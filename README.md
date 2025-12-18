@@ -1,12 +1,16 @@
-# SeqCond: Sequence Conditioning for Autoregressive Models
+# SeqCond: Sequence Condenser for Autoregressive Models
 
-A TensorFlow library implementing custom attention mechanisms for sequence conditioning in autoregressive generation tasks.
+A TensorFlow library implementing custom attention mechanisms for sequence condensation in autoregressive generation tasks.
+
+## What is SeqCond?
+
+**SeqCond** stands for **Sequence Condenser** - a library designed to condense and efficiently process sequences in autoregressive models. The name reflects our focus on compressing and optimizing sequence representations while maintaining high quality generation.
 
 ## Overview
 
 SeqCond provides specialized layers and utilities for building efficient autoregressive models:
 
-- **Custom attention mechanisms** for sequence processing
+- **Custom attention mechanisms** for sequence condensation
 - **Memory-efficient architectures** for long sequences
 - **Specialized metrics** for language modeling evaluation
 - **Modular components** for flexible model construction
@@ -115,7 +119,7 @@ model.fit(train_dataset, epochs=10, batch_size=32)
 
 The library provides building blocks for constructing efficient autoregressive models:
 
-- **Attention mechanisms** designed for sequence conditioning
+- **Attention mechanisms** designed for sequence condensation
 - **Efficient normalization** layers (RMSNorm)
 - **Positional encoding** schemes (rotary embeddings)
 - **Custom metrics** for proper evaluation
