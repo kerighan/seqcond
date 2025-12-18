@@ -15,7 +15,7 @@ class StepwiseGenerationCallback(tf.keras.callbacks.Callback):
         self,
         trigger_every_n_steps=100,
         nlp=None,
-        prompt="<|im_start|>",
+        prompt="<|im_start|>user\n",
         max_new_tokens=64,
         temperature=1.0,
         top_k=50,
@@ -135,7 +135,7 @@ class StepwiseGenerationCallback(tf.keras.callbacks.Callback):
     def generate_text(self):
         """Generate text using autoregressive sampling with top-k, temperature, and repetition penalty."""
         print(f"\n--- Generation at step {self.step_counter} ---")
-        txt = "<|im_start|>user\n"
+        txt = self.prompt
         tokens = self.nlp([txt])[0]
         generated_tokens = []
 

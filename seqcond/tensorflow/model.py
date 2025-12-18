@@ -11,6 +11,7 @@ def create_transformer_model(
     d_ff=768,
     num_layers=12,
     num_heads=8,
+    num_kv_heads=None,
     vocab_size=100300,
     maxlen=1024,
     dropout=0.0,
@@ -35,6 +36,7 @@ def create_transformer_model(
             d_model=d_model,
             num_heads=num_heads,
             d_ff=d_ff,
+            num_kv_heads=num_kv_heads,
             dropout=dropout,
             qk_norm=qk_norm,
             qk_norm_eps=qk_norm_eps,
@@ -60,8 +62,10 @@ def create_seqcond_model(
     num_layers=12,
     vocab_size=100300,
     maxlen=1024,
+    use_positional_embedding=False,
     seqcond_ratio=3,
     num_heads=8,
+    num_kv_heads=None,
     seqcond_heads=None,
     num_anchor_heads=0,
     num_thetas=4,
@@ -86,6 +90,16 @@ def create_seqcond_model(
     x = embedding(inputs)
     mask = embedding.compute_mask(inputs)
 
+    if use_positional_embedding:
+        if maxlen is None:
+            raise ValueError("maxlen must be set when use_positional_embedding=True")
+        position_embedding = tf.keras.layers.Embedding(
+            maxlen, d_model, name="position_embedding"
+        )
+        seq_len = tf.shape(inputs)[1]
+        positions = tf.range(seq_len, dtype=tf.int32)[tf.newaxis, :]
+        x = x + position_embedding(positions)
+
     rotary = RotaryPositionalEmbedding(maxlen, d_model // num_heads)
     cos, sin = rotary(inputs, n_heads=num_heads)
 
@@ -97,6 +111,7 @@ def create_seqcond_model(
                 d_model=d_model,
                 num_heads=num_heads,
                 d_ff=d_ff,
+                num_kv_heads=num_kv_heads,
                 dropout=dropout,
                 qk_norm=qk_norm,
                 qk_norm_eps=qk_norm_eps,

@@ -63,6 +63,7 @@ class RotarySelfAttention(tf.keras.layers.Layer):
         self,
         d_model,
         num_heads,
+        num_kv_heads=None,
         dropout=0.0,
         qk_norm=False,
         qk_norm_eps=1e-6,
@@ -73,23 +74,41 @@ class RotarySelfAttention(tf.keras.layers.Layer):
             raise ValueError("d_model must be divisible by num_heads")
         self.d_model = d_model
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        if num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_groups = num_heads // self.num_kv_heads
         self.head_dim = d_model // num_heads
         self.qk_norm = bool(qk_norm)
         self.qk_norm_eps = float(qk_norm_eps)
 
         self.q_proj = tf.keras.layers.Dense(d_model, use_bias=False)
-        self.k_proj = tf.keras.layers.Dense(d_model, use_bias=False)
-        self.v_proj = tf.keras.layers.Dense(d_model, use_bias=False)
+        self.k_proj = tf.keras.layers.Dense(
+            self.num_kv_heads * self.head_dim, use_bias=False
+        )
+        self.v_proj = tf.keras.layers.Dense(
+            self.num_kv_heads * self.head_dim, use_bias=False
+        )
         self.out_proj = tf.keras.layers.Dense(d_model, use_bias=False)
         self.attn_dropout = tf.keras.layers.Dropout(dropout)
+
+    def _repeat_kv(self, x):
+        """Repeat KV heads to match Q heads for GQA."""
+        if self.num_groups == 1:
+            return x
+        b = tf.shape(x)[0]
+        l = tf.shape(x)[1]
+        x = tf.reshape(x, [b, l, self.num_kv_heads, 1, self.head_dim])
+        x = tf.tile(x, [1, 1, 1, self.num_groups, 1])
+        return tf.reshape(x, [b, l, self.num_heads, self.head_dim])
 
     def call(self, x, cos, sin, training=False, mask=None):
         b = tf.shape(x)[0]
         l = tf.shape(x)[1]
 
         q = tf.reshape(self.q_proj(x), [b, l, self.num_heads, self.head_dim])
-        k = tf.reshape(self.k_proj(x), [b, l, self.num_heads, self.head_dim])
-        v = tf.reshape(self.v_proj(x), [b, l, self.num_heads, self.head_dim])
+        k = tf.reshape(self.k_proj(x), [b, l, self.num_kv_heads, self.head_dim])
+        v = tf.reshape(self.v_proj(x), [b, l, self.num_kv_heads, self.head_dim])
 
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
@@ -101,6 +120,9 @@ class RotarySelfAttention(tf.keras.layers.Layer):
             k_ms = tf.reduce_mean(tf.square(k_f32), axis=-1, keepdims=True)
             q = tf.cast(q_f32 * tf.math.rsqrt(q_ms + self.qk_norm_eps), q.dtype)
             k = tf.cast(k_f32 * tf.math.rsqrt(k_ms + self.qk_norm_eps), k.dtype)
+
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
 
         scores = tf.einsum("blhd,bmhd->bhlm", q, k) / tf.math.sqrt(
             tf.cast(self.head_dim, tf.float32)
@@ -128,6 +150,7 @@ class TransformerDecoderBlock(tf.keras.layers.Layer):
         d_model,
         num_heads,
         d_ff,
+        num_kv_heads=None,
         dropout=0.0,
         norm_eps=1e-6,
         qk_norm=False,
@@ -139,7 +162,8 @@ class TransformerDecoderBlock(tf.keras.layers.Layer):
         self.attn = RotarySelfAttention(
             d_model,
             num_heads,
-            dropout,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout,
             qk_norm=qk_norm,
             qk_norm_eps=qk_norm_eps,
         )
