@@ -80,15 +80,9 @@ class SeqCondAttention(tf.keras.layers.Layer):
                 kernel_size=self.conv_kernel, padding="valid", use_bias=True
             )
 
-        theta_max = 1.1 * float(np.sqrt(self.H))
-        pos = np.geomspace(
-            max(theta_max / 32, 1e-4), theta_max, self.M // 2, dtype=np.float32
-        )
-        grid = (
-            np.concatenate([-pos[::-1], pos], axis=0)
-            if self.M % 2 == 0
-            else np.concatenate([-pos[::-1], [0.0], pos], axis=0)
-        )
+        # Theta initialization: [-π/3, π/3] to avoid gradient dead zones
+        # cos/sin have zero gradients at multiples of π/2, so we stay within safe range
+        grid = np.linspace(-np.pi / 3, np.pi / 3, self.M, dtype=np.float32)
 
         head_scale = np.ones((1, 1, self.K, 1, 1), dtype=np.float32)
         base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, self.H, 1))
@@ -187,16 +181,10 @@ class SeqCondAttention(tf.keras.layers.Layer):
             slopes = tf.nn.softplus(
                 tf.reshape(self.decay_slopes, [1, 1, self.num_decay_heads, 1])
             )
-            if mask is not None:
-                lengths = tf.reduce_sum(tf.cast(mask, tf.int32), axis=1)
-                lengths = tf.maximum(lengths, 1)
-                lengths_f32 = tf.cast(lengths, tf.float32)
-                dist = lengths_f32[:, None] - 1.0 - pos_f32[None, :]
-                dist = tf.maximum(dist, 0.0)
-                dist = dist[:, :, None, None]
-            else:
-                dist = tf.cast(l - 1, tf.float32) - pos_f32
-                dist = dist[None, :, None, None]
+            # Use fixed sequence length l (not mask-based lengths) for train/inference consistency
+            dist = tf.cast(l - 1, tf.float32) - pos_f32
+            dist = tf.maximum(dist, 0.0)
+            dist = dist[None, :, None, None]
             slopes = tf.cast(slopes, tf.float32)
             w_list.append(tf.exp(-slopes * dist))
         if self.num_anchor_heads > 0:
@@ -216,8 +204,10 @@ class SeqCondAttention(tf.keras.layers.Layer):
             p = p * tf.cast(mask, x.dtype)[:, :, None, None]
 
         x_val5 = tf.reshape(x_val, [b, l, k, h, 1])
-        phi = x_val5 * self.theta
-        cos_b, sin_b = tf.cos(phi), tf.sin(phi)
+        phi = x_val5 * tf.cast(self.theta, x.dtype)
+        phi_f32 = tf.cast(phi, tf.float32)
+        cos_b = tf.cast(tf.cos(phi_f32), x.dtype)
+        sin_b = tf.cast(tf.sin(phi_f32), x.dtype)
 
         if self.derivative_order == 0:
             re_m, im_m = cos_b, sin_b
@@ -261,19 +251,21 @@ class SeqCondAttention(tf.keras.layers.Layer):
         cumsum = tf.cumsum(merged, axis=1)
         num_re, num_im, den = tf.split(cumsum, 3, axis=-1)
 
-        inv_den = tf.math.reciprocal(tf.maximum(den, 1e-9))
+        inv_den = tf.math.reciprocal(tf.maximum(den, tf.cast(1e-4, den.dtype)))
         re = num_re * inv_den
         im = num_im * inv_den
 
         re_flat = tf.reshape(re, [b, l, k, h * self.M])
         im_flat = tf.reshape(im, [b, l, k, h * self.M])
 
-        mean_sq_re = tf.reduce_sum(tf.square(re_flat), axis=-1)
-        mean_sq_im = tf.reduce_sum(tf.square(im_flat), axis=-1)
+        re_flat_f32 = tf.cast(re_flat, tf.float32)
+        im_flat_f32 = tf.cast(im_flat, tf.float32)
+        mean_sq_re = tf.reduce_sum(tf.square(re_flat_f32), axis=-1)
+        mean_sq_im = tf.reduce_sum(tf.square(im_flat_f32), axis=-1)
 
         inv_total_dim = 1.0 / (2.0 * float(h * self.M))
         mean_sq = (mean_sq_re + mean_sq_im) * inv_total_dim
-        rsqrt = tf.math.rsqrt(mean_sq[..., None] + self.norm_eps)
+        rsqrt = tf.cast(tf.math.rsqrt(mean_sq[..., None] + self.norm_eps), x.dtype)
 
         split_idx = self.H * self.M
         scale_re = self.norm_scale[:split_idx]

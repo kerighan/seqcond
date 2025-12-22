@@ -9,6 +9,7 @@ from .metrics import (
     SparseWeightedCategoricalAccuracyIgnoreZero,
 )
 from .model import create_seqcond_model, create_transformer_model, compile_lm
+from .generate import generate_text
 
 __all__ = [
     "RMSNorm",
@@ -24,4 +25,5 @@ __all__ = [
     "create_seqcond_model",
     "create_transformer_model",
     "compile_lm",
+    "generate_text",
 ]

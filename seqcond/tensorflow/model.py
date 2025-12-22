@@ -50,7 +50,7 @@ def create_transformer_model(
         )(x)
     else:
         logits = tf.keras.layers.Dense(
-            vocab_size, use_bias=False, name="output_projection"
+            vocab_size, use_bias=False, dtype="float32", name="output_projection"
         )(x)
 
     return tf.keras.Model(inputs=inputs, outputs=logits)
@@ -139,7 +139,7 @@ def create_seqcond_model(
         )(x)
     else:
         logits = tf.keras.layers.Dense(
-            vocab_size, use_bias=False, name="output_projection"
+            vocab_size, use_bias=False, dtype="float32", name="output_projection"
         )(x)
 
     return tf.keras.Model(inputs=inputs, outputs=logits)
@@ -240,7 +240,6 @@ class GradientAccumulationModel(tf.keras.Model):
         self.accum_steps = max(1, int(accum_steps))
         self._accum_step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
         self._accum_grads = None
-        self._has_grad = None
 
     def call(self, inputs, training=False):
         return self.inner_model(inputs, training=training)
@@ -254,7 +253,9 @@ class GradientAccumulationModel(tf.keras.Model):
             tf.Variable(tf.zeros_like(v), trainable=False)
             for v in self.trainable_variables
         ]
-        self._has_grad = [False for _ in self.trainable_variables]
+
+    def _is_loss_scale_optimizer(self):
+        return hasattr(self.optimizer, "get_scaled_loss")
 
     def train_step(self, data):
         if self.accum_steps <= 1:
@@ -267,7 +268,13 @@ class GradientAccumulationModel(tf.keras.Model):
                     sample_weight=sample_weight,
                     regularization_losses=self.losses,
                 )
-            gradients = tape.gradient(loss, self.trainable_variables)
+                if self._is_loss_scale_optimizer():
+                    scaled_loss = self.optimizer.get_scaled_loss(loss)
+                else:
+                    scaled_loss = loss
+            gradients = tape.gradient(scaled_loss, self.trainable_variables)
+            if self._is_loss_scale_optimizer():
+                gradients = self.optimizer.get_unscaled_gradients(gradients)
             self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
             self.compiled_metrics.update_state(y, y_pred, sample_weight=sample_weight)
             results = {m.name: m.result() for m in self.metrics}
@@ -283,49 +290,34 @@ class GradientAccumulationModel(tf.keras.Model):
                 sample_weight=sample_weight,
                 regularization_losses=self.losses,
             )
-
             loss_to_backprop = loss / tf.cast(self.accum_steps, loss.dtype)
+            if self._is_loss_scale_optimizer():
+                scaled_loss = self.optimizer.get_scaled_loss(loss_to_backprop)
+            else:
+                scaled_loss = loss_to_backprop
 
-        gradients = tape.gradient(loss_to_backprop, self.trainable_variables)
+        gradients = tape.gradient(scaled_loss, self.trainable_variables)
+        if self._is_loss_scale_optimizer():
+            gradients = self.optimizer.get_unscaled_gradients(gradients)
 
         self._maybe_init_accumulators()
-        if self._accum_grads is None:
-            self._accum_grads = [
-                tf.Variable(tf.zeros_like(v), trainable=False)
-                for v in self.trainable_variables
-            ]
-            self._has_grad = [False for _ in self.trainable_variables]
 
         for acc_g, g in zip(self._accum_grads, gradients):
-            if g is None:
-                continue
-            acc_g.assign_add(g)
-
-        if self._has_grad is not None:
-            for i, g in enumerate(gradients):
-                if g is not None:
-                    self._has_grad[i] = True
+            if g is not None:
+                acc_g.assign_add(g)
 
         self._accum_step_counter.assign_add(1)
 
         def _apply_and_reset():
-            grads_and_vars = []
-            for i, (acc_g, v) in enumerate(
-                zip(self._accum_grads, self.trainable_variables)
-            ):
-                if self._has_grad is None or self._has_grad[i]:
-                    grads_and_vars.append((acc_g, v))
-
-            if grads_and_vars:
-                self.optimizer.apply_gradients(grads_and_vars)
-
-            for i, acc_g in enumerate(self._accum_grads):
-                if self._has_grad is None or self._has_grad[i]:
-                    acc_g.assign(tf.zeros_like(acc_g))
-
-            if self._has_grad is not None:
-                for i in range(len(self._has_grad)):
-                    self._has_grad[i] = False
+            grads = [g.value() for g in self._accum_grads]
+            if self._is_loss_scale_optimizer():
+                self.optimizer.inner_optimizer.apply_gradients(
+                    zip(grads, self.trainable_variables)
+                )
+            else:
+                self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+            for acc_g in self._accum_grads:
+                acc_g.assign(tf.zeros_like(acc_g))
             self._accum_step_counter.assign(0)
             return tf.no_op()
 

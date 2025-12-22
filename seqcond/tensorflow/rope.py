@@ -111,7 +111,12 @@ class RotarySelfAttention(tf.keras.layers.Layer):
         v = tf.reshape(self.v_proj(x), [b, l, self.num_kv_heads, self.head_dim])
 
         q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        if self.num_kv_heads < self.num_heads:
+            cos_kv = cos[:, :, : self.num_kv_heads, :]
+            sin_kv = sin[:, :, : self.num_kv_heads, :]
+            k = apply_rope(k, cos_kv, sin_kv)
+        else:
+            k = apply_rope(k, cos, sin)
 
         if self.qk_norm:
             q_f32 = tf.cast(q, tf.float32)
@@ -124,19 +129,20 @@ class RotarySelfAttention(tf.keras.layers.Layer):
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
-        scores = tf.einsum("blhd,bmhd->bhlm", q, k) / tf.math.sqrt(
-            tf.cast(self.head_dim, tf.float32)
-        )
+        scale = tf.math.rsqrt(tf.cast(self.head_dim, q.dtype))
+        scores = tf.einsum("blhd,bmhd->bhlm", q, k) * scale
 
         causal = tf.linalg.band_part(tf.ones((l, l)), -1, 0)
         causal_mask = tf.cast(causal, tf.bool)[None, None, :, :]
 
+        large_neg = tf.cast(-1e4, scores.dtype)  # -1e9 overflows float16
         if mask is not None:
-            key_mask = tf.cast(mask, tf.float32)[:, None, None, :]
-            scores = scores + (1.0 - key_mask) * -1e9
+            key_mask = tf.cast(mask, scores.dtype)[:, None, None, :]
+            scores = scores + (1.0 - key_mask) * large_neg
 
-        scores = tf.where(causal_mask, scores, tf.fill(tf.shape(scores), -1e9))
-        attn = tf.nn.softmax(scores, axis=-1)
+        scores = tf.where(causal_mask, scores, tf.fill(tf.shape(scores), large_neg))
+        attn = tf.nn.softmax(tf.cast(scores, tf.float32), axis=-1)
+        attn = tf.cast(attn, v.dtype)
         attn = self.attn_dropout(attn, training=training)
 
         out = tf.einsum("bhql,blhd->bqhd", attn, v)
