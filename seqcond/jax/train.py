@@ -175,6 +175,31 @@ def make_train_step_with_debug(
     return train_step
 
 
+def make_pmap_train_step(
+    model, optimizer, compute_dtype=jnp.float32, axis_name: str = "devices"
+):
+    """Create a pmapped data-parallel train step."""
+
+    compute_dtype = jnp.dtype(compute_dtype)
+    keep_weights_fp32 = compute_dtype != jnp.float32
+
+    def train_step(params, opt_state, x, y):
+        def loss_fn(p, xb, yb):
+            p_apply = cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
+            logits = model.apply({"params": p_apply}, xb, deterministic=True)
+            loss = sparse_categorical_crossentropy_loss(logits, yb, ignore_class=0)
+            return loss, logits
+
+        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x, y)
+        loss = jax.lax.pmean(loss, axis_name=axis_name)
+        grads = jax.lax.pmean(grads, axis_name=axis_name)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss, logits
+
+    return jax.pmap(train_step, axis_name=axis_name)
+
+
 def make_grad_step(model):
     """Create a JIT-compiled gradient computation step (for accumulation)."""
 
@@ -219,14 +244,18 @@ def accumulate_grads(grads_accum, grads, accum_steps: int):
 
 def save_checkpoint(
     params: Any,
+    opt_state: Any,
     config: Config,
     path: str,
     step: Optional[int] = None,
 ):
     """Save model checkpoint."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    params_cpu = jax.device_get(params)
+    opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
     data = {
-        "params": params,
+        "params": params_cpu,
+        "opt_state": opt_state_cpu,
         "config": config.to_dict(),
         "step": step,
     }
@@ -234,11 +263,11 @@ def save_checkpoint(
         pickle.dump(data, f)
 
 
-def load_checkpoint(path: str) -> Tuple[Any, Dict, Optional[int]]:
-    """Load model checkpoint. Returns (params, config_dict, step)."""
+def load_checkpoint(path: str) -> Tuple[Any, Dict, Optional[int], Optional[Any]]:
+    """Load model checkpoint. Returns (params, config_dict, step, opt_state)."""
     with open(path, "rb") as f:
         data = pickle.load(f)
-    return data["params"], data["config"], data.get("step")
+    return data["params"], data["config"], data.get("step"), data.get("opt_state")
 
 
 class Trainer:
@@ -250,6 +279,7 @@ class Trainer:
         data_loader: DataLoader = None,
         tokenizer: Any = None,
         model_name: Optional[str] = None,
+        resume_checkpoint: Optional[str] = None,
     ):
         self.config = config
         self.model_config = config.model
@@ -257,6 +287,7 @@ class Trainer:
         self.data_loader = data_loader
         self.tokenizer = tokenizer
         self.model_name = model_name or config.name
+        self.resume_checkpoint = resume_checkpoint
         self._wandb = None
 
         # Will be initialized in setup()
@@ -265,6 +296,34 @@ class Trainer:
         self.optimizer = None
         self.opt_state = None
         self.compute_dtype = None
+        self.start_step = 0
+        self.use_pmap = False
+        self.num_devices = jax.device_count()
+        self.per_device_batch = None
+        self._pmap_train_step = None
+
+    def _replicate_tree(self, tree):
+        return jax.device_put_replicated(tree, jax.local_devices())
+
+    def _unreplicate_tree(self, tree):
+        return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+    def _host_tree(self, tree):
+        return jax.device_get(tree)
+
+    def _params_for_host(self):
+        params = self._host_tree(self.params)
+        if self.use_pmap:
+            params = self._unreplicate_tree(params)
+        return params
+
+    def _opt_state_for_host(self):
+        opt_state = (
+            self._host_tree(self.opt_state) if self.opt_state is not None else None
+        )
+        if opt_state is not None and self.use_pmap:
+            opt_state = self._unreplicate_tree(opt_state)
+        return opt_state
 
     def setup(self, seed: int = 42):
         """Initialize model, optimizer, and compile training steps."""
@@ -319,10 +378,71 @@ class Trainer:
         )
         self.opt_state = self.optimizer.init(self.params)
 
+        # Determine multi-device usage
+        self.use_pmap = (
+            bool(self.train_config.use_multiple_tpus) and self.num_devices > 1
+        )
+        if self.train_config.use_multiple_tpus and not self.use_pmap:
+            print(
+                "Warning: use_multiple_tpus enabled but only one device detected. "
+                "Falling back to single-device training."
+            )
+
+        if self.use_pmap:
+            if grad_accum_steps != 1:
+                raise ValueError(
+                    "Gradient accumulation is not supported when use_multiple_tpus=True."
+                )
+            if self.train_config.batch_size % self.num_devices != 0:
+                raise ValueError(
+                    "Batch size must be divisible by the number of devices for multi-TPU training."
+                )
+            self.per_device_batch = self.train_config.batch_size // self.num_devices
+            print(
+                f"Using data parallelism across {self.num_devices} devices "
+                f"(per-device batch size = {self.per_device_batch})."
+            )
+
+        # Resume from checkpoint if provided
+        if self.resume_checkpoint:
+            if os.path.exists(self.resume_checkpoint):
+                (
+                    ckpt_params,
+                    _,
+                    ckpt_step,
+                    ckpt_opt_state,
+                ) = load_checkpoint(self.resume_checkpoint)
+                self.params = ckpt_params
+                if ckpt_opt_state is not None:
+                    self.opt_state = ckpt_opt_state
+                self.start_step = ckpt_step or 0
+                print(
+                    f"Resumed from checkpoint {self.resume_checkpoint} "
+                    f"(step {self.start_step})"
+                )
+            else:
+                print(
+                    f"Warning: checkpoint {self.resume_checkpoint} not found. "
+                    "Starting from scratch."
+                )
+
+        if self.use_pmap:
+            self.params = self._replicate_tree(self.params)
+            self.opt_state = self._replicate_tree(self.opt_state)
+
         # Create JIT-compiled steps
-        if grad_accum_steps > 1:
+        if self.use_pmap:
+            self._pmap_train_step = make_pmap_train_step(
+                self.model, self.optimizer, self.compute_dtype
+            )
+            self._train_step = None
+            self._train_step_dbg = None
+            self._grad_step = None
+            self._update_step = None
+        elif grad_accum_steps > 1:
             self._grad_step = make_grad_step(self.model)
             self._update_step = make_update_step(self.optimizer)
+            self._pmap_train_step = None
             print(f"Using gradient accumulation: {grad_accum_steps} steps")
         else:
             debug_opt = os.environ.get("SLM_JAX_DEBUG_OPT", "0").strip() == "1"
@@ -341,12 +461,14 @@ class Trainer:
                     compute_dtype=self.compute_dtype,
                 )
                 self._train_step = None
+                self._pmap_train_step = None
                 print("JAX debug optimizer logging enabled (SLM_JAX_DEBUG_OPT=1)")
             else:
                 self._train_step = make_train_step(
                     self.model, self.optimizer, self.compute_dtype
                 )
                 self._train_step_dbg = None
+                self._pmap_train_step = None
 
         # Initialize wandb if enabled
         if self.train_config.use_wandb:
@@ -393,7 +515,10 @@ class Trainer:
         metrics = MetricsAccumulator(ignore_class=0)
         grads_accum = None
         accum_count = 0
-        macro_step = 0
+        macro_step = self.start_step
+
+        if macro_step > 0:
+            print(f"Continuing training from step {macro_step}")
 
         start_time = time.time()
         last_log_time = start_time
@@ -402,39 +527,64 @@ class Trainer:
         print("\nStarting training...")
 
         for step, (x_batch, y_batch) in enumerate(self.data_loader):
-            x = jnp.array(x_batch, dtype=jnp.int32)
-            y = jnp.array(y_batch, dtype=jnp.int32)
+            if self.use_pmap:
+                x = jnp.array(x_batch, dtype=jnp.int32).reshape(
+                    self.num_devices, self.per_device_batch, -1
+                )
+                y = jnp.array(y_batch, dtype=jnp.int32).reshape(
+                    self.num_devices, self.per_device_batch, -1
+                )
+                self.params, self.opt_state, loss, logits = self._pmap_train_step(
+                    self.params, self.opt_state, x, y
+                )
+                macro_step += 1
 
-            if grad_accum_steps > 1:
-                loss, logits, grads = self._grad_step(self.params, x, y)
-                grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
-                accum_count += 1
-
-                if accum_count >= grad_accum_steps:
-                    self.params, self.opt_state = self._update_step(
-                        self.params, self.opt_state, grads_accum
-                    )
-                    grads_accum = None
-                    accum_count = 0
-                    macro_step += 1
+                loss_metric = jnp.array(jax.device_get(loss)).mean()
+                logits_metric = jnp.array(jax.device_get(logits)).reshape(
+                    self.train_config.batch_size, -1, logits.shape[-1]
+                )
+                y_metric = jnp.array(y_batch, dtype=jnp.int32)
             else:
-                if self._train_step_dbg is not None:
-                    self.params, self.opt_state, loss, logits, dbg = (
-                        self._train_step_dbg(
-                            self.params, self.opt_state, x, y, step + 1
-                        )
-                    )
-                else:
-                    self.params, self.opt_state, loss, logits = self._train_step(
-                        self.params, self.opt_state, x, y
-                    )
-                macro_step = step + 1
+                x = jnp.array(x_batch, dtype=jnp.int32)
+                y = jnp.array(y_batch, dtype=jnp.int32)
 
-            metrics.update(y, logits, loss)
+                if grad_accum_steps > 1:
+                    loss, logits, grads = self._grad_step(self.params, x, y)
+                    grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
+                    accum_count += 1
+
+                    if accum_count >= grad_accum_steps:
+                        self.params, self.opt_state = self._update_step(
+                            self.params, self.opt_state, grads_accum
+                        )
+                        grads_accum = None
+                        accum_count = 0
+                        macro_step += 1
+                else:
+                    next_step = macro_step + 1
+                    if self._train_step_dbg is not None:
+                        self.params, self.opt_state, loss, logits, dbg = (
+                            self._train_step_dbg(
+                                self.params, self.opt_state, x, y, next_step
+                            )
+                        )
+                    else:
+                        self.params, self.opt_state, loss, logits = self._train_step(
+                            self.params, self.opt_state, x, y
+                        )
+                    macro_step = next_step
+
+                y_metric = y
+                logits_metric = logits
+                loss_metric = loss
+
+            metrics.update(y_metric, logits_metric, loss_metric)
 
             # Wandb logging every gradient step
-            if self._wandb is not None and (grad_accum_steps <= 1 or accum_count == 0):
-                payload = {"loss": float(loss), "step": macro_step}
+            if self._wandb is not None and (
+                self.use_pmap or grad_accum_steps <= 1 or accum_count == 0
+            ):
+                payload = {"loss": float(loss_metric), "step": macro_step}
                 if grad_accum_steps <= 1 and self._train_step_dbg is not None:
                     payload.update(
                         {
@@ -587,7 +737,7 @@ class Trainer:
                 f"{self.train_config.checkpoint_dir}/{self.model_name}_step{step}.pkl"
             )
 
-        save_checkpoint(self.params, self.config, path, step)
+        save_checkpoint(self.params, self.opt_state, self.config, path, step)
         print(f"Checkpoint saved: {path}")
 
 
@@ -597,6 +747,7 @@ def train(
     tokenizer: Any = None,
     model_name: Optional[str] = None,
     seed: int = 42,
+    resume_checkpoint: Optional[str] = None,
 ) -> Any:
     """
     High-level training function.
@@ -616,6 +767,7 @@ def train(
         data_loader=data_loader,
         tokenizer=tokenizer,
         model_name=model_name,
+        resume_checkpoint=resume_checkpoint,
     )
     trainer.setup(seed=seed)
     return trainer.train()
