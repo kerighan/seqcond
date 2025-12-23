@@ -474,8 +474,24 @@ class Trainer:
             )
             self.mesh = Mesh(jax.devices(), axis_names=("dp",))
             
-            # Parameters are sharded across devices (1D sharding)
-            self.params_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
+            # Determine sharding strategy based on parameter shapes
+            # We use eval_shape to get the structure and shapes without allocating memory
+            rng_init = jax.random.PRNGKey(0)
+            abstract_variables = jax.eval_shape(
+                lambda r: self.model.init(r, jnp.ones((1, 1), dtype=jnp.int32)),
+                rng_init
+            )
+            abstract_params = abstract_variables["params"]
+
+            def get_sharding(x):
+                # Shard on first dimension if it's divisible by num_devices
+                if x.ndim > 0 and x.shape[0] % self.num_devices == 0:
+                    return NamedSharding(self.mesh, PartitionSpec("dp"))
+                # Otherwise replicate
+                return NamedSharding(self.mesh, PartitionSpec())
+
+            self.params_sharding = jax.tree_util.tree_map(get_sharding, abstract_params)
+            
             # Data is sharded on batch dimension
             self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
             # Scalar metrics must be replicated
