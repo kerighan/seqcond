@@ -141,6 +141,18 @@ def parse_args():
         default=None,
         help="Number of theta parameters for seqcond",
     )
+    parser.add_argument(
+        "--seqcond-heads",
+        type=int,
+        default=None,
+        help="Number of seqcond heads",
+    )
+    parser.add_argument(
+        "--generate-every-n-steps",
+        type=int,
+        default=None,
+        help="Generate samples every n steps",
+    )
     return parser.parse_args()
 
 
@@ -176,6 +188,10 @@ if __name__ == "__main__":
         config.model.d_ff = int(args.d_ff)
     if args.num_thetas is not None:
         config.model.num_thetas = int(args.num_thetas)
+    if args.seqcond_heads is not None:
+        config.model.seqcond_heads = int(args.seqcond_heads)
+    if args.generate_every_n_steps is not None:
+        config.training.generate_every_n_steps = int(args.generate_every_n_steps)
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
