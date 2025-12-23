@@ -562,7 +562,7 @@ class Trainer:
 
             num_params = pjit(
                 count_params_fn,
-                in_shardings=self.params_sharding,
+                in_shardings=(self.params_sharding,),
                 out_shardings=None,
             )(self.params)
         else:
