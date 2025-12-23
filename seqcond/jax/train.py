@@ -473,9 +473,18 @@ class Trainer:
                 f"(per-device batch size = {self.per_device_batch})."
             )
             self.mesh = Mesh(jax.devices(), axis_names=("dp",))
-            # Parameters are sharded across devices, data is replicated
-            self.params_sharding = NamedSharding(self.mesh, PartitionSpec())
+            
+            # Parameters are sharded across devices (1D sharding)
+            self.params_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
+            # Data is sharded on batch dimension
             self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
+            # Scalar metrics must be replicated
+            replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
+            
+            metrics_sharding = {
+                "loss": replicated_sharding,
+                "logits": self.data_sharding,
+            }
 
             # Init params and opt_state with PJIT
             def init_fn(rng, model, optimizer, input_shape):
@@ -595,7 +604,7 @@ class Trainer:
                 out_shardings=(
                     self.params_sharding,
                     self.params_sharding,
-                    self.data_sharding,
+                    metrics_sharding,
                 ),
             )
         elif self.use_pmap:
