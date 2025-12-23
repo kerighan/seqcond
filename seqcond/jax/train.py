@@ -491,6 +491,12 @@ class Trainer:
                 return NamedSharding(self.mesh, PartitionSpec())
 
             self.params_sharding = jax.tree_util.tree_map(get_sharding, abstract_params)
+
+            # Compute sharding for optimizer state
+            abstract_opt_state = jax.eval_shape(
+                self.optimizer.init, abstract_params
+            )
+            self.opt_state_sharding = jax.tree_util.tree_map(get_sharding, abstract_opt_state)
             
             # Data is sharded on batch dimension
             self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
@@ -515,7 +521,7 @@ class Trainer:
                 in_shardings=(
                     None,
                 ),
-                out_shardings=(self.params_sharding, self.params_sharding),
+                out_shardings=(self.params_sharding, self.opt_state_sharding),
             )
 
             rng = jax.random.PRNGKey(seed)
@@ -613,13 +619,13 @@ class Trainer:
                 step_fn,
                 in_shardings=(
                     self.params_sharding,
-                    self.params_sharding,
+                    self.opt_state_sharding,
                     self.data_sharding,
                     self.data_sharding,
                 ),
                 out_shardings=(
                     self.params_sharding,
-                    self.params_sharding,
+                    self.opt_state_sharding,
                     metrics_sharding,
                 ),
             )
