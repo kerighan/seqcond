@@ -474,10 +474,8 @@ class Trainer:
 
             pjit_init_fn = pjit(
                 init_fn,
+                static_argnums=(1, 2, 3),
                 in_shardings=(
-                    None,
-                    None,
-                    None,
                     None,
                 ),
                 out_shardings=(self.params_sharding, self.params_sharding),
