@@ -14,9 +14,9 @@ import logging
 
 logging.getLogger("jax").setLevel(logging.ERROR)
 
-from lib.config import Config, ModelConfig, TrainingConfig
-from lib.dataset import tokenizer
-from lib.jax import train
+from seqcond.config import Config, ModelConfig, TrainingConfig
+from seqcond.dataset import tokenizer
+from seqcond.jax import train
 
 
 model_config = ModelConfig.small(model_type="seqcond", num_thetas=4, seqcond_heads=16)
