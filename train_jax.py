@@ -65,13 +65,13 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
+        default=1,
         help="Override training batch size (int)",
     )
     parser.add_argument(
         "--total-steps",
         type=int,
-        default=None,
+        default=500000,
         help="Override total number of training steps (int)",
     )
     parser.add_argument(
@@ -79,6 +79,12 @@ def parse_args():
         type=int,
         default=None,
         help="Override checkpoint save interval (int)",
+    )
+    parser.add_argument(
+        "--log-every-n-steps",
+        type=int,
+        default=1,
+        help="Log every n steps"
     )
     parser.add_argument(
         "--wandb-project",
@@ -102,6 +108,8 @@ if __name__ == "__main__":
         config.training.save_every_n_steps = int(args.save_every_n_steps)
     if args.wandb_project is not None:
         config.training.wandb_project = args.wandb_project
+    if args.log_every_n_steps is not None:
+        config.training.log_every_n_steps = args.log_every_n_steps
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
