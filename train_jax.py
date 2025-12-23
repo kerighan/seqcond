@@ -104,6 +104,43 @@ def parse_args():
         default=None,
         help="Number of batches to prefetch to device (0 disables)",
     )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate (overrides base_lr)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["seqcond", "transformer"],
+        default=None,
+        help="Model type: seqcond or transformer",
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Number of layers",
+    )
+    parser.add_argument(
+        "--d-model",
+        type=int,
+        default=None,
+        help="Model dimension (d_model)",
+    )
+    parser.add_argument(
+        "--d-ff",
+        type=int,
+        default=None,
+        help="Feed-forward dimension (d_ff)",
+    )
+    parser.add_argument(
+        "--num-thetas",
+        type=int,
+        default=None,
+        help="Number of theta parameters for seqcond",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +164,18 @@ if __name__ == "__main__":
         config.training.log_every_n_steps = args.log_every_n_steps
     if args.prefetch_batches is not None:
         config.training.prefetch_batches = max(0, int(args.prefetch_batches))
+    if args.lr is not None:
+        config.training.base_lr = float(args.lr)
+    if args.model is not None:
+        config.model.model_type = args.model
+    if args.num_layers is not None:
+        config.model.num_layers = int(args.num_layers)
+    if args.d_model is not None:
+        config.model.d_model = int(args.d_model)
+    if args.d_ff is not None:
+        config.model.d_ff = int(args.d_ff)
+    if args.num_thetas is not None:
+        config.model.num_thetas = int(args.num_thetas)
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
