@@ -427,6 +427,18 @@ class Trainer:
         print("Creating model...")
         self.model = create_model_from_config(self.model_config)
 
+        # Create optimizer
+        self._base_optimizer = create_optimizer(
+            base_lr=self.train_config.base_lr,
+            warmup_steps=self.train_config.warmup_steps,
+            total_steps=self.train_config.total_steps,
+            weight_decay=self.train_config.weight_decay,
+            clipnorm=self.train_config.clipnorm,
+            beta_1=self.train_config.beta_1,
+            beta_2=self.train_config.beta_2,
+        )
+        self.optimizer = self._base_optimizer
+
         # Determine multi-device usage
         self.use_fsdp = (
             bool(self.train_config.full_shard_data_parallel) and self.num_devices > 1
@@ -528,17 +540,6 @@ class Trainer:
         print(f"Model type: {self.model_config.model_type}")
         print(f"Parameters: {num_params:,}")
 
-        # Create optimizer
-        self._base_optimizer = create_optimizer(
-            base_lr=self.train_config.base_lr,
-            warmup_steps=self.train_config.warmup_steps,
-            total_steps=self.train_config.total_steps,
-            weight_decay=self.train_config.weight_decay,
-            clipnorm=self.train_config.clipnorm,
-            beta_1=self.train_config.beta_1,
-            beta_2=self.train_config.beta_2,
-        )
-        self.optimizer = self._base_optimizer
         grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
         self._grad_mask = grad_mask or None
 
