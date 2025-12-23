@@ -80,6 +80,11 @@ def parse_args():
         default=None,
         help="Override checkpoint save interval (int)",
     )
+    parser.add_argument(
+        "--wandb-project",
+        default=None,
+        help="Override wandb project",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +100,8 @@ if __name__ == "__main__":
         config.training.total_steps = int(args.total_steps)
     if args.save_every_n_steps is not None:
         config.training.save_every_n_steps = int(args.save_every_n_steps)
+    if args.wandb_project is not None:
+        config.training.wandb_project = args.wandb_project
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
