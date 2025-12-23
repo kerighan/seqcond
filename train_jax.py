@@ -75,6 +75,8 @@ if __name__ == "__main__":
         config.training.batch_size = int(args.batch_size)
     if args.total_steps is not None:
         config.training.total_steps = int(args.total_steps)
+    if args.save_every_n_steps is not None:
+        config.training.save_every_n_steps = int(args.save_every_n_steps)
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
