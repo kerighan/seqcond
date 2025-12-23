@@ -62,6 +62,24 @@ def parse_args():
         action="store_true",
         help="If set, keep theta parameters frozen (not trainable)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override training batch size (int)",
+    )
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=None,
+        help="Override total number of training steps (int)",
+    )
+    parser.add_argument(
+        "--save-every-n-steps",
+        type=int,
+        default=None,
+        help="Override checkpoint save interval (int)",
+    )
     return parser.parse_args()
 
 
