@@ -19,12 +19,14 @@ from seqcond.dataset import tokenizer
 from seqcond.jax import train
 
 
-model_config = ModelConfig.small(model_type="seqcond", num_thetas=4, seqcond_heads=16)
+model_config = ModelConfig.small(
+    model_type="seqcond", num_thetas=4, seqcond_heads=16, maxlen=1024
+)
 config = Config(
     model=model_config,
     training=TrainingConfig(
         batch_size=1,
-        maxlen=768,
+        maxlen=1024,
         base_lr=1e-3,
         warmup_steps=2000,
         total_steps=500000,
@@ -69,6 +71,10 @@ if __name__ == "__main__":
         config.training.use_multiple_tpus = True
     if args.freeze_thetas:
         config.training.train_thetas = False
+    if args.batch_size is not None:
+        config.training.batch_size = int(args.batch_size)
+    if args.total_steps is not None:
+        config.training.total_steps = int(args.total_steps)
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
