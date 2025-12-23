@@ -17,10 +17,11 @@ logging.getLogger("jax").setLevel(logging.ERROR)
 from seqcond.config import Config, ModelConfig, TrainingConfig
 from seqcond.dataset import tokenizer
 from seqcond.jax import train
-
+from jax_smi import initialise_tracking
+initialise_tracking()
 
 model_config = ModelConfig.small(
-    model_type="seqcond", num_thetas=4, seqcond_heads=16, maxlen=1024
+    model_type="seqcond", num_thetas=2, seqcond_heads=24, maxlen=1024
 )
 config = Config(
     model=model_config,
