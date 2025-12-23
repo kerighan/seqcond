@@ -7,7 +7,7 @@ import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["JAX_PLATFORMS"] = "cuda"
+os.environ["JAX_PLATFORMS"] = "tpu"
 
 import argparse
 import logging
