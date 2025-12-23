@@ -1,0 +1,88 @@
+"""
+JAX/Flax training script for language models.
+Uses the high-level training API from lib.jax.train.
+"""
+
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["JAX_PLATFORMS"] = "cuda"
+
+import argparse
+import logging
+
+logging.getLogger("jax").setLevel(logging.ERROR)
+
+from lib.config import Config, ModelConfig, TrainingConfig
+from lib.dataset import tokenizer
+from lib.jax import train
+
+
+model_config = ModelConfig.small(model_type="seqcond", num_thetas=4, seqcond_heads=16)
+config = Config(
+    model=model_config,
+    training=TrainingConfig(
+        batch_size=1,
+        maxlen=768,
+        base_lr=1e-3,
+        warmup_steps=2000,
+        total_steps=500000,
+        weight_decay=1e-2,
+        clipnorm=1.0,
+        beta_1=0.9,
+        beta_2=0.999,
+        grad_accum_steps=1,
+        mixed_precision="bfloat16",
+        keep_weights_fp32=True,
+        log_every_n_steps=1000,
+        generate_every_n_steps=10000,
+        save_every_n_steps=50000,
+        checkpoint_dir="checkpoints",
+        use_wandb=True,
+        wandb_project="slm-training-len768",
+    ),
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume-step", type=int, default=None)
+    parser.add_argument("--resume-checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--use-multiple-tpus",
+        action="store_true",
+        help="Enable pmap data-parallel training across all TPU devices",
+    )
+    parser.add_argument(
+        "--freeze-thetas",
+        action="store_true",
+        help="If set, keep theta parameters frozen (not trainable)",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.use_multiple_tpus:
+        config.training.use_multiple_tpus = True
+    if args.freeze_thetas:
+        config.training.train_thetas = False
+
+    resume_ckpt = args.resume_checkpoint
+    if resume_ckpt is None and args.resume_step is not None:
+        ckpt_name = f"{config.name}_step{args.resume_step}.pkl"
+        candidate = os.path.join(config.training.checkpoint_dir, ckpt_name)
+        if os.path.exists(candidate):
+            resume_ckpt = candidate
+            print(f"Resuming from {resume_ckpt}")
+        else:
+            print(f"Checkpoint for step {args.resume_step} not found at {candidate}")
+
+    train(
+        config=config,
+        tokenizer=tokenizer,
+        seed=args.seed,
+        resume_checkpoint=resume_ckpt,
+    )
