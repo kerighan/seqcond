@@ -18,6 +18,7 @@ from seqcond.config import Config, ModelConfig, TrainingConfig
 from seqcond.dataset import tokenizer
 from seqcond.jax import train
 from jax_smi import initialise_tracking
+
 initialise_tracking()
 
 model_config = ModelConfig.small(
@@ -66,13 +67,13 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=None,
         help="Override training batch size (int)",
     )
     parser.add_argument(
         "--total-steps",
         type=int,
-        default=500000,
+        default=None,
         help="Override total number of training steps (int)",
     )
     parser.add_argument(
@@ -84,13 +85,19 @@ def parse_args():
     parser.add_argument(
         "--log-every-n-steps",
         type=int,
-        default=1,
-        help="Log every n steps"
+        default=None,
+        help="Log every n steps",
     )
     parser.add_argument(
         "--wandb-project",
         default=None,
         help="Override wandb project",
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=None,
+        help="Number of batches to prefetch to device (0 disables)",
     )
     return parser.parse_args()
 
@@ -111,6 +118,8 @@ if __name__ == "__main__":
         config.training.wandb_project = args.wandb_project
     if args.log_every_n_steps is not None:
         config.training.log_every_n_steps = args.log_every_n_steps
+    if args.prefetch_batches is not None:
+        config.training.prefetch_batches = max(0, int(args.prefetch_batches))
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
