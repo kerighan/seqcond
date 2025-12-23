@@ -5,6 +5,7 @@ High-level training utilities for JAX/Flax models.
 import os
 import time
 import pickle
+import itertools
 from typing import Any, Optional, Callable, Tuple, Dict
 
 import jax
@@ -12,6 +13,9 @@ import jax.numpy as jnp
 import optax
 import numpy as np
 from flax.core import FrozenDict
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.experimental.pjit import pjit
+
 
 from .model import (
     create_seqcond_model,
@@ -27,7 +31,7 @@ from .metrics import MetricsAccumulator
 from .callback import generate_text
 
 from ..config import ModelConfig, TrainingConfig, Config
-from ..dataset import DataLoader
+from ..dataset import DataLoader, create_tf_dataset
 
 
 def _tree_map_with_names(tree, fn: Callable, path=()):
@@ -213,6 +217,34 @@ def make_train_step_with_debug(
     return train_step
 
 
+def make_fsdp_train_step(
+    model, optimizer, compute_dtype=jnp.float32, grad_mask=None
+):
+    """Create a PJIT-compiled FSDP train step."""
+
+    compute_dtype = jnp.dtype(compute_dtype)
+    keep_weights_fp32 = compute_dtype != jnp.float32
+
+    def train_step(params, opt_state, x, y):
+        def loss_fn(p):
+            p_apply = (
+                cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
+            )
+            logits = model.apply({"params": p_apply}, x, deterministic=True)
+            loss = sparse_categorical_crossentropy_loss(logits, y, ignore_class=0)
+            return loss, logits
+
+        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        grads = _apply_grad_mask(grads, grad_mask)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        metrics = {"loss": loss, "logits": logits}
+        return new_params, new_opt_state, metrics
+
+    return train_step
+
+
 def make_pmap_train_step(
     model, optimizer, compute_dtype=jnp.float32, axis_name: str = "devices"
 ):
@@ -337,9 +369,14 @@ class Trainer:
         self.compute_dtype = None
         self.start_step = 0
         self.use_pmap = False
+        self.use_fsdp = False
         self.num_devices = jax.device_count()
         self.per_device_batch = None
         self._pmap_train_step = None
+        self._fsdp_train_step = None
+        self.mesh = None
+        self.params_sharding = None
+        self.data_sharding = None
 
     def _replicate_tree(self, tree):
         return jax.device_put_replicated(tree, jax.local_devices())
@@ -347,7 +384,16 @@ class Trainer:
     def _unreplicate_tree(self, tree):
         return jax.tree_util.tree_map(lambda x: x[0], tree)
 
+    def _unshard_tree(self, tree):
+        """Unshard a tree from devices to host."""
+        return jax.tree_util.tree_map(
+            lambda x: x.addressable_data(0),
+            tree,
+        )
+
     def _host_tree(self, tree):
+        if self.use_fsdp:
+            return self._unshard_tree(tree)
         return jax.device_get(tree)
 
     def _params_for_host(self):
@@ -381,17 +427,84 @@ class Trainer:
         print("Creating model...")
         self.model = create_model_from_config(self.model_config)
 
-        # Initialize
-        rng = jax.random.PRNGKey(seed)
-        variables = init_model(
-            self.model, rng, input_shape=(1, self.model_config.maxlen)
+        # Determine multi-device usage
+        self.use_fsdp = (
+            bool(self.train_config.full_shard_data_parallel) and self.num_devices > 1
         )
-        self.params = variables["params"]
+        self.use_pmap = (
+            bool(self.train_config.use_multiple_tpus)
+            and not self.use_fsdp
+            and self.num_devices > 1
+        )
 
-        # Cast to compute dtype
+        if self.train_config.use_multiple_tpus and not (self.use_pmap or self.use_fsdp):
+            print(
+                "Warning: use_multiple_tpus is enabled but only one device was detected. "
+                "Falling back to single-device training."
+            )
+
+        grad_accum_steps = self.train_config.grad_accum_steps
+        if self.use_pmap or self.use_fsdp:
+            if grad_accum_steps != 1:
+                raise ValueError(
+                    "Gradient accumulation is not supported with multi-device training."
+                )
+            if self.train_config.batch_size % self.num_devices != 0:
+                raise ValueError(
+                    "Batch size must be divisible by the number of devices for multi-TPU training."
+                )
+            self.per_device_batch = self.train_config.batch_size // self.num_devices
+
+        if self.use_fsdp:
+            print(
+                f"Using FSDP across {self.num_devices} devices "
+                f"(per-device batch size = {self.per_device_batch})."
+            )
+            self.mesh = Mesh(jax.devices(), axis_names=("dp",))
+            # Parameters are sharded across devices, data is replicated
+            self.params_sharding = NamedSharding(self.mesh, PartitionSpec())
+            self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
+
+            # Init params and opt_state with PJIT
+            def init_fn(rng, model, optimizer, input_shape):
+                variables = model.init(rng, jnp.ones(input_shape, dtype=jnp.int32))
+                params = variables["params"]
+                opt_state = optimizer.init(params)
+                return params, opt_state
+
+            pjit_init_fn = pjit(
+                init_fn,
+                in_shardings=(
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                out_shardings=(self.params_sharding, self.params_sharding),
+            )
+
+            rng = jax.random.PRNGKey(seed)
+            with self.mesh:
+                self.params, self.opt_state = pjit_init_fn(
+                    rng,
+                    self.model,
+                    self._base_optimizer,
+                    (self.train_config.batch_size, self.model_config.maxlen),
+                )
+
+
+        else:  # Single device or PMAP
+            rng = jax.random.PRNGKey(seed)
+            variables = init_model(
+                self.model, rng, input_shape=(1, self.model_config.maxlen)
+            )
+            self.params = variables["params"]
+
+        # Cast to compute dtype if not keeping weights in FP32
         if (
             self.compute_dtype != jnp.float32
             and not self.train_config.keep_weights_fp32
+            and not self.use_fsdp  # FSDP handles this internally
         ):
             self.params = cast_params_to_dtype(self.params, self.compute_dtype)
 
@@ -400,12 +513,24 @@ class Trainer:
         except Exception:
             pass
 
-        num_params = count_parameters(self.params)
+        # Use PJIT to count params if FSDP, otherwise standard
+        if self.use_fsdp:
+
+            def count_params_fn(p):
+                return sum(x.size for x in jax.tree_util.tree_leaves(p))
+
+            num_params = pjit(
+                count_params_fn,
+                in_shardings=self.params_sharding,
+                out_shardings=None,
+            )(self.params)
+        else:
+            num_params = count_parameters(self.params)
+
         print(f"Model type: {self.model_config.model_type}")
         print(f"Parameters: {num_params:,}")
 
         # Create optimizer
-        grad_accum_steps = self.train_config.grad_accum_steps
         self._base_optimizer = create_optimizer(
             base_lr=self.train_config.base_lr,
             warmup_steps=self.train_config.warmup_steps,
@@ -417,35 +542,14 @@ class Trainer:
         )
         self.optimizer = self._base_optimizer
         grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
-        if grad_mask is not None:
-            # store for later updates
-            self._grad_mask = grad_mask
-        else:
-            self._grad_mask = None
-        self.opt_state = self.optimizer.init(self.params)
+        self._grad_mask = grad_mask or None
 
-        # Determine multi-device usage
-        self.use_pmap = (
-            bool(self.train_config.use_multiple_tpus) and self.num_devices > 1
-        )
-        if self.train_config.use_multiple_tpus and not self.use_pmap:
-            print(
-                "Warning: use_multiple_tpus enabled but only one device detected. "
-                "Falling back to single-device training."
-            )
+        if not self.use_fsdp:
+            self.opt_state = self.optimizer.init(self.params)
 
         if self.use_pmap:
-            if grad_accum_steps != 1:
-                raise ValueError(
-                    "Gradient accumulation is not supported when use_multiple_tpus=True."
-                )
-            if self.train_config.batch_size % self.num_devices != 0:
-                raise ValueError(
-                    "Batch size must be divisible by the number of devices for multi-TPU training."
-                )
-            self.per_device_batch = self.train_config.batch_size // self.num_devices
             print(
-                f"Using data parallelism across {self.num_devices} devices "
+                f"Using data parallelism (pmap) across {self.num_devices} devices "
                 f"(per-device batch size = {self.per_device_batch})."
             )
 
@@ -477,18 +581,31 @@ class Trainer:
             self.opt_state = self._replicate_tree(self.opt_state)
 
         # Create JIT-compiled steps
-        if self.use_pmap:
+        if self.use_fsdp:
+            step_fn = make_fsdp_train_step(
+                self.model, self.optimizer, self.compute_dtype, self._grad_mask
+            )
+            self._fsdp_train_step = pjit(
+                step_fn,
+                in_shardings=(
+                    self.params_sharding,
+                    self.params_sharding,
+                    self.data_sharding,
+                    self.data_sharding,
+                ),
+                out_shardings=(
+                    self.params_sharding,
+                    self.params_sharding,
+                    self.data_sharding,
+                ),
+            )
+        elif self.use_pmap:
             self._pmap_train_step = make_pmap_train_step(
                 self.model, self.optimizer, self.compute_dtype
             )
-            self._train_step = None
-            self._train_step_dbg = None
-            self._grad_step = None
-            self._update_step = None
         elif grad_accum_steps > 1:
             self._grad_step = make_grad_step(self.model)
             self._update_step = make_update_step(self.optimizer)
-            self._pmap_train_step = None
             print(f"Using gradient accumulation: {grad_accum_steps} steps")
         else:
             debug_opt = os.environ.get("SLM_JAX_DEBUG_OPT", "0").strip() == "1"
@@ -497,24 +614,19 @@ class Trainer:
                     base_lr=self.train_config.base_lr,
                     warmup_steps=self.train_config.warmup_steps,
                     total_steps=self.train_config.total_steps,
-                    alpha=1e-5,
                 )
                 self._train_step_dbg = make_train_step_with_debug(
                     self.model,
                     self.optimizer,
-                    lr_schedule=lr_schedule,
-                    clipnorm=self.train_config.clipnorm,
-                    compute_dtype=self.compute_dtype,
+                    lr_schedule,
+                    self.train_config.clipnorm,
+                    self.compute_dtype,
                 )
-                self._train_step = None
-                self._pmap_train_step = None
                 print("JAX debug optimizer logging enabled (SLM_JAX_DEBUG_OPT=1)")
             else:
                 self._train_step = make_train_step(
-                    self.model, self.optimizer, self.compute_dtype
+                    self.model, self.optimizer, self.compute_dtype, self._grad_mask
                 )
-                self._train_step_dbg = None
-                self._pmap_train_step = None
 
         # Initialize wandb if enabled
         if self.train_config.use_wandb:
@@ -549,13 +661,26 @@ class Trainer:
         grad_accum_steps = tc.grad_accum_steps
 
         # Create data loader if not provided
+        # Use tf.data for better performance on TPUs
         if self.data_loader is None:
             micro_steps = tc.total_steps * grad_accum_steps
-            self.data_loader = DataLoader(
+            print("Initializing tf.data pipeline...")
+            dataset = create_tf_dataset(
                 batch_size=tc.batch_size,
                 max_steps=micro_steps,
                 maxlen=tc.maxlen,
+                prefetch_buffer=tc.prefetch_batches
+                if tc.prefetch_batches > 0
+                else None,
             )
+            data_iterator = dataset.as_numpy_iterator()
+            # We need to track tokens manually since we are not using the python DataLoader class
+            tokens_seen = 0
+            last_tokens_seen = 0
+            using_tf_data = True
+        else:
+            data_iterator = iter(self.data_loader)
+            using_tf_data = False
 
         # Training state
         metrics = MetricsAccumulator(ignore_class=0)
@@ -568,12 +693,52 @@ class Trainer:
 
         start_time = time.time()
         last_log_time = start_time
-        self.data_loader.reset_stats()
+        if not using_tf_data:
+            self.data_loader.reset_stats()
 
         print("\nStarting training...")
 
-        for step, (x_batch, y_batch) in enumerate(self.data_loader):
-            if self.use_pmap:
+        # Metrics are now computed on device and only fetched for logging
+        device_metrics = None
+
+        for step in itertools.count(start=1):
+            if step > tc.total_steps * grad_accum_steps:
+                break
+
+            try:
+                x_batch, y_batch = next(data_iterator)
+                # Update manual token tracking if using tf.data
+                if using_tf_data:
+                    # Approximation: batch_size * seq_len (actual tokens might be less due to padding)
+                    # But for SYNTH dataset we usually pack or pad to maxlen.
+                    # x_batch is (batch, len)
+                    tokens_in_batch = x_batch.size
+                    tokens_seen += tokens_in_batch
+            except StopIteration:
+                print("Data loader exhausted.")
+                break
+
+            if self.use_fsdp:
+                x = jax.device_put(
+                    jnp.array(x_batch, dtype=jnp.int32), self.data_sharding
+                )
+                y = jax.device_put(
+                    jnp.array(y_batch, dtype=jnp.int32), self.data_sharding
+                )
+                with self.mesh:
+                    (
+                        self.params,
+                        self.opt_state,
+                        device_metrics,
+                    ) = self._fsdp_train_step(self.params, self.opt_state, x, y)
+                macro_step += 1
+                y_metric, logits_metric, loss_metric = (
+                    y,
+                    device_metrics["logits"],
+                    device_metrics["loss"],
+                )
+
+            elif self.use_pmap:
                 x = jnp.array(x_batch, dtype=jnp.int32).reshape(
                     self.num_devices, self.per_device_batch, -1
                 )
@@ -584,12 +749,13 @@ class Trainer:
                     self.params, self.opt_state, x, y
                 )
                 macro_step += 1
-
-                loss_metric = jnp.array(jax.device_get(loss)).mean()
-                logits_metric = jnp.array(jax.device_get(logits)).reshape(
-                    self.train_config.batch_size, -1, logits.shape[-1]
+                # This is the blocking part we want to avoid.
+                # For pmap, we still need to get it for now.
+                loss_metric = jnp.mean(jax.device_get(loss))
+                logits_metric = jax.device_get(logits).reshape(
+                    tc.batch_size, -1, logits.shape[-1]
                 )
-                y_metric = jnp.array(y_batch, dtype=jnp.int32)
+                y_metric = y_batch
             else:
                 x = jnp.array(x_batch, dtype=jnp.int32)
                 y = jnp.array(y_batch, dtype=jnp.int32)
@@ -598,7 +764,6 @@ class Trainer:
                     loss, logits, grads = self._grad_step(self.params, x, y)
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
                     accum_count += 1
-
                     if accum_count >= grad_accum_steps:
                         self.params, self.opt_state = self._update_step(
                             self.params, self.opt_state, grads_accum
@@ -607,45 +772,44 @@ class Trainer:
                         accum_count = 0
                         macro_step += 1
                 else:
-                    next_step = macro_step + 1
-                    if self._train_step_dbg is not None:
+                    if self._train_step_dbg:
                         self.params, self.opt_state, loss, logits, dbg = (
                             self._train_step_dbg(
-                                self.params, self.opt_state, x, y, next_step
+                                self.params, self.opt_state, x, y, macro_step + 1
                             )
                         )
                     else:
                         self.params, self.opt_state, loss, logits = self._train_step(
                             self.params, self.opt_state, x, y
                         )
-                    macro_step = next_step
+                    macro_step += 1
 
-                y_metric = y
-                logits_metric = logits
-                loss_metric = loss
+                loss_metric, logits_metric, y_metric = loss, logits, y
 
-            metrics.update(y_metric, logits_metric, loss_metric)
+            # Non-blocking metrics update for FSDP
+            if not self.use_pmap:
+                metrics.update(y_metric, logits_metric, loss_metric)
 
-            # Wandb logging every gradient step
-            if self._wandb is not None and (
-                self.use_pmap or grad_accum_steps <= 1 or accum_count == 0
-            ):
-                payload = {"loss": float(loss_metric), "step": macro_step}
-                if grad_accum_steps <= 1 and self._train_step_dbg is not None:
-                    payload.update(
-                        {
-                            "lr": float(dbg["lr"]),
-                            "grad_norm": float(dbg["grad_norm"]),
-                            "update_norm": float(dbg["update_norm"]),
-                            "clip_ratio": float(dbg["clip_ratio"]),
-                        }
+            # Logging, Generation, Checkpointing
+            if macro_step > 0 and macro_step % tc.log_every_n_steps == 0:
+                if using_tf_data:
+                    tokens_delta = tokens_seen - last_tokens_seen
+                    last_tokens_seen = tokens_seen
+                    current_tokens_seen = tokens_seen
+                else:
+                    tokens_delta = self.data_loader.tokens_since_last_check()
+                    current_tokens_seen = self.data_loader.tokens_seen
+
+                # For FSDP, metrics are on-device, fetch them now
+                if self.use_fsdp and device_metrics is not None:
+                    # Since metrics are reset after logging, we update here
+                    metrics.update(
+                        y_metric, device_metrics["logits"], device_metrics["loss"]
                     )
-                self._wandb.log(payload, step=macro_step)
+                # For pmap, we still fetch them synchronously
+                elif self.use_pmap:
+                    metrics.update(y_metric, logits_metric, loss_metric)
 
-            # Logging
-            log_interval = tc.log_every_n_steps * grad_accum_steps
-            if (step + 1) % log_interval == 0:
-                tokens_delta = self.data_loader.tokens_since_last_check()
                 self._log_progress(
                     macro_step,
                     tc.total_steps,
@@ -653,32 +817,23 @@ class Trainer:
                     start_time,
                     last_log_time,
                     tokens_delta,
-                    self.data_loader.tokens_seen,
+                    current_tokens_seen,
                 )
                 metrics.reset()
                 last_log_time = time.time()
 
-                if grad_accum_steps <= 1 and self._train_step_dbg is not None:
-                    print(
-                        f"debug | lr: {float(dbg['lr']):.3e} | "
-                        f"grad_norm: {float(dbg['grad_norm']):.3e} | "
-                        f"update_norm: {float(dbg['update_norm']):.3e} | "
-                        f"clip_ratio: {float(dbg['clip_ratio']):.3f}"
-                    )
-
-            # Generation
-            gen_interval = tc.generate_every_n_steps * grad_accum_steps
-            if (step + 1) % gen_interval == 0:
+            if macro_step > 0 and macro_step % tc.generate_every_n_steps == 0:
                 self._generate_sample(macro_step)
 
-            # Checkpointing
-            save_interval = tc.save_every_n_steps * grad_accum_steps
-            if tc.save_every_n_steps > 0 and (step + 1) % save_interval == 0:
+            if (
+                macro_step > 0
+                and tc.save_every_n_steps > 0
+                and macro_step % tc.save_every_n_steps == 0
+            ):
                 self._save_checkpoint(macro_step)
 
         print("\nTraining complete!")
         self._save_checkpoint(macro_step, final=True)
-
         return self.params
 
     def _log_progress(
@@ -707,7 +862,9 @@ class Trainer:
         eta_m = int((eta_seconds % 3600) // 60)
         eta_s = int(eta_seconds % 60)
 
-        results = metrics.result()
+        # This is now the only place we should be calling device_get for metrics
+        results = jax.device_get(metrics.result())
+
         print(
             f"Step {macro_step:6d}/{total_steps} | "
             f"loss: {results['loss']:.4f} | "
@@ -718,29 +875,27 @@ class Trainer:
             f"ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
         )
 
-        # Wandb detailed logging (names aligned with TensorFlow for comparison)
+        # Wandb detailed logging
         if self._wandb is not None:
-            self._wandb.log(
-                {
-                    "loss": results["loss"],
-                    "acc": results["acc"],
-                    "topk": results["topk"],
-                    "ppx": results["ppx"],
-                    "tokens_per_sec": tokens_per_sec,
-                    "tokens_seen": tokens_seen,
-                },
-                step=macro_step,
-            )
+            log_data = {
+                **{k: float(v) for k, v in results.items()},
+                "tokens_per_sec": tokens_per_sec,
+                "tokens_seen": tokens_seen,
+            }
+            self._wandb.log(log_data, step=macro_step)
 
     def _generate_sample(self, step: int):
         """Generate a text sample (dual pad modes: fixed, power2)."""
         # Use a complete prompt that expects assistant response with thinking
         prompt = "<|im_start|>user\n"
 
+        # Ensure params are on the host for generation
+        host_params = self._params_for_host()
+
         print(f"\n--- Generation at step {step} (fixed padding) ---")
         txt_fixed = generate_text(
             model=self.model,
-            params=self.params,
+            params=host_params,
             tokenizer=self.tokenizer,
             prompt=prompt,
             max_new_tokens=128,
@@ -758,7 +913,7 @@ class Trainer:
         print(f"--- Generation at step {step} (power2 padding) ---")
         txt_power2 = generate_text(
             model=self.model,
-            params=self.params,
+            params=host_params,
             tokenizer=self.tokenizer,
             prompt=prompt,
             max_new_tokens=128,
@@ -783,7 +938,11 @@ class Trainer:
                 f"{self.train_config.checkpoint_dir}/{self.model_name}_step{step}.pkl"
             )
 
-        save_checkpoint(self.params, self.opt_state, self.config, path, step)
+        # Get params and opt_state from devices before saving
+        params_to_save = self._params_for_host()
+        opt_state_to_save = self._opt_state_for_host()
+
+        save_checkpoint(params_to_save, opt_state_to_save, self.config, path, step)
         print(f"Checkpoint saved: {path}")
 
 

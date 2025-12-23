@@ -60,6 +60,11 @@ def parse_args():
         help="Enable pmap data-parallel training across all TPU devices",
     )
     parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Enable fully sharded data parallel (FSDP) training",
+    )
+    parser.add_argument(
         "--freeze-thetas",
         action="store_true",
         help="If set, keep theta parameters frozen (not trainable)",
@@ -106,6 +111,8 @@ if __name__ == "__main__":
     args = parse_args()
     if args.use_multiple_tpus:
         config.training.use_multiple_tpus = True
+    if args.fsdp:
+        config.training.full_shard_data_parallel = True
     if args.freeze_thetas:
         config.training.train_thetas = False
     if args.batch_size is not None:

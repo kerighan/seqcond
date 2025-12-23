@@ -132,10 +132,11 @@ class MetricsAccumulator:
         self.reset()
 
     def reset(self):
-        self.total_loss = 0.0
-        self.total_correct = 0.0
-        self.total_top_k_correct = 0.0
-        self.total_count = 0.0
+        # Initialize as JAX arrays to avoid implicit sync
+        self.total_loss = jnp.array(0.0, dtype=jnp.float32)
+        self.total_correct = jnp.array(0.0, dtype=jnp.float32)
+        self.total_top_k_correct = jnp.array(0.0, dtype=jnp.float32)
+        self.total_count = jnp.array(0.0, dtype=jnp.float32)
 
     def update(
         self,
@@ -158,22 +159,28 @@ class MetricsAccumulator:
         )
         masked_top_k_correct = jnp.where(mask, top_k_correct, 0.0)
 
-        self.total_count += float(count)
-        self.total_correct += float(jnp.sum(masked_correct))
-        self.total_top_k_correct += float(jnp.sum(masked_top_k_correct))
+        # Accumulate as JAX arrays (non-blocking)
+        self.total_count += count
+        self.total_correct += jnp.sum(masked_correct)
+        self.total_top_k_correct += jnp.sum(masked_top_k_correct)
 
         if loss is not None:
-            self.total_loss += float(loss * count)
+            self.total_loss += loss * count
 
     def result(self):
-        if self.total_count == 0:
-            return {"acc": 0.0, "topk": 0.0, "ppx": 0.0, "loss": 0.0}
-
-        acc = self.total_correct / self.total_count
-        topk = self.total_top_k_correct / self.total_count
-        mean_loss = self.total_loss / self.total_count
-        ppx = min(10000.0, round(float(jnp.exp(mean_loss)) * 100.0) / 100.0)
-
+        # Returns JAX arrays. Call jax.device_get() on the result dict.
+        # Avoid division by zero
+        safe_count = jnp.maximum(self.total_count, 1.0)
+        
+        acc = self.total_correct / safe_count
+        topk = self.total_top_k_correct / safe_count
+        mean_loss = self.total_loss / safe_count
+        
+        ppx = jnp.exp(mean_loss)
+        # Clip and round could be done here or in logging, but keep consistent
+        ppx = jnp.clip(ppx, 0.0, 10000.0)
+        
+        # Return scalar JAX arrays
         return {
             "acc": acc,
             "topk": topk,

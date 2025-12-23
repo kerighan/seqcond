@@ -138,6 +138,7 @@ class TrainingConfig:
     # Gradient accumulation
     grad_accum_steps: int = 1
     use_multiple_tpus: bool = False
+    full_shard_data_parallel: bool = False
     train_thetas: bool = True
     prefetch_batches: int = 0
 
