@@ -138,6 +138,7 @@ class TrainingConfig:
     # Gradient accumulation
     grad_accum_steps: int = 1
     use_multiple_tpus: bool = False
+    train_thetas: bool = True
 
     # Mixed precision
     mixed_precision: Optional[Literal["float16", "bfloat16"]] = None

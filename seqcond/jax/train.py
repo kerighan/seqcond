@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
+from flax.core import FrozenDict
 
 from .model import (
     create_seqcond_model,
@@ -27,6 +28,42 @@ from .callback import generate_text
 
 from ..config import ModelConfig, TrainingConfig, Config
 from ..dataset import DataLoader
+
+
+def _tree_map_with_names(tree, fn: Callable, path=()):
+    if isinstance(tree, FrozenDict):
+        return FrozenDict(
+            {k: _tree_map_with_names(v, fn, path + (k,)) for k, v in tree.items()}
+        )
+    if isinstance(tree, dict):
+        return {k: _tree_map_with_names(v, fn, path + (k,)) for k, v in tree.items()}
+    return fn(path, tree)
+
+
+def _theta_trainable_mask(params, train_thetas: bool):
+    if train_thetas:
+        return jax.tree_util.tree_map(lambda _: True, params)
+
+    def selector(path, _):
+        return not any("theta" in str(key).lower() for key in path)
+
+    return _tree_map_with_names(params, selector)
+
+
+def _create_grad_mask(params, train_thetas: bool):
+    bool_mask = _theta_trainable_mask(params, train_thetas)
+
+    def to_array(keep, p):
+        ones = jnp.ones_like(p)
+        return ones if keep else jnp.zeros_like(p)
+
+    return jax.tree_util.tree_map(to_array, bool_mask, params)
+
+
+def _apply_grad_mask(grads, mask):
+    if mask is None:
+        return grads
+    return jax.tree_util.tree_map(lambda g, m: g * m, grads, mask)
 
 
 def _global_norm(tree: Any) -> jnp.ndarray:
@@ -114,7 +151,7 @@ def cast_params_to_dtype(params: Any, dtype: jnp.dtype) -> Any:
     return jax.tree_util.tree_map(lambda x: x.astype(dtype), params)
 
 
-def make_train_step(model, optimizer, compute_dtype=jnp.float32):
+def make_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None):
     """Create a JIT-compiled train step function."""
 
     compute_dtype = jnp.dtype(compute_dtype)
@@ -129,6 +166,7 @@ def make_train_step(model, optimizer, compute_dtype=jnp.float32):
             return loss, logits
 
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        grads = _apply_grad_mask(grads, grad_mask)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss, logits
@@ -293,6 +331,7 @@ class Trainer:
         # Will be initialized in setup()
         self.model = None
         self.params = None
+        self._base_optimizer = None
         self.optimizer = None
         self.opt_state = None
         self.compute_dtype = None
@@ -367,7 +406,7 @@ class Trainer:
 
         # Create optimizer
         grad_accum_steps = self.train_config.grad_accum_steps
-        self.optimizer = create_optimizer(
+        self._base_optimizer = create_optimizer(
             base_lr=self.train_config.base_lr,
             warmup_steps=self.train_config.warmup_steps,
             total_steps=self.train_config.total_steps,
@@ -376,6 +415,13 @@ class Trainer:
             beta_1=self.train_config.beta_1,
             beta_2=self.train_config.beta_2,
         )
+        self.optimizer = self._base_optimizer
+        grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
+        if grad_mask is not None:
+            # store for later updates
+            self._grad_mask = grad_mask
+        else:
+            self._grad_mask = None
         self.opt_state = self.optimizer.init(self.params)
 
         # Determine multi-device usage
