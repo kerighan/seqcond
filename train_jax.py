@@ -4,34 +4,24 @@ Uses the high-level training API from lib.jax.train.
 """
 
 import os
+import argparse
 import logging
+from dataclasses import fields
 
 # 1. Environment and Distributed Init MUST happen first
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["JAX_PLATFORMS"] = "tpu"
 
-import jax
-try:
-    print("Initializing JAX distributed...")
-    jax.distributed.initialize()
-    print(f"JAX distributed initialized. Process {jax.process_index()} / {jax.process_count()}")
-except Exception as e:
-    print(f"JAX distributed initialization failed or not required: {e}")
-
-import argparse
-from dataclasses import fields
-
 logging.getLogger("jax").setLevel(logging.ERROR)
 
-from seqcond.config import Config, ModelConfig, TrainingConfig
-from seqcond.dataset import tokenizer
-from seqcond.jax import train
-from jax_smi import initialise_tracking
-
-
+# Pre-define parse_args so we can use it before full imports
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SeqCond model", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # # Distributed / Debugging
+    # parser.add_argument("--jax-distributed", action="store_true", help="Initialize JAX distributed system (for multi-host TPU)")
+    # parser.add_argument("--jax-smi", action="store_true", help="Enable JAX SMI tracking (memory profiler)")
 
     # Base Configuration
     parser.add_argument("--size", choices=["small", "medium", "large", "xlarge"], default="small", help="Base model size configuration")
@@ -66,6 +56,19 @@ def parse_args():
     grp_train.add_argument("--lr", type=float, default=None, dest="base_lr", help="Override learning rate")
 
     return parser.parse_args()
+
+# Parse args immediately to configure environment
+args = parse_args()
+
+import jax
+
+jax.distributed.initialize()
+
+# Now import application modules
+from seqcond.config import Config, ModelConfig, TrainingConfig
+from seqcond.dataset import tokenizer
+from seqcond.jax import train
+from jax_smi import initialise_tracking
 
 
 def get_config(args) -> Config:
@@ -136,7 +139,8 @@ def get_config(args) -> Config:
 
 def main():
     initialise_tracking()
-    args = parse_args()
+    print("JAX SMI tracking enabled")
+    
     config = get_config(args)
 
     # Resume Logic
