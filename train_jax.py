@@ -15,6 +15,9 @@ os.environ["JAX_PLATFORMS"] = "tpu"
 
 logging.getLogger("jax").setLevel(logging.ERROR)
 
+import jax
+jax.distributed.initialize()
+
 from seqcond.config import Config, ModelConfig, TrainingConfig
 from seqcond.dataset import tokenizer
 from seqcond.jax import train
