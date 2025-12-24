@@ -456,10 +456,10 @@ class Trainer:
             )
 
         grad_accum_steps = self.train_config.grad_accum_steps
-        if self.use_pmap or self.use_fsdp:
+        if self.use_pmap:
             if grad_accum_steps != 1:
                 raise ValueError(
-                    "Gradient accumulation is not supported with multi-device training."
+                    "Gradient accumulation is not supported with pmap multi-device training. Use FSDP instead."
                 )
             if self.train_config.batch_size % self.num_devices != 0:
                 raise ValueError(
@@ -468,6 +468,11 @@ class Trainer:
             self.per_device_batch = self.train_config.batch_size // self.num_devices
 
         if self.use_fsdp:
+            if self.train_config.batch_size % self.num_devices != 0:
+                raise ValueError(
+                    "Batch size must be divisible by the number of devices for FSDP training."
+                )
+            self.per_device_batch = self.train_config.batch_size // self.num_devices
             print(
                 f"Using FSDP across {self.num_devices} devices "
                 f"(per-device batch size = {self.per_device_batch})."
@@ -624,23 +629,54 @@ class Trainer:
 
         # Create JIT-compiled steps
         if self.use_fsdp:
-            step_fn = make_fsdp_train_step(
-                self.model, self.optimizer, self.compute_dtype, self._grad_mask
-            )
-            self._fsdp_train_step = pjit(
-                step_fn,
-                in_shardings=(
-                    self.params_sharding,
-                    self.opt_state_sharding,
-                    self.data_sharding,
-                    self.data_sharding,
-                ),
-                out_shardings=(
-                    self.params_sharding,
-                    self.opt_state_sharding,
-                    metrics_sharding,
-                ),
-            )
+            if grad_accum_steps > 1:
+                # 1. Grad step for FSDP
+                def fsdp_grad_step_fn(params, x, y):
+                    def loss_fn(p):
+                        p_apply = cast_params_to_dtype(p, self.compute_dtype) if (self.compute_dtype != jnp.float32 and self.train_config.keep_weights_fp32) else p
+                        logits = self.model.apply({"params": p_apply}, x, deterministic=True)
+                        loss = sparse_categorical_crossentropy_loss(logits, y, ignore_class=0)
+                        return loss, logits
+                    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+                    grads = _apply_grad_mask(grads, self._grad_mask)
+                    return grads, loss, logits
+
+                self._fsdp_grad_step = pjit(
+                    fsdp_grad_step_fn,
+                    in_shardings=(self.params_sharding, self.data_sharding, self.data_sharding),
+                    out_shardings=(self.params_sharding, replicated_sharding, self.data_sharding),
+                )
+                
+                # 2. Update step for FSDP
+                def fsdp_update_step_fn(params, opt_state, grads):
+                    updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
+                    new_params = optax.apply_updates(params, updates)
+                    return new_params, new_opt_state
+
+                self._fsdp_update_step = pjit(
+                    fsdp_update_step_fn,
+                    in_shardings=(self.params_sharding, self.opt_state_sharding, self.params_sharding),
+                    out_shardings=(self.params_sharding, self.opt_state_sharding),
+                )
+                print(f"Using FSDP with gradient accumulation: {grad_accum_steps} steps")
+            else:
+                step_fn = make_fsdp_train_step(
+                    self.model, self.optimizer, self.compute_dtype, self._grad_mask
+                )
+                self._fsdp_train_step = pjit(
+                    step_fn,
+                    in_shardings=(
+                        self.params_sharding,
+                        self.opt_state_sharding,
+                        self.data_sharding,
+                        self.data_sharding,
+                    ),
+                    out_shardings=(
+                        self.params_sharding,
+                        self.opt_state_sharding,
+                        metrics_sharding,
+                    ),
+                )
         elif self.use_pmap:
             self._pmap_train_step = make_pmap_train_step(
                 self.model, self.optimizer, self.compute_dtype
@@ -767,18 +803,38 @@ class Trainer:
                 y = jax.device_put(
                     jnp.array(y_batch, dtype=jnp.int32), self.data_sharding
                 )
-                with self.mesh:
-                    (
-                        self.params,
-                        self.opt_state,
-                        device_metrics,
-                    ) = self._fsdp_train_step(self.params, self.opt_state, x, y)
-                macro_step += 1
-                y_metric, logits_metric, loss_metric = (
-                    y,
-                    device_metrics["logits"],
-                    device_metrics["loss"],
-                )
+                
+                if grad_accum_steps > 1:
+                    with self.mesh:
+                        grads, loss, logits = self._fsdp_grad_step(self.params, x, y)
+                    
+                    grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
+                    accum_count += 1
+                    
+                    if accum_count >= grad_accum_steps:
+                        with self.mesh:
+                            self.params, self.opt_state = self._fsdp_update_step(
+                                self.params, self.opt_state, grads_accum
+                            )
+                        grads_accum = None
+                        accum_count = 0
+                        macro_step += 1
+                    
+                    # For metrics, we use the values from the current micro-batch
+                    loss_metric, logits_metric, y_metric = loss, logits, y
+                else:
+                    with self.mesh:
+                        (
+                            self.params,
+                            self.opt_state,
+                            device_metrics,
+                        ) = self._fsdp_train_step(self.params, self.opt_state, x, y)
+                    macro_step += 1
+                    y_metric, logits_metric, loss_metric = (
+                        y,
+                        device_metrics["logits"],
+                        device_metrics["loss"],
+                    )
 
             elif self.use_pmap:
                 x = jnp.array(x_batch, dtype=jnp.int32).reshape(
