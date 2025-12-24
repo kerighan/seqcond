@@ -88,7 +88,16 @@ def iterate_synth(
         text = format_synth_item(item)
 
         if tokenize:
-            yield tok.encode(text)
+            try:
+                tokens = tok.encode(text)
+                yield tokens
+            except ValueError as e:
+                if "disallowed special token" in str(e):
+                    # Skip this sample entirely and continue to next one
+                    print(f"[WARNING] Skipping sample with disallowed special token: {e}")
+                    continue
+                else:
+                    raise
         else:
             yield text
 
