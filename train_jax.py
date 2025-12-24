@@ -165,6 +165,12 @@ def parse_args():
         default=None,
         help="Generate samples every n steps",
     )
+    parser.add_argument(
+        "--maxlen",
+        type=int,
+        default=1024,
+        help="Max length",
+    )
     return parser.parse_args()
 
 
@@ -206,6 +212,9 @@ if __name__ == "__main__":
         config.model.seqcond_heads = int(args.seqcond_heads)
     if args.generate_every_n_steps is not None:
         config.training.generate_every_n_steps = int(args.generate_every_n_steps)
+    if args.maxlen is not None:
+        config.model.maxlen = args.maxlen
+        config.training.maxlen = args.maxlen
 
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
