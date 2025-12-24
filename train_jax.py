@@ -36,6 +36,7 @@ def parse_args():
     grp_model.add_argument("--d-model", type=int, default=None, help="Override model dimension")
     grp_model.add_argument("--d-ff", type=int, default=None, help="Override feed-forward dimension")
     grp_model.add_argument("--num-thetas", type=int, default=None, help="Override number of theta parameters")
+    grp_model.add_argument("--ratio", type=int, default=None, dest="seqcond_ratio", help="Override seqcond to transformer ratio")
     grp_model.add_argument("--derivative", type=int, default=None, dest="derivative_order", help="Override derivative order (0, 1, 2)")
     grp_model.add_argument("--anchor", type=int, default=None, dest="num_anchor_heads", help="Override number of anchor heads")
     grp_model.add_argument("--seqcond-heads", type=int, default=None, help="Override number of seqcond heads")
@@ -81,7 +82,7 @@ def get_config(args) -> Config:
     model_overrides = {}
     
     # Direct mappings (name matches)
-    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type"]:
+    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type", "seqcond_ratio"]:
         val = getattr(args, field)
         if val is not None:
             model_overrides[field] = val
