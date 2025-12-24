@@ -22,7 +22,7 @@ from jax_smi import initialise_tracking
 initialise_tracking()
 
 model_config = ModelConfig.small(
-    model_type="seqcond", num_thetas=2, seqcond_heads=24, maxlen=1024
+    model_type="seqcond", num_thetas=2, seqcond_heads=24, maxlen=1024, vocab_size=100300
 )
 config = Config(
     model=model_config,
@@ -142,6 +142,18 @@ def parse_args():
         help="Number of theta parameters for seqcond",
     )
     parser.add_argument(
+        "--derivative",
+        type=int,
+        default=0,
+        help="Derivative order for seqcond (0, 1, or 2)",
+    )
+    parser.add_argument(
+        "--anchor",
+        type=int,
+        default=0,
+        help="Number of anchor heads for seqcond",
+    )
+    parser.add_argument(
         "--seqcond-heads",
         type=int,
         default=None,
@@ -188,6 +200,8 @@ if __name__ == "__main__":
         config.model.d_ff = int(args.d_ff)
     if args.num_thetas is not None:
         config.model.num_thetas = int(args.num_thetas)
+    config.model.derivative_order = int(args.derivative)
+    config.model.num_anchor_heads = int(args.anchor)
     if args.seqcond_heads is not None:
         config.model.seqcond_heads = int(args.seqcond_heads)
     if args.generate_every_n_steps is not None:

@@ -600,6 +600,18 @@ class Trainer:
                     f"Resumed from checkpoint {self.resume_checkpoint} "
                     f"(step {self.start_step})"
                 )
+                
+                # Validate parameter shapes
+                try:
+                    emb_shape = self.params["token_embedding"]["embedding"].shape
+                    expected_shape = (self.model_config.vocab_size, self.model_config.d_model)
+                    if emb_shape != expected_shape:
+                        print(f"WARNING: Parameter shape mismatch in token_embedding!")
+                        print(f"  Checkpoint: {emb_shape}")
+                        print(f"  Config:     {expected_shape}")
+                        print(f"  This may cause errors. Consider updating config.vocab_size to {emb_shape[0]}.")
+                except KeyError:
+                    pass
             else:
                 print(
                     f"Warning: checkpoint {self.resume_checkpoint} not found. "

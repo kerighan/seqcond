@@ -55,7 +55,7 @@ class StepwiseGenerationCallback:
         """Called at the end of a training batch."""
         self.step_counter += 1
 
-        if self.step_counter % self.trigger_every_n_steps == 0:
+        if self.trigger_every_n_steps > 0 and self.step_counter % self.trigger_every_n_steps == 0:
             print(f"\n--- Generation at step {self.step_counter} ---")
             # Generate with fixed padding
             txt_fixed = generate_text(

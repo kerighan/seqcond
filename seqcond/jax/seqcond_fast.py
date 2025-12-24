@@ -175,6 +175,8 @@ class SeqCondAttention(nn.Module):
 
         if self._derivative_order == 0:
             re_m, im_m = cos_b, sin_b
+        elif self._derivative_order == 1:
+            re_m, im_m = x_val5 * sin_b, x_val5 * cos_b
         else:
             deriv_logits = self.param(
                 "deriv_logits",
