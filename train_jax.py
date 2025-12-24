@@ -4,19 +4,25 @@ Uses the high-level training API from lib.jax.train.
 """
 
 import os
-import argparse
 import logging
-from dataclasses import fields
 
-# Environment setup
+# 1. Environment and Distributed Init MUST happen first
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["JAX_PLATFORMS"] = "tpu"
 
-logging.getLogger("jax").setLevel(logging.ERROR)
-
 import jax
-jax.distributed.initialize()
+try:
+    print("Initializing JAX distributed...")
+    jax.distributed.initialize()
+    print(f"JAX distributed initialized. Process {jax.process_index()} / {jax.process_count()}")
+except Exception as e:
+    print(f"JAX distributed initialization failed or not required: {e}")
+
+import argparse
+from dataclasses import fields
+
+logging.getLogger("jax").setLevel(logging.ERROR)
 
 from seqcond.config import Config, ModelConfig, TrainingConfig
 from seqcond.dataset import tokenizer
