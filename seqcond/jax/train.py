@@ -114,7 +114,6 @@ def create_model_from_config(config: ModelConfig):
             tie_weights=config.tie_weights,
             qk_norm=config.qk_norm,
             qk_norm_eps=config.qk_norm_eps,
-            use_conv=config.use_conv,
             conv_kernel_size=config.conv_kernel_size,
             remat=config.remat,
         )
@@ -136,7 +135,6 @@ def create_model_from_config(config: ModelConfig):
             tie_weights=config.tie_weights,
             qk_norm=config.qk_norm,
             qk_norm_eps=config.qk_norm_eps,
-            use_conv=config.use_conv,
             conv_kernel_size=config.conv_kernel_size,
             remat=config.remat,
         )

@@ -35,7 +35,6 @@ class ModelConfig:
     num_thetas: int = 4
     derivative_order: int = 0
     num_anchor_heads: int = 0
-    use_conv: bool = True
     conv_kernel_size: int = 4
     use_positional_embedding: bool = False
     seqcond_ratio: int = 5  # Interleaving ratio
