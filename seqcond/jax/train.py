@@ -27,7 +27,7 @@ from .model import (
     count_parameters,
     sparse_categorical_crossentropy_loss,
 )
-from .metrics import MetricsAccumulator
+from .metrics import MetricsAccumulator, compute_batch_metrics
 from .callback import generate_text
 
 from ..config import ModelConfig, TrainingConfig, Config
@@ -93,6 +93,7 @@ def create_model_from_config(config: ModelConfig):
             tie_weights=config.tie_weights,
             qk_norm=config.qk_norm,
             qk_norm_eps=config.qk_norm_eps,
+            remat=config.remat,
         )
     elif config.model_type == "seqcond":
         return create_seqcond_model(
@@ -115,6 +116,7 @@ def create_model_from_config(config: ModelConfig):
             qk_norm_eps=config.qk_norm_eps,
             use_conv=config.use_conv,
             conv_kernel_size=config.conv_kernel_size,
+            remat=config.remat,
         )
     elif config.model_type == "seqcond2":
         return create_seqcond_model_v2(
@@ -136,6 +138,7 @@ def create_model_from_config(config: ModelConfig):
             qk_norm_eps=config.qk_norm_eps,
             use_conv=config.use_conv,
             conv_kernel_size=config.conv_kernel_size,
+            remat=config.remat,
         )
     else:
         raise ValueError(f"Unknown model type: {config.model_type}")
@@ -173,7 +176,9 @@ def make_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None)
         grads = _apply_grad_mask(grads, grad_mask)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, logits
+        
+        metrics = compute_batch_metrics(logits, y, ignore_class=0)
+        return new_params, new_opt_state, metrics
 
     return train_step
 
@@ -239,7 +244,7 @@ def make_fsdp_train_step(
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        metrics = {"loss": loss, "logits": logits}
+        metrics = compute_batch_metrics(logits, y, ignore_class=0)
         return new_params, new_opt_state, metrics
 
     return train_step
@@ -263,9 +268,19 @@ def make_pmap_train_step(
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x, y)
         loss = jax.lax.pmean(loss, axis_name=axis_name)
         grads = jax.lax.pmean(grads, axis_name=axis_name)
+        
+        # Compute metrics locally
+        metrics_local = compute_batch_metrics(logits, y, ignore_class=0)
+        # Aggregate across devices
+        metrics = {
+            "correct": jax.lax.psum(metrics_local["correct"], axis_name=axis_name),
+            "count": jax.lax.psum(metrics_local["count"], axis_name=axis_name),
+            "loss": jax.lax.psum(metrics_local["loss"], axis_name=axis_name),
+        }
+
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, logits
+        return new_params, new_opt_state, metrics
 
     return jax.pmap(train_step, axis_name=axis_name)
 
@@ -286,7 +301,8 @@ def make_grad_step(model):
             return loss, logits
 
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        return loss, logits, grads
+        metrics = compute_batch_metrics(logits, y, ignore_class=0)
+        return metrics, grads
 
     return grad_step
 
@@ -509,8 +525,9 @@ class Trainer:
             replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
             
             metrics_sharding = {
+                "correct": replicated_sharding,
+                "count": replicated_sharding,
                 "loss": replicated_sharding,
-                "logits": self.data_sharding,
             }
 
             # Init params and opt_state with PJIT
@@ -639,12 +656,13 @@ class Trainer:
                         return loss, logits
                     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
                     grads = _apply_grad_mask(grads, self._grad_mask)
-                    return grads, loss, logits
+                    metrics = compute_batch_metrics(logits, y, ignore_class=0)
+                    return grads, metrics
 
                 self._fsdp_grad_step = pjit(
                     fsdp_grad_step_fn,
                     in_shardings=(self.params_sharding, self.data_sharding, self.data_sharding),
-                    out_shardings=(self.params_sharding, replicated_sharding, self.data_sharding),
+                    out_shardings=(self.params_sharding, metrics_sharding),
                 )
                 
                 # 2. Update step for FSDP
@@ -763,6 +781,7 @@ class Trainer:
         # Training state
         metrics = MetricsAccumulator(ignore_class=0)
         grads_accum = None
+        metrics_accum = None
         accum_count = 0
         macro_step = self.start_step
 
@@ -776,9 +795,6 @@ class Trainer:
 
         print("\nStarting training...")
 
-        # Metrics are now computed on device and only fetched for logging
-        device_metrics = None
-
         for step in itertools.count(start=1):
             if step > tc.total_steps * grad_accum_steps:
                 break
@@ -787,14 +803,13 @@ class Trainer:
                 x_batch, y_batch = next(data_iterator)
                 # Update manual token tracking if using tf.data
                 if using_tf_data:
-                    # Approximation: batch_size * seq_len (actual tokens might be less due to padding)
-                    # But for SYNTH dataset we usually pack or pad to maxlen.
-                    # x_batch is (batch, len)
                     tokens_in_batch = x_batch.size
                     tokens_seen += tokens_in_batch
             except StopIteration:
                 print("Data loader exhausted.")
                 break
+
+            metrics_batch = None
 
             if self.use_fsdp:
                 x = jax.device_put(
@@ -806,9 +821,15 @@ class Trainer:
                 
                 if grad_accum_steps > 1:
                     with self.mesh:
-                        grads, loss, logits = self._fsdp_grad_step(self.params, x, y)
+                        grads, metrics_step = self._fsdp_grad_step(self.params, x, y)
                     
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
+                    
+                    if metrics_accum is None:
+                        metrics_accum = metrics_step
+                    else:
+                        metrics_accum = jax.tree_util.tree_map(jnp.add, metrics_accum, metrics_step)
+
                     accum_count += 1
                     
                     if accum_count >= grad_accum_steps:
@@ -817,24 +838,18 @@ class Trainer:
                                 self.params, self.opt_state, grads_accum
                             )
                         grads_accum = None
+                        metrics_batch = metrics_accum
+                        metrics_accum = None
                         accum_count = 0
                         macro_step += 1
-                    
-                    # For metrics, we use the values from the current micro-batch
-                    loss_metric, logits_metric, y_metric = loss, logits, y
                 else:
                     with self.mesh:
                         (
                             self.params,
                             self.opt_state,
-                            device_metrics,
+                            metrics_batch,
                         ) = self._fsdp_train_step(self.params, self.opt_state, x, y)
                     macro_step += 1
-                    y_metric, logits_metric, loss_metric = (
-                        y,
-                        device_metrics["logits"],
-                        device_metrics["loss"],
-                    )
 
             elif self.use_pmap:
                 x = jnp.array(x_batch, dtype=jnp.int32).reshape(
@@ -843,50 +858,57 @@ class Trainer:
                 y = jnp.array(y_batch, dtype=jnp.int32).reshape(
                     self.num_devices, self.per_device_batch, -1
                 )
-                self.params, self.opt_state, loss, logits = self._pmap_train_step(
+                self.params, self.opt_state, metrics_batch = self._pmap_train_step(
                     self.params, self.opt_state, x, y
                 )
+                # PMAP returns sharded arrays (one per device). Since we psum-ed, they are identical.
+                # Take the first device's output.
+                metrics_batch = jax.tree_util.tree_map(lambda x: x[0], metrics_batch)
                 macro_step += 1
-                # This is the blocking part we want to avoid.
-                # For pmap, we still need to get it for now.
-                loss_metric = jnp.mean(jax.device_get(loss))
-                logits_metric = jax.device_get(logits).reshape(
-                    tc.batch_size, -1, logits.shape[-1]
-                )
-                y_metric = y_batch
+
             else:
                 x = jnp.array(x_batch, dtype=jnp.int32)
                 y = jnp.array(y_batch, dtype=jnp.int32)
 
                 if grad_accum_steps > 1:
-                    loss, logits, grads = self._grad_step(self.params, x, y)
+                    metrics_step, grads = self._grad_step(self.params, x, y)
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
+                    
+                    if metrics_accum is None:
+                        metrics_accum = metrics_step
+                    else:
+                        metrics_accum = jax.tree_util.tree_map(jnp.add, metrics_accum, metrics_step)
+
                     accum_count += 1
                     if accum_count >= grad_accum_steps:
                         self.params, self.opt_state = self._update_step(
                             self.params, self.opt_state, grads_accum
                         )
                         grads_accum = None
+                        metrics_batch = metrics_accum
+                        metrics_accum = None
                         accum_count = 0
                         macro_step += 1
                 else:
                     if self._train_step_dbg:
+                        # Fallback for debug mode (not updated to metrics dict yet)
+                        # We just ignore metrics here or crash if used.
+                        # Assuming user won't use debug_opt=1 for performance run.
                         self.params, self.opt_state, loss, logits, dbg = (
                             self._train_step_dbg(
                                 self.params, self.opt_state, x, y, macro_step + 1
                             )
                         )
+                        metrics_batch = compute_batch_metrics(logits, y, ignore_class=0)
                     else:
-                        self.params, self.opt_state, loss, logits = self._train_step(
+                        self.params, self.opt_state, metrics_batch = self._train_step(
                             self.params, self.opt_state, x, y
                         )
                     macro_step += 1
 
-                loss_metric, logits_metric, y_metric = loss, logits, y
-
-            # Non-blocking metrics update for FSDP
-            if not self.use_pmap:
-                metrics.update(y_metric, logits_metric, loss_metric)
+            # Update metrics accumulator
+            if metrics_batch is not None:
+                metrics.update_with_precomputed(metrics_batch)
 
             # Logging, Generation, Checkpointing
             if macro_step > 0 and macro_step % tc.log_every_n_steps == 0:
@@ -897,16 +919,6 @@ class Trainer:
                 else:
                     tokens_delta = self.data_loader.tokens_since_last_check()
                     current_tokens_seen = self.data_loader.tokens_seen
-
-                # For FSDP, metrics are on-device, fetch them now
-                if self.use_fsdp and device_metrics is not None:
-                    # Since metrics are reset after logging, we update here
-                    metrics.update(
-                        y_metric, device_metrics["logits"], device_metrics["loss"]
-                    )
-                # For pmap, we still fetch them synchronously
-                elif self.use_pmap:
-                    metrics.update(y_metric, logits_metric, loss_metric)
 
                 self._log_progress(
                     macro_step,

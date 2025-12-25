@@ -25,6 +25,7 @@ class TransformerModel(nn.Module):
     tie_weights: bool = True
     qk_norm: bool = False
     qk_norm_eps: float = 1e-6
+    remat: bool = True
 
     def setup(self):
         self.embedding = nn.Embed(
@@ -35,8 +36,13 @@ class TransformerModel(nn.Module):
         self.cos_emb, self.sin_emb = precompute_freqs(
             self.maxlen, self.d_model // self.num_heads
         )
+        
+        Block = TransformerDecoderBlock
+        if self.remat:
+            Block = nn.remat(Block)
+
         self.blocks = [
-            TransformerDecoderBlock(
+            Block(
                 d_model=self.d_model,
                 num_heads=self.num_heads,
                 d_ff=self.d_ff,
@@ -104,6 +110,7 @@ class SeqCondModel(nn.Module):
     qk_norm_eps: float = 1e-6
     use_conv: bool = True
     conv_kernel_size: int = 4
+    remat: bool = True
 
     def setup(self):
         _seqcond_heads = (
@@ -131,12 +138,18 @@ class SeqCondModel(nn.Module):
             self.maxlen, self.d_model // self.num_heads
         )
 
+        TransformerBlock = TransformerDecoderBlock
+        SeqBlock = SeqCondBlock
+        if self.remat:
+            TransformerBlock = nn.remat(TransformerBlock)
+            SeqBlock = nn.remat(SeqBlock)
+
         blocks = []
         transformer_idx = 0
         seqcond_idx = 0
         for i in range(self.num_layers):
             if (i + 1) % (self.seqcond_ratio + 1) == 0:
-                block = TransformerDecoderBlock(
+                block = TransformerBlock(
                     d_model=self.d_model,
                     num_heads=self.num_heads,
                     d_ff=self.d_ff,
@@ -149,7 +162,7 @@ class SeqCondModel(nn.Module):
                 blocks.append(("transformer", block))
                 transformer_idx += 1
             else:
-                block = SeqCondBlock(
+                block = SeqBlock(
                     num_heads=_seqcond_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
@@ -228,6 +241,7 @@ class SeqCondModelV2(nn.Module):
     qk_norm_eps: float = 1e-6
     use_conv: bool = True
     conv_kernel_size: int = 4
+    remat: bool = True
 
     def setup(self):
         _seqcond_heads = (
@@ -255,12 +269,18 @@ class SeqCondModelV2(nn.Module):
             self.maxlen, self.d_model // self.num_heads
         )
 
+        TransformerBlock = TransformerDecoderBlock
+        SeqBlock = SeqCondBlockV2
+        if self.remat:
+            TransformerBlock = nn.remat(TransformerBlock)
+            SeqBlock = nn.remat(SeqBlock)
+
         blocks = []
         transformer_idx = 0
         seqcond_idx = 0
         for i in range(self.num_layers):
             if (i + 1) % (self.seqcond_ratio + 1) == 0:
-                block = TransformerDecoderBlock(
+                block = TransformerBlock(
                     d_model=self.d_model,
                     num_heads=self.num_heads,
                     d_ff=self.d_ff,
@@ -273,7 +293,7 @@ class SeqCondModelV2(nn.Module):
                 blocks.append(("transformer", block))
                 transformer_idx += 1
             else:
-                block = SeqCondBlockV2(
+                block = SeqBlock(
                     num_heads=_seqcond_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
@@ -341,6 +361,7 @@ def create_transformer_model(
     tie_weights: bool = True,
     qk_norm: bool = False,
     qk_norm_eps: float = 1e-6,
+    remat: bool = True,
 ) -> TransformerModel:
     """Create a Transformer model."""
     return TransformerModel(
@@ -355,6 +376,7 @@ def create_transformer_model(
         tie_weights=tie_weights,
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
+        remat=remat,
     )
 
 
@@ -379,6 +401,7 @@ def create_seqcond_model(
     qk_norm_eps: float = 1e-6,
     use_conv: bool = True,
     conv_kernel_size: int = 4,
+    remat: bool = True,
 ) -> SeqCondModel:
     """Create a SeqCond model."""
     return SeqCondModel(
@@ -402,6 +425,7 @@ def create_seqcond_model(
         qk_norm_eps=qk_norm_eps,
         use_conv=use_conv,
         conv_kernel_size=conv_kernel_size,
+        remat=remat,
     )
 
 
@@ -424,6 +448,7 @@ def create_seqcond_model_v2(
     qk_norm_eps: float = 1e-6,
     use_conv: bool = True,
     conv_kernel_size: int = 4,
+    remat: bool = True,
 ) -> SeqCondModelV2:
     """Create a SeqCond V2 model with dynamic thetas."""
     return SeqCondModelV2(
@@ -445,6 +470,7 @@ def create_seqcond_model_v2(
         qk_norm_eps=qk_norm_eps,
         use_conv=use_conv,
         conv_kernel_size=conv_kernel_size,
+        remat=remat,
     )
 
 

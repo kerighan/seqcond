@@ -51,10 +51,11 @@ def parse_args():
     grp_train.add_argument("--total-steps", type=int, default=None, help="Override total training steps")
     grp_train.add_argument("--save-every-n-steps", type=int, default=None, help="Checkpoint interval")
     grp_train.add_argument("--log-every-n-steps", type=int, default=None, help="Logging interval")
-    grp_train.add_argument("--generate-every-n-steps", type=int, default=None, help="Generation sample interval")
+    grp_train.add_argument("--generate-every-n_steps", type=int, default=None, help="Generation sample interval")
     grp_train.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     grp_train.add_argument("--prefetch-batches", type=int, default=None, help="Number of batches to prefetch")
     grp_train.add_argument("--lr", type=float, default=None, dest="base_lr", help="Override learning rate")
+    grp_train.add_argument("--no-remat", action="store_true", help="Disable gradient checkpointing (rematerialization)")
 
     return parser.parse_args()
 
@@ -94,6 +95,10 @@ def get_config(args) -> Config:
 
     # Create model config
     model_config = model_factory(**model_overrides)
+    
+    # Remat logic
+    if args.no_remat:
+        model_config.remat = False
 
     # 2. Training Config
     # Default values suitable for this script (preserved from original file)

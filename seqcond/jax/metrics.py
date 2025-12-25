@@ -124,6 +124,37 @@ def sparse_categorical_crossentropy(
     return jnp.where(count > 0, -total_log_prob / count, 0.0)
 
 
+def compute_batch_metrics(
+    logits: jnp.ndarray,
+    labels: jnp.ndarray,
+    ignore_class: int = 0,
+) -> dict:
+    """Compute metrics for a batch (returns sums/counts, not averages)."""
+    mask = labels != ignore_class
+    count = jnp.sum(mask.astype(jnp.float32))
+
+    y_pred_classes = jnp.argmax(logits, axis=-1)
+    correct = (labels == y_pred_classes).astype(jnp.float32)
+    total_correct = jnp.sum(jnp.where(mask, correct, 0.0))
+    
+    # Calculate loss sum (to be averaged later)
+    # Re-calculate loss here to avoid passing it if not needed, 
+    # but usually we have loss. 
+    # If we want to save compute, we can pass loss, but loss is usually mean.
+    # Let's assume we re-calc or pass it. 
+    # Actually, sparse_categorical_crossentropy returns mean.
+    # So we can just use that * count if passed, but here we act on logits.
+    
+    loss_val = sparse_categorical_crossentropy(labels, logits, ignore_class)
+    total_loss = loss_val * count
+    
+    return {
+        "correct": total_correct,
+        "count": count,
+        "loss": total_loss,
+    }
+
+
 class MetricsAccumulator:
     """Accumulator for computing metrics over multiple batches."""
 
@@ -137,6 +168,15 @@ class MetricsAccumulator:
         self.total_correct = jnp.array(0.0, dtype=jnp.float32)
         self.total_top_k_correct = jnp.array(0.0, dtype=jnp.float32)
         self.total_count = jnp.array(0.0, dtype=jnp.float32)
+
+    def update_with_precomputed(self, metrics: dict):
+        """Update with precomputed sums/counts."""
+        self.total_count += metrics["count"]
+        self.total_correct += metrics["correct"]
+        self.total_loss += metrics["loss"]
+        # Top-k might be missing in precomputed optimization
+        if "topk" in metrics:
+            self.total_top_k_correct += metrics["topk"]
 
     def update(
         self,

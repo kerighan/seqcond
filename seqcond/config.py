@@ -28,6 +28,7 @@ class ModelConfig:
     num_kv_heads: Optional[int] = None  # For GQA, None = MHA
     qk_norm: bool = True
     qk_norm_eps: float = 1e-6
+    remat: bool = True
 
     # SeqCond params
     seqcond_heads: int = 32
