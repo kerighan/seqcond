@@ -371,7 +371,7 @@ class SeqCondAttention(nn.Module):
 
         # --- 3. SPECTRAL MODULATION ---
         phi = (x_val[..., None] * theta)
-        cos_b, sin_b = jnp.cosh(phi), jnp.sinh(phi)
+        cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
         re_m, im_m = cos_b, sin_b
 
         # --- 4. SINGLE FUSED SCAN (OPTIMIZED) ---
