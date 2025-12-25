@@ -365,8 +365,7 @@ class SeqCondAttention(nn.Module):
         log_p_raw = score_scale[None, None, :, None] * s_raw
         
         # Clip vital ici
-        log_p = jnp.clip(log_p_raw, -20., 20.)
-        
+        log_p = jnp.clip(log_p_raw, -20., 20.)        
         p_w = jnp.exp(log_p + log_time_weight)
 
         # --- 3. SPECTRAL MODULATION ---
@@ -411,6 +410,7 @@ class SeqCondAttention(nn.Module):
         y_im = jnp.dot(im * scale[split_dim:], W_im)
 
         y = (y_re + y_im).reshape(b, l, d_inner)
+        y = jax.nn.silu(y)
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
 
         if self.dropout > 0:
