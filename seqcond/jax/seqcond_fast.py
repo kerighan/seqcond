@@ -209,20 +209,35 @@ class SeqCondAttention(nn.Module):
                 im_m = im_mod * sin_b
 
         p_w = (p * time_weight)[..., None]
-        flat_shape = (b, l, k * h * self.M)
-        merged = jnp.concatenate(
-            [
-                (p_w * re_m).reshape(flat_shape),
-                (p_w * im_m).reshape(flat_shape),
-                jnp.broadcast_to(p_w, (b, l, k, h, self.M)).reshape(flat_shape),
-            ],
-            axis=-1,
-        )
+        # p_w shape: (b, l, k, 1, 1)
 
-        cumsum = jnp.cumsum(merged, axis=1)
-        num_re, num_im, den = jnp.split(cumsum, 3, axis=-1)
+        # 1. Compute denominator cumsum separately on small tensor
+        # Reduce over l (axis 1). Squeeze the last dims for cumsum then restore.
+        # p_w_small: (b, l, k)
+        p_w_small = p_w.reshape(b, l, k)
+        den = jnp.cumsum(p_w_small, axis=1)
+        den = den.reshape(b, l, k, 1, 1) # Restore for broadcasting
+
+        # 2. Compute numerators
+        # Avoid creating the huge concatenated tensor.
+        # Compute re/im separately.
+        num_re = p_w * re_m
+        num_im = p_w * im_m
+        
+        # Flatten for cumsum (b, l, k*h*M)
+        flat_dim = k * h * self.M
+        num_re_flat = num_re.reshape(b, l, flat_dim)
+        num_im_flat = num_im.reshape(b, l, flat_dim)
+
+        num_re_sum = jnp.cumsum(num_re_flat, axis=1)
+        num_im_sum = jnp.cumsum(num_im_flat, axis=1)
+        
+        # Reshape back to (b, l, k, h, M)
+        num_re = num_re_sum.reshape(b, l, k, h, self.M)
+        num_im = num_im_sum.reshape(b, l, k, h, self.M)
 
         inv_den = 1.0 / jnp.maximum(den, jnp.float32(1e-4))
+        # Broadcast den (b, l, k, 1, 1) to (b, l, k, h, M)
         re = num_re * inv_den
         im = num_im * inv_den
 
