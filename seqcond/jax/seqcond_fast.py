@@ -283,14 +283,14 @@ from typing import Optional
 
 class SeqCondAttention(nn.Module):
     num_heads: int = 32
-    key_heads: Optional[int] = None      # Si None, utilise num_heads
-    num_anchor_heads: int = 4            # Têtes "Longue Mémoire"
-    num_thetas: int = 1                  # M (Expansion spectrale)
-    derivative_order: int = 2            # 0, 1 ou 2
+    key_heads: Optional[int] = None
+    num_anchor_heads: int = 4
+    num_thetas: int = 1
+    derivative_order: int = 2
     conv_kernel_size: int = 4
-    expand_factor: int = 2               # Projection interne (d_model -> 2*d_model)
+    expand_factor: int = 2
     dropout: float = 0.0
-    maxlen: Optional[int] = None         # Pour decay à distance fixe (inférence stable)
+    maxlen: Optional[int] = None
 
     def setup(self):
         self.K = self.key_heads if self.key_heads is not None else self.num_heads
@@ -301,142 +301,125 @@ class SeqCondAttention(nn.Module):
     def __call__(self, x, mask=None, deterministic=True):
         b, l, d_model = x.shape
         d_inner = int(d_model * self.expand_factor)
-        H = max(1, d_inner // self.K) # Dim par tête
+        H = max(1, d_inner // self.K)
 
-        # --- 1. PROJECTION & CONVOLUTION (Optimized) ---
-        # Value + Gate + Scores
+        # --- 1. PROJECTION & CONVOLUTION ---
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
         
-        # FIX DU PADDING HELL :
-        # On passe le tuple ((left, right),) directement à nn.Conv
-        # XLA gère ça en interne sans briser l'alignement mémoire (Zero-Copy implicit padding)
-        padding_tuple = ((self.conv_kernel_size - 1, 0),)
-        
+        # Padding natif dans la conv (évite la copie mémoire)
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
-            padding=padding_tuple,  # <--- MAGIE ICI
+            padding=((self.conv_kernel_size - 1, 0),), 
             feature_group_count=z.shape[-1], 
             name="conv"
         )(z)
-        # Split: Value, Gate (SwiGLU style), Scores
+
         x_val = z[..., :d_inner].reshape(b, l, self.K, H)
         x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
-        # Masking optionnel (padding)
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
             x_val *= m
 
         # --- 2. PARAMETERS (Time & Frequency) ---
-        # Theta Init: Gestion robuste du cas M=1 pour éviter le gradient 0
+        # Theta Init (Robuste M=1)
         def init_theta(key, shape):
-            # shape: (1, 1, K, H, M)
             if self.M == 1:
-                # Si M=1, on étale des fréquences variées à travers les têtes et la dim H
-                # Évite que tout le monde démarre à 0.
+                # Force shape explicite (1, 1, K, H, 1)
                 grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
-                # Alterne les signes pour richesse spectrale
                 signs = np.resize([1., -1.], grid.shape)
                 return jnp.array(grid * signs, dtype=jnp.float32)
             else:
-                # Standard: Couverture spectrale [-pi/3, pi/3]
                 grid = np.linspace(-np.pi/3, np.pi/3, self.M)
                 base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
                 return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
         
-        # Decay Weights (Appris dans l'espace Log)
+        # Decay Weights
         pos = jnp.arange(l, dtype=jnp.float32)
         w_list = []
         
-        # Têtes à décroissance (Recency)
         if self.num_decay_heads > 0:
             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
+            # Shape: (1, L, num_decay, 1)
             w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
 
-        # Têtes d'ancrage (Primacy / Long term)
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
+            # Shape: (1, L, num_anchor, 1)
             w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
 
-        # Fusion des poids temporels + Scores d'importance
-        time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32) # Force f32 pour précision cumsum
+        # Concatenate heads -> (1, L, K, 1)
+        time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32)
+        
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
-        p_w = (p * time_weight)[..., None] # (B, L, K, 1, 1)
+        
+        # --- FIX DIMENSION p_w ---
+        # On force explicitement le Rank 5: (B, L, K, 1, M)
+        # p * time_weight -> (B, L, K, 1)
+        p_w = (p * time_weight).reshape(b, l, self.K, 1, 1)
+        
+        # Si M > 1, on broadcast p_w sur la dernière dimension pour qu'il matche theta
+        if self.M > 1:
+            p_w = jnp.broadcast_to(p_w, (b, l, self.K, 1, self.M))
 
         # --- 3. SPECTRAL MODULATION ---
-        # Pré-calcul trigonométrique
-        phi = (x_val[..., None] * theta).astype(jnp.float32) # Force f32
+        # x_val (B, L, K, H) -> (B, L, K, H, 1)
+        phi = (x_val[..., None] * theta).astype(jnp.float32) 
         cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
 
-        # Logique des dérivées (Order 0, 1, 2)
         if self.derivative_order == 0:
             re_m, im_m = cos_b, sin_b
         else:
-            # Poids apprenables pour mixer ordre 0, 1, 2
             w = jax.nn.softmax(self.param("deriv_logits", lambda r,s: jnp.array([5.] + [0.]*self.derivative_order), (self.derivative_order+1,)))
             term_0 = w[0]
             term_1 = w[1] * x_val[..., None]
             term_2 = (w[2] * -jnp.square(x_val[..., None])) if self.derivative_order == 2 else 0.
             poly = term_0 + term_1 + term_2
-            
-            # Aggregation "re_im" standard
             re_m, im_m = poly * cos_b, poly * sin_b
+
+        # --- 4. SCANS OPTIMISÉS (Correct Dimensions) ---
         
-        # --- 4. OPTIMIZED SCANS (Zero-Redundancy) ---
-        
-        # 1. Denominator : On scanne le PETIT tenseur (B, L, K, 1, 1)
-        # Coût mémoire divisé par (H * M) -> Vitesse x10 instantanée
+        # 1. Denominator (Scan sur p_w directement, très léger)
+        # Shape p_w: (B, L, K, 1, M) -> Scan axis 1
         den_small = jnp.cumsum(p_w, axis=1)
         
-        # 2. Numerators : On est obligés de scanner le gros tenseur, MAIS
-        # on évite le reshape (flatten) qui peut briser le tiling du TPU.
-        # XLA préfère souvent scanner sur des dimensions natives 5D.
-        
-        # (B, L, K, H, M)
+        # 2. Numerators (Scan sur le produit)
+        # p_w (..., 1, M) * re_m (..., H, M) -> Broadcast OK (1 -> H)
+        # Result (B, L, K, H, M)
         num_re = jnp.cumsum(p_w * re_m, axis=1)
         num_im = jnp.cumsum(p_w * im_m, axis=1)
 
-        # --- 5. NORMALIZATION & MERGE ---
-        
-        # On broadcast le dénominateur (petit) seulement au moment de la division
-        # JAX va optimiser ça en une opération élémentaire sans allocation géante
+        # --- 5. NORMALIZATION ---
         inv_den = 1.0 / jnp.maximum(den_small, 1e-4)
         
-        # La division broadcast implicitement (numpy style)
+        # Broadcast implicite de la division (..., 1, M) vers (..., H, M)
         re = num_re * inv_den
         im = num_im * inv_den
 
-        # --- 6. OUTPUT PROJECTION ---
-        
-        # Flatten maintenant pour la projection
+        # --- 6. PROJECTION ---
         re_flat = re.reshape(b, l, self.K, H * self.M)
         im_flat = im.reshape(b, l, self.K, H * self.M)
 
-        # Calcul Norme (Reste identique)
-        # mean_sq sur dim -1
         mean_sq = (jnp.sum(jnp.square(re_flat), -1) + jnp.sum(jnp.square(im_flat), -1)) / (2 * H * self.M)
         rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
 
-        # Params de projection séparés
         split_dim = H * self.M
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
         scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        # Apply Norm & Project
-        y_re = jnp.dot(re * rsqrt * scale[:split_dim], W_re)
-        y_im = jnp.dot(im * rsqrt * scale[split_dim:], W_im)
+        y_re = jnp.dot(re_flat * rsqrt * scale[:split_dim], W_re)
+        y_im = jnp.dot(im_flat * rsqrt * scale[split_dim:], W_im)
 
-        # Merge & Out
         y = (y_re + y_im).reshape(b, l, d_inner)
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
 
@@ -444,6 +427,7 @@ class SeqCondAttention(nn.Module):
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
         
         return out
+
 
 class SeqCondBlock(nn.Module):
     # Wrapper simple avec Pre-Norm et Residual
