@@ -396,57 +396,40 @@ class SeqCondAttention(nn.Module):
         p = (jax.nn.softplus(logits) + self.eps).astype(self.compute_dtype)   # (B,L,K,1)
         p_w = p * time_weight                                                # (B,L,K,1)
 
-        # ---- 5) Spectral modulation ----
+        # ---- 5) Spectral modulation (SIN ONLY) ----
         theta = self.param("theta", self._init_theta, (1, 1, K, H, M)).astype(self.param_dtype)
         phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)
 
-        cos_b = jnp.cos(phi)
-        sin_b = jnp.sin(phi)
+        # sin only
+        feat = jnp.sin(phi).astype(self.compute_dtype)  # (B,L,K,H,M) (or whatever rank you have)
 
-        re_m = cos_b.astype(self.compute_dtype)
-        im_m = sin_b.astype(self.compute_dtype)
-
-        # ---- 6) Causal aggregation (robust broadcasting) ----
+        # ---- 6) Causal aggregation: only 2 cumsums (den + num) ----
         den = jnp.cumsum(p_w.astype(jnp.float32), axis=1)  # (B,L,K,1)
 
-        pw = p_w.astype(jnp.float32)  # (B,L,K,1)
-        pw = pw.reshape(pw.shape + (1,) * (re_m.ndim - pw.ndim))
+        pw = p_w.astype(jnp.float32)
+        pw = pw.reshape(pw.shape + (1,) * (feat.ndim - pw.ndim))
 
-        num_re = jnp.cumsum(pw * re_m.astype(jnp.float32), axis=1)
-        num_im = jnp.cumsum(pw * im_m.astype(jnp.float32), axis=1)
+        num = jnp.cumsum(pw * feat.astype(jnp.float32), axis=1)
 
-        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(jnp.float32)  # (B,L,K,1)
-        inv_den = inv_den.reshape(inv_den.shape + (1,) * (re_m.ndim - inv_den.ndim))
+        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(jnp.float32)
+        inv_den = inv_den.reshape(inv_den.shape + (1,) * (feat.ndim - inv_den.ndim))
 
-        re = (num_re * inv_den).astype(self.compute_dtype)
-        im = (num_im * inv_den).astype(self.compute_dtype)
+        y_feat = (num * inv_den).astype(self.compute_dtype)
 
-        # ---- 7) Mix + RMS-like norm (flatten trailing dims) ----
-        re = re.reshape(B, L, K, -1)
-        im = im.reshape(B, L, K, -1)
-        split_dim = re.shape[-1]
+        # ---- 7) Mix (flatten trailing dims) ----
+        y_feat = y_feat.reshape(B, L, K, -1)
+        split_dim = y_feat.shape[-1]
 
-        mean_sq = (
-            (jnp.sum(jnp.square(re).astype(jnp.float32), axis=-1) +
-             jnp.sum(jnp.square(im).astype(jnp.float32), axis=-1))
-            / jnp.float32(2 * split_dim)
-        )  # (B,L,K)
-
+        # RMS-like norm on single stream
+        mean_sq = jnp.mean(jnp.square(y_feat).astype(jnp.float32), axis=-1)  # (B,L,K)
         rsqrt = jax.lax.rsqrt(mean_sq + 1e-5).astype(self.compute_dtype)
 
-        # Mix to head-dim H (so output is (B,L,K,H) -> (B,L,d_inner))
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
-        scale = self.param("mix_scale", nn.initializers.ones, (2 * split_dim,)).astype(self.param_dtype)
+        W = self.param("W_sin", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
+        scale = self.param("mix_scale_sin", nn.initializers.ones, (split_dim,)).astype(self.param_dtype)
 
-        re_n = (re * rsqrt[..., None] * scale[:split_dim][None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
-        im_n = (im * rsqrt[..., None] * scale[split_dim:][None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
-
-        y_re = jnp.einsum("blkd,dh->blkh", re_n.astype(self.param_dtype), W_re)
-        y_im = jnp.einsum("blkd,dh->blkh", im_n.astype(self.param_dtype), W_im)
-
-        y = (y_re + y_im).astype(self.compute_dtype).reshape(B, L, d_inner)
-
+        y_n = (y_feat * rsqrt[..., None] * scale[None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
+        y = jnp.einsum("blkd,dh->blkh", y_n.astype(self.param_dtype), W).astype(self.compute_dtype)
+        y = y.reshape(B, L, d_inner)
         out = nn.Dense(
             D, use_bias=False,
             dtype=self.compute_dtype, param_dtype=self.param_dtype,
