@@ -437,7 +437,6 @@ class SeqCondBlock(nn.Module):
     num_anchor_heads: int = 0
     derivative_order: int = 0
     dropout: float = 0.0
-    use_conv: bool = True
     conv_kernel_size: int = 4
     conv_kernel: Optional[int] = None
     norm_eps: float = 1e-5
@@ -458,7 +457,6 @@ class SeqCondBlock(nn.Module):
             num_anchor_heads=self.num_anchor_heads,
             derivative_order=self.derivative_order,
             dropout=self.dropout,
-            use_conv=self.use_conv,
             conv_kernel_size=self.conv_kernel_size,
             conv_kernel=self.conv_kernel,
             maxlen=self.maxlen,
