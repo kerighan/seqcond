@@ -403,7 +403,6 @@ class SeqCondAttention(nn.Module):
         cos_b = jnp.cos(phi)
         sin_b = jnp.sin(phi)
 
-
         re_m = cos_b.astype(self.compute_dtype)
         im_m = sin_b.astype(self.compute_dtype)
 
@@ -416,12 +415,20 @@ class SeqCondAttention(nn.Module):
         num_im = jnp.cumsum((pw5 * im_m).astype(jnp.float32), axis=1)
 
         inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(self.compute_dtype)  # (B,L,K,1)
-        re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)     # (B,L,K,H,M)
+
+        # re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)     # (B,L,K,H,M)
+        # im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
+
+        # # ---- 7) Mix (H*M -> H) + cheap RMS-like normalization ----
+        # re = re.reshape(B, L, K, H * M)
+        # im = im.reshape(B, L, K, H * M)
+
+        re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)
         im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
 
-        # ---- 7) Mix (H*M -> H) + cheap RMS-like normalization ----
         re = re.reshape(B, L, K, H * M)
         im = im.reshape(B, L, K, H * M)
+        split_dim = H * M
 
         mean_sq = (
             (jnp.sum(jnp.square(re).astype(jnp.float32), axis=-1) +
@@ -431,7 +438,7 @@ class SeqCondAttention(nn.Module):
 
         rsqrt = jax.lax.rsqrt(mean_sq + 1e-5).astype(self.compute_dtype)
 
-        split_dim = H * M
+        # split_dim = H * M
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
         scale = self.param("mix_scale", nn.initializers.ones, (2 * split_dim,)).astype(self.param_dtype)
