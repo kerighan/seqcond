@@ -282,165 +282,166 @@ import numpy as np
 from typing import Optional
 
 class SeqCondAttention(nn.Module):
-    """
-    Best-now test option (TPU-friendly):
-    - depthwise causal conv on the ORIGINAL width (D) to keep it cheap
-    - single projection AFTER conv to produce {val, gate, score} at expanded width
-    - softplus weights (no exp/clip), fused sincos, and separate cumsums (no broadcast/concat monster)
-    """
     num_heads: int = 32
-    key_heads: Optional[int] = None
-    num_thetas: int = 1              # M (keep 1 for speed)
-    num_anchor_heads: int = 0
-    conv_kernel_size: int = 4
-    expand_factor: float = 2.0       # expansion happens ONLY after conv
+    key_heads: Optional[int] = None   # Si None, utilise num_heads
+    num_anchor_heads: int = 4         # Têtes à décroissance lente
+    num_thetas: int = 1               # Dimension M (Spectral)
+    derivative_order: int = 2         # Ordre de Taylor pour la modulation
+    conv_kernel_size: int = 4         # Taille du kernel de convolution locale
+    expand_factor: int = 2            # <--- C'est ici ! 2 = 140k tokens/s. Mets 1 pour accélérer.
     dropout: float = 0.0
-    maxlen: Optional[int] = None
-
-    compute_dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.float32
-    eps: float = 1e-4
+    maxlen: Optional[int] = None      # Pour le calcul des positions relatives si besoin
 
     def setup(self):
+        # Configuration des dimensions
         self.K = self.key_heads if self.key_heads is not None else self.num_heads
         self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
 
-    def _init_theta(self, key, shape):
-        # (1,1,K,H,M)
-        if shape[-1] == 1:
-            K, H = shape[2], shape[3]
-            grid = np.linspace(0.1, 1.5, K * H).reshape(1, 1, K, H, 1)
-            signs = np.resize([1.0, -1.0], grid.shape)
-            return jnp.array(grid * signs, dtype=self.param_dtype)
-        grid = np.linspace(-np.pi / 3, np.pi / 3, shape[-1])
-        base = np.tile(grid.reshape(1, 1, 1, 1, shape[-1]), (1, 1, shape[2], shape[3], 1))
-        return jnp.array(base, dtype=self.param_dtype)
-
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
-        B, L, D = x.shape
-        K = self.K
-        M = self.M
+        b, l, d_model = x.shape
+        d_inner = int(d_model * self.expand_factor)
+        H = max(1, d_inner // self.K)
 
-        d_inner = int(D * self.expand_factor)
-        if d_inner % K != 0:
-            raise ValueError(f"d_inner={d_inner} must be divisible by K={K}")
-        H = d_inner // K
+        # --- 1. PROJECTION & LOCAL MIXING (Optimized) ---
+        # Projection unique (Channel Mixing)
+        # On projette vers : Values (d_inner) + Gates (d_inner) + Keys/Scores (K)
+        z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
+        
+        # Convolution Depthwise Causale (Token Mixing Local)
+        # feature_group_count = features => Depthwise
+        z = nn.Conv(
+            features=z.shape[-1], 
+            kernel_size=(self.conv_kernel_size,), 
+            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (gauche)
+            feature_group_count=z.shape[-1], 
+            use_bias=False, # Pas de bias ici pour économiser
+            name="conv"
+        )(z)
 
-        x = x.astype(self.compute_dtype)
+        # Splitting des tenseurs
+        x_val = z[..., :d_inner].reshape(b, l, self.K, H)
+        x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
+        s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
-        # ---- 1) Cheap causal depthwise conv on D ----
-        x_conv = nn.Conv(
-            features=D,
-            kernel_size=(self.conv_kernel_size,),
-            padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=D,
-            use_bias=False,
-            dtype=self.compute_dtype,
-            param_dtype=self.param_dtype,
-            name="conv_dw",
-        )(x)
-
-        # ---- 2) Single expansion projection -> val, gate, score ----
-        z = nn.Dense(
-            d_inner * 2 + K,
-            use_bias=False,
-            dtype=self.compute_dtype,
-            param_dtype=self.param_dtype,
-            name="z_proj",
-        )(x_conv)
-
-        x_val = z[..., :d_inner].reshape(B, L, K, H)                # (B,L,K,H)
-        x_gate = jax.nn.silu(z[..., d_inner:2 * d_inner])           # (B,L,d_inner)
-        s_raw = z[..., -K:].reshape(B, L, K, 1)                     # (B,L,K,1)
-
+        # Masquage optionnel (padding mask)
         if mask is not None:
-            m = mask.astype(self.compute_dtype)[:, :, None, None]
-            x_val = x_val * m
-            s_raw = s_raw * m
+            m = mask.astype(x.dtype)[:, :, None, None]
+            s_raw *= m
+            x_val *= m
 
-        # ---- 3) Time weights ----
-        pos = jnp.arange(L, dtype=self.param_dtype)
+        # --- 2. GENERATION DES PARAMETRES (Theta & Decay) ---
+        
+        # A. Theta Init (Frequencies)
+        def init_theta(key, shape):
+            if self.M == 1:
+                # Distribution linéaire simple alternée
+                grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
+                signs = np.resize([1., -1.], grid.shape)
+                return jnp.array(grid * signs, dtype=jnp.float32)
+            else:
+                # Distribution angulaire pour M > 1
+                grid = np.linspace(-np.pi/3, np.pi/3, self.M)
+                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+                return jnp.array(base, dtype=jnp.float32)
 
+        theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
+        
+        # B. Decay Weights (Time constant)
+        pos = jnp.arange(l, dtype=jnp.float32)
         w_list = []
+        
+        # Têtes rapides (Short-term memory)
         if self.num_decay_heads > 0:
-            d_slopes = self.param(
-                "decay_slopes",
-                lambda rng, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1.0).astype(self.param_dtype),
-                (self.num_decay_heads,),
-            )
+            d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
-            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.0)
-            w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))     # (1,L,dec,1)
+            # Distance inversée pour le decay
+            dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
+            w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
 
+        # Têtes lentes (Long-term / Anchor)
         if self.num_anchor_heads > 0:
-            a_slopes = self.param(
-                "anchor_slopes",
-                lambda rng, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1.0).astype(self.param_dtype),
-                (self.num_anchor_heads,),
-            )
+            a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))    # (1,L,anch,1)
+            w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
 
-        if len(w_list) == 0:
-            time_weight = jnp.ones((1, L, K, 1), dtype=self.compute_dtype)
-        elif len(w_list) == 1:
-            time_weight = w_list[0].astype(self.compute_dtype)
+        # Fusion des poids temporels
+        time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32)
+        
+        # C. Scores (Keys) scaling
+        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
+        p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
+        
+        # Préparation pour le scan : p * time_decay
+        # Shape: (B, L, K, 1, 1) broadcastable vers (K, H, M)
+        p_w = (p * time_weight)[..., None] 
+
+        # --- 3. SPECTRAL MODULATION ---
+        # Modulation complexe (x * theta)
+        phi = (x_val[..., None] * theta).astype(jnp.float32)
+        cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
+
+        # Approximation polynomiale (Taylor) si order > 0
+        if self.derivative_order == 0:
+            re_m, im_m = cos_b, sin_b
         else:
-            time_weight = jnp.concatenate(w_list, axis=2).astype(self.compute_dtype)
+            # Poids apprenables pour le polynôme
+            w = jax.nn.softmax(self.param("deriv_logits", lambda r,s: jnp.array([5.] + [0.]*self.derivative_order), (self.derivative_order+1,)))
+            poly = w[0] + w[1] * x_val[..., None]
+            if self.derivative_order == 2:
+                poly += w[2] * -jnp.square(x_val[..., None])
+            re_m, im_m = poly * cos_b, poly * sin_b
 
-        # ---- 4) Positive weights (softplus) ----
-        score_scale = self.param("score_scale", nn.initializers.ones, (K,)).astype(self.param_dtype)
-        logits = (s_raw.astype(self.param_dtype) * score_scale[None, None, :, None]).astype(self.param_dtype)
-        p = (jax.nn.softplus(logits) + self.eps).astype(self.compute_dtype)   # (B,L,K,1)
-        p_w = p * time_weight                                                # (B,L,K,1)
+        # --- 4. SINGLE FUSED SCAN (Bandwidth King) ---
+        # Optimisation critique : On concatène tout pour faire 1 seul cumsum (prefix sum)
+        
+        flat_dim = self.K * H * self.M
+        
+        # A. Dénominateur (p_w)
+        # Broadcast explicite nécessaire pour concaténer sur l'axe features
+        den_in = jnp.broadcast_to(p_w, (b, l, self.K, H, self.M)).reshape(b, l, flat_dim)
+        
+        # B. Numérateurs (Réel & Imaginaire)
+        # p_w * modulation
+        num_re_in = (p_w * re_m).reshape(b, l, flat_dim)
+        num_im_in = (p_w * im_m).reshape(b, l, flat_dim)
+        
+        # C. Fusion et Scan
+        merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
+        cumsum = jnp.cumsum(merged, axis=1) # Le scan linéaire
+        
+        # D. Séparation post-scan
+        den, num_re, num_im = jnp.split(cumsum, 3, axis=-1)
 
-        # ---- 5) Spectral modulation (SIN ONLY) ----
-        theta = self.param("theta", self._init_theta, (1, 1, K, H, M)).astype(self.param_dtype)
-        phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)
+        # --- 5. NORMALIZATION & OUTPUT PROJ ---
+        # Normalisation par le dénominateur accumulé
+        inv_den = 1.0 / jnp.maximum(den, 1e-4)
+        re = (num_re * inv_den).reshape(b, l, self.K, H * self.M)
+        im = (num_im * inv_den).reshape(b, l, self.K, H * self.M)
 
-        # sin only
-        feat = jnp.sin(phi).astype(self.compute_dtype)  # (B,L,K,H,M) (or whatever rank you have)
+        # L2-like Norm interne (RMSNorm sur les composantes complexes)
+        mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
+        rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
 
-        # ---- 6) Causal aggregation: only 2 cumsums (den + num) ----
-        den = jnp.cumsum(p_w.astype(jnp.float32), axis=1)  # (B,L,K,1)
+        # Projection de sortie complexe -> réel
+        split_dim = H * self.M
+        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
+        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
+        scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        pw = p_w.astype(jnp.float32)
-        pw = pw.reshape(pw.shape + (1,) * (feat.ndim - pw.ndim))
+        # Application de la projection
+        y_re = jnp.dot(re * rsqrt * scale[:split_dim], W_re)
+        y_im = jnp.dot(im * rsqrt * scale[split_dim:], W_im)
 
-        num = jnp.cumsum(pw * feat.astype(jnp.float32), axis=1)
-
-        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(jnp.float32)
-        inv_den = inv_den.reshape(inv_den.shape + (1,) * (feat.ndim - inv_den.ndim))
-
-        y_feat = (num * inv_den).astype(self.compute_dtype)
-
-        # ---- 7) Mix (flatten trailing dims) ----
-        y_feat = y_feat.reshape(B, L, K, -1)
-        split_dim = y_feat.shape[-1]
-
-        # RMS-like norm on single stream
-        mean_sq = jnp.mean(jnp.square(y_feat).astype(jnp.float32), axis=-1)  # (B,L,K)
-        rsqrt = jax.lax.rsqrt(mean_sq + 1e-5).astype(self.compute_dtype)
-
-        W = self.param("W_sin", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
-        scale = self.param("mix_scale_sin", nn.initializers.ones, (split_dim,)).astype(self.param_dtype)
-
-        y_n = (y_feat * rsqrt[..., None] * scale[None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
-        y = jnp.einsum("blkd,dh->blkh", y_n.astype(self.param_dtype), W).astype(self.compute_dtype)
-        y = y.reshape(B, L, d_inner)
-        out = nn.Dense(
-            D, use_bias=False,
-            dtype=self.compute_dtype, param_dtype=self.param_dtype,
-            name="out_proj"
-        )(y * x_gate)
+        # Recombinaison + Gating
+        y = (y_re + y_im).reshape(b, l, d_inner)
+        out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
 
         if self.dropout > 0:
-            out = nn.Dropout(rate=self.dropout)(out, deterministic=deterministic)
-
-        return out.astype(x.dtype)
-
+            out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
+        
+        return out
 
 
 class SeqCondBlock(nn.Module):
