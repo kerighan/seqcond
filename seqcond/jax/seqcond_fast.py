@@ -292,6 +292,9 @@ class SeqCondAttention(nn.Module):
     dropout: float = 0.0
     maxlen: Optional[int] = None      # Pour le calcul des positions relatives si besoin
 
+    compute_dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
+
     def setup(self):
         # Configuration des dimensions
         self.K = self.key_heads if self.key_heads is not None else self.num_heads
