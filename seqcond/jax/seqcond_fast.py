@@ -281,182 +281,208 @@ import flax.linen as nn
 import numpy as np
 from typing import Optional
 
-class SeqCondAttention(nn.Module):
+class SeqCondAttentionBestNow(nn.Module):
+    """
+    Best-now test option (TPU-friendly):
+    - depthwise causal conv on the ORIGINAL width (D) to keep it cheap
+    - single projection AFTER conv to produce {val, gate, score} at expanded width
+    - softplus weights (no exp/clip), fused sincos, and separate cumsums (no broadcast/concat monster)
+    """
     num_heads: int = 32
     key_heads: Optional[int] = None
-    num_anchor_heads: int = 4
-    num_thetas: int = 1
-    derivative_order: int = 2
+    num_thetas: int = 1              # M (keep 1 for speed)
+    num_anchor_heads: int = 0
     conv_kernel_size: int = 4
-    expand_factor: int = 1  # <--- RETOUR A 1 POUR LA VITESSE
+    expand_factor: float = 2.0       # expansion happens ONLY after conv
     dropout: float = 0.0
     maxlen: Optional[int] = None
+
+    compute_dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
+    eps: float = 1e-4
 
     def setup(self):
         self.K = self.key_heads if self.key_heads is not None else self.num_heads
         self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
 
+    def _init_theta(self, key, shape):
+        # (1,1,K,H,M)
+        if shape[-1] == 1:
+            K, H = shape[2], shape[3]
+            grid = np.linspace(0.1, 1.5, K * H).reshape(1, 1, K, H, 1)
+            signs = np.resize([1.0, -1.0], grid.shape)
+            return jnp.array(grid * signs, dtype=self.param_dtype)
+        grid = np.linspace(-np.pi / 3, np.pi / 3, shape[-1])
+        base = np.tile(grid.reshape(1, 1, 1, 1, shape[-1]), (1, 1, shape[2], shape[3], 1))
+        return jnp.array(base, dtype=self.param_dtype)
+
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
-        b, l, d_model = x.shape
-        d_inner = int(d_model * self.expand_factor)
-        H = max(1, d_inner // self.K)
+        B, L, D = x.shape
+        K = self.K
+        M = self.M
 
-        # --- 1. PROJECTION & CONVOLUTION (Optimized) ---
-        z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
-        
-        # Native Padding : XLA fusionne ça sans overhead mémoire
-        z = nn.Conv(
-            features=z.shape[-1], 
-            kernel_size=(self.conv_kernel_size,), 
-            padding=((self.conv_kernel_size - 1, 0),), 
-            feature_group_count=z.shape[-1], 
-            name="conv"
-        )(z)
+        d_inner = int(D * self.expand_factor)
+        if d_inner % K != 0:
+            raise ValueError(f"d_inner={d_inner} must be divisible by K={K}")
+        H = d_inner // K
 
-        x_val = z[..., :d_inner].reshape(b, l, self.K, H)
-        x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
-        s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
+        x = x.astype(self.compute_dtype)
+
+        # ---- 1) Cheap causal depthwise conv on D ----
+        x_conv = nn.Conv(
+            features=D,
+            kernel_size=(self.conv_kernel_size,),
+            padding=((self.conv_kernel_size - 1, 0),),
+            feature_group_count=D,
+            use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="conv_dw",
+        )(x)
+
+        # ---- 2) Single expansion projection -> val, gate, score ----
+        z = nn.Dense(
+            d_inner * 2 + K,
+            use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="z_proj",
+        )(x_conv)
+
+        x_val = z[..., :d_inner].reshape(B, L, K, H)                # (B,L,K,H)
+        x_gate = jax.nn.silu(z[..., d_inner:2 * d_inner])           # (B,L,d_inner)
+        s_raw = z[..., -K:].reshape(B, L, K, 1)                     # (B,L,K,1)
 
         if mask is not None:
-            m = mask.astype(x.dtype)[:, :, None, None]
-            s_raw *= m
-            x_val *= m
+            m = mask.astype(self.compute_dtype)[:, :, None, None]
+            x_val = x_val * m
+            s_raw = s_raw * m
 
-        # --- 2. PARAMETERS ---
-        # Theta Init (Anti-Zero Gradient)
-        def init_theta(key, shape):
-            if self.M == 1:
-                grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
-                signs = np.resize([1., -1.], grid.shape)
-                return jnp.array(grid * signs, dtype=jnp.float32)
-            else:
-                grid = np.linspace(-np.pi/3, np.pi/3, self.M)
-                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-                return jnp.array(base, dtype=jnp.float32)
+        # ---- 3) Time weights ----
+        pos = jnp.arange(L, dtype=self.param_dtype)
 
-        theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
-        
-        # Decay Weights
-        pos = jnp.arange(l, dtype=jnp.float32)
         w_list = []
-        
         if self.num_decay_heads > 0:
-            d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
+            d_slopes = self.param(
+                "decay_slopes",
+                lambda rng, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1.0).astype(self.param_dtype),
+                (self.num_decay_heads,),
+            )
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
-            dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
-            w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
+            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.0)
+            w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))     # (1,L,dec,1)
 
         if self.num_anchor_heads > 0:
-            a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
+            a_slopes = self.param(
+                "anchor_slopes",
+                lambda rng, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1.0).astype(self.param_dtype),
+                (self.num_anchor_heads,),
+            )
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
+            w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))    # (1,L,anch,1)
 
-        time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32)
-        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
-        
-        # Shape finale: (B, L, K, 1, M) pour broadcaster correctement sur H
-        p_w = (p * time_weight)[..., None] 
-        # Si M > 1, on laisse le broadcast implicite agir plus tard, 
-        # mais ici on s'assure juste que p_w est prêt à être multiplié par (K, H, M)
-
-        # --- 3. SPECTRAL MODULATION ---
-        phi = (x_val[..., None] * theta).astype(jnp.float32)
-        cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
-
-        if self.derivative_order == 0:
-            re_m, im_m = cos_b, sin_b
+        if len(w_list) == 0:
+            time_weight = jnp.ones((1, L, K, 1), dtype=self.compute_dtype)
+        elif len(w_list) == 1:
+            time_weight = w_list[0].astype(self.compute_dtype)
         else:
-            w = jax.nn.softmax(self.param("deriv_logits", lambda r,s: jnp.array([5.] + [0.]*self.derivative_order), (self.derivative_order+1,)))
-            poly = w[0] + w[1] * x_val[..., None]
-            if self.derivative_order == 2:
-                poly += w[2] * -jnp.square(x_val[..., None])
-            re_m, im_m = poly * cos_b, poly * sin_b
+            time_weight = jnp.concatenate(w_list, axis=2).astype(self.compute_dtype)
 
-        # --- 4. SINGLE FUSED SCAN (Bandwidth King) ---
-        # On prépare tout pour un SEUL appel kernel
-        # On broadcast p_w maintenant pour matcher les dimensions (K, H, M)
-        # p_w est (B, L, K, 1, 1), re_m est (B, L, K, H, M)
-        # Le produit p_w * re_m fait le broadcast implicite
-        
-        flat_dim = self.K * H * self.M
-        
-        # Terme Dénominateur (Broadcasté à la taille max pour être concaténé)
-        # C'est un peu de gaspillage mémoire mais ça garantit UN SEUL kernel de lecture/écriture
-        den_in = jnp.broadcast_to(p_w, (b, l, self.K, H, self.M)).reshape(b, l, flat_dim)
-        num_re_in = (p_w * re_m).reshape(b, l, flat_dim)
-        num_im_in = (p_w * im_m).reshape(b, l, flat_dim)
-        
-        # Concaténation sur l'axe des features
-        merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
-        
-        # LE SEUL ET UNIQUE SCAN
-        cumsum = jnp.cumsum(merged, axis=1)
-        
-        # Split post-calcul
-        den, num_re, num_im = jnp.split(cumsum, 3, axis=-1)
+        # ---- 4) Positive weights (softplus) ----
+        score_scale = self.param("score_scale", nn.initializers.ones, (K,)).astype(self.param_dtype)
+        logits = (s_raw.astype(self.param_dtype) * score_scale[None, None, :, None]).astype(self.param_dtype)
+        p = (jax.nn.softplus(logits) + self.eps).astype(self.compute_dtype)   # (B,L,K,1)
+        p_w = p * time_weight                                                # (B,L,K,1)
 
-        # --- 5. NORM & PROJ ---
-        inv_den = 1.0 / jnp.maximum(den, 1e-4)
-        re = (num_re * inv_den).reshape(b, l, self.K, H * self.M)
-        im = (num_im * inv_den).reshape(b, l, self.K, H * self.M)
+        # ---- 5) Spectral modulation (fused sincos) ----
+        theta = self.param("theta", self._init_theta, (1, 1, K, H, M)).astype(self.param_dtype)
+        phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)  # (B,L,K,H,M)
+        cos_b, sin_b = jax.lax.sincos(phi)
 
-        # Fusion Norm
-        mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
-        rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
+        re_m = cos_b.astype(self.compute_dtype)
+        im_m = sin_b.astype(self.compute_dtype)
 
-        split_dim = H * self.M
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
-        scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
+        # ---- 6) Causal aggregation (no giant broadcast/concat) ----
+        den = jnp.cumsum(p_w.astype(jnp.float32), axis=1)  # (B,L,K,1)
 
-        y_re = jnp.dot(re * rsqrt * scale[:split_dim], W_re)
-        y_im = jnp.dot(im * rsqrt * scale[split_dim:], W_im)
+        # (B,L,K,H,M): broadcast p_w with explicit singleton axes (cheap)
+        pw5 = p_w[..., None, None]
+        num_re = jnp.cumsum((pw5 * re_m).astype(jnp.float32), axis=1)
+        num_im = jnp.cumsum((pw5 * im_m).astype(jnp.float32), axis=1)
 
-        y = (y_re + y_im).reshape(b, l, d_inner)
-        out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
+        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(self.compute_dtype)  # (B,L,K,1)
+        re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)     # (B,L,K,H,M)
+        im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
+
+        # ---- 7) Mix (H*M -> H) + cheap RMS-like normalization ----
+        re = re.reshape(B, L, K, H * M)
+        im = im.reshape(B, L, K, H * M)
+
+        mean_sq = (
+            (jnp.sum(jnp.square(re).astype(jnp.float32), axis=-1) +
+             jnp.sum(jnp.square(im).astype(jnp.float32), axis=-1))
+            / jnp.float32(2 * H * M)
+        )  # (B,L,K)
+
+        rsqrt = jax.lax.rsqrt(mean_sq + 1e-5).astype(self.compute_dtype)
+
+        split_dim = H * M
+        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
+        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
+        scale = self.param("mix_scale", nn.initializers.ones, (2 * split_dim,)).astype(self.param_dtype)
+
+        re_n = (re * rsqrt[..., None] * scale[:split_dim][None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
+        im_n = (im * rsqrt[..., None] * scale[split_dim:][None, None, None, :].astype(self.compute_dtype)).astype(self.compute_dtype)
+
+        y_re = jnp.einsum("blkd,dh->blkh", re_n.astype(self.param_dtype), W_re)
+        y_im = jnp.einsum("blkd,dh->blkh", im_n.astype(self.param_dtype), W_im)
+
+        y = (y_re + y_im).astype(self.compute_dtype).reshape(B, L, d_inner)
+
+        out = nn.Dense(
+            D, use_bias=False,
+            dtype=self.compute_dtype, param_dtype=self.param_dtype,
+            name="out_proj"
+        )(y * x_gate)
 
         if self.dropout > 0:
-            out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
-        
-        return out
+            out = nn.Dropout(rate=self.dropout)(out, deterministic=deterministic)
 
+        return out.astype(x.dtype)
 
 
 class SeqCondBlock(nn.Module):
-    # Wrapper simple avec Pre-Norm et Residual
     num_heads: int = 32
     key_heads: Optional[int] = None
-    expand_factor: int = 2
-    num_thetas: int = 4
+    expand_factor: float = 2.0
+    num_thetas: int = 1
     num_anchor_heads: int = 0
-    derivative_order: int = 0
-    dropout: float = 0.0
     conv_kernel_size: int = 4
+    dropout: float = 0.0
     norm_eps: float = 1e-5
-    maxlen: Optional[int] = None  # forwarded to SeqCondAttention for fixed-length dist
+    maxlen: Optional[int] = None
 
-    # ... passer tous les autres args ...
-    
+    compute_dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
+
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
-        # Passage d'args dynamique via **kwargs possible ou explicite
-        # Ici simplifié pour l'exemple
-        normed = nn.RMSNorm(epsilon=1e-5)(x)
-        mixed = SeqCondAttention(
+        h = nn.RMSNorm(epsilon=self.norm_eps, dtype=self.compute_dtype, param_dtype=self.param_dtype)(x)
+        h = SeqCondAttentionBestNow(
             num_heads=self.num_heads,
             key_heads=self.key_heads,
             expand_factor=self.expand_factor,
             num_thetas=self.num_thetas,
             num_anchor_heads=self.num_anchor_heads,
-            derivative_order=self.derivative_order,
-            dropout=self.dropout,
             conv_kernel_size=self.conv_kernel_size,
+            dropout=self.dropout,
             maxlen=self.maxlen,
-        )(normed, mask, deterministic)
-        return x + mixed
+            compute_dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(h, mask=mask, deterministic=deterministic)
+        return x + h
 
 
 # class SeqCondBlock(nn.Module):
