@@ -288,7 +288,7 @@ class SeqCondAttention(nn.Module):
     num_thetas: int = 1
     derivative_order: int = 2
     conv_kernel_size: int = 4
-    expand_factor: int = 2
+    expand_factor: int = 1  # <--- RETOUR A 1 POUR LA VITESSE
     dropout: float = 0.0
     maxlen: Optional[int] = None
 
@@ -303,10 +303,10 @@ class SeqCondAttention(nn.Module):
         d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K)
 
-        # --- 1. PROJECTION & CONVOLUTION ---
+        # --- 1. PROJECTION & CONVOLUTION (Optimized) ---
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
         
-        # Padding natif dans la conv (évite la copie mémoire)
+        # Native Padding : XLA fusionne ça sans overhead mémoire
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
@@ -324,11 +324,10 @@ class SeqCondAttention(nn.Module):
             s_raw *= m
             x_val *= m
 
-        # --- 2. PARAMETERS (Time & Frequency) ---
-        # Theta Init (Robuste M=1)
+        # --- 2. PARAMETERS ---
+        # Theta Init (Anti-Zero Gradient)
         def init_theta(key, shape):
             if self.M == 1:
-                # Force shape explicite (1, 1, K, H, 1)
                 grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
                 signs = np.resize([1., -1.], grid.shape)
                 return jnp.array(grid * signs, dtype=jnp.float32)
@@ -347,69 +346,65 @@ class SeqCondAttention(nn.Module):
             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
-            # Shape: (1, L, num_decay, 1)
             w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
 
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            # Shape: (1, L, num_anchor, 1)
             w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
 
-        # Concatenate heads -> (1, L, K, 1)
         time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32)
-        
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
         
-        # --- FIX DIMENSION p_w ---
-        # On force explicitement le Rank 5: (B, L, K, 1, M)
-        # p * time_weight -> (B, L, K, 1)
-        p_w = (p * time_weight).reshape(b, l, self.K, 1, 1)
-        
-        # Si M > 1, on broadcast p_w sur la dernière dimension pour qu'il matche theta
-        if self.M > 1:
-            p_w = jnp.broadcast_to(p_w, (b, l, self.K, 1, self.M))
+        # Shape finale: (B, L, K, 1, M) pour broadcaster correctement sur H
+        p_w = (p * time_weight)[..., None] 
+        # Si M > 1, on laisse le broadcast implicite agir plus tard, 
+        # mais ici on s'assure juste que p_w est prêt à être multiplié par (K, H, M)
 
         # --- 3. SPECTRAL MODULATION ---
-        # x_val (B, L, K, H) -> (B, L, K, H, 1)
-        phi = (x_val[..., None] * theta).astype(jnp.float32) 
+        phi = (x_val[..., None] * theta).astype(jnp.float32)
         cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
 
         if self.derivative_order == 0:
             re_m, im_m = cos_b, sin_b
         else:
             w = jax.nn.softmax(self.param("deriv_logits", lambda r,s: jnp.array([5.] + [0.]*self.derivative_order), (self.derivative_order+1,)))
-            term_0 = w[0]
-            term_1 = w[1] * x_val[..., None]
-            term_2 = (w[2] * -jnp.square(x_val[..., None])) if self.derivative_order == 2 else 0.
-            poly = term_0 + term_1 + term_2
+            poly = w[0] + w[1] * x_val[..., None]
+            if self.derivative_order == 2:
+                poly += w[2] * -jnp.square(x_val[..., None])
             re_m, im_m = poly * cos_b, poly * sin_b
 
-        # --- 4. SCANS OPTIMISÉS (Correct Dimensions) ---
+        # --- 4. SINGLE FUSED SCAN (Bandwidth King) ---
+        # On prépare tout pour un SEUL appel kernel
+        # On broadcast p_w maintenant pour matcher les dimensions (K, H, M)
+        # p_w est (B, L, K, 1, 1), re_m est (B, L, K, H, M)
+        # Le produit p_w * re_m fait le broadcast implicite
         
-        # 1. Denominator (Scan sur p_w directement, très léger)
-        # Shape p_w: (B, L, K, 1, M) -> Scan axis 1
-        den_small = jnp.cumsum(p_w, axis=1)
+        flat_dim = self.K * H * self.M
         
-        # 2. Numerators (Scan sur le produit)
-        # p_w (..., 1, M) * re_m (..., H, M) -> Broadcast OK (1 -> H)
-        # Result (B, L, K, H, M)
-        num_re = jnp.cumsum(p_w * re_m, axis=1)
-        num_im = jnp.cumsum(p_w * im_m, axis=1)
-
-        # --- 5. NORMALIZATION ---
-        inv_den = 1.0 / jnp.maximum(den_small, 1e-4)
+        # Terme Dénominateur (Broadcasté à la taille max pour être concaténé)
+        # C'est un peu de gaspillage mémoire mais ça garantit UN SEUL kernel de lecture/écriture
+        den_in = jnp.broadcast_to(p_w, (b, l, self.K, H, self.M)).reshape(b, l, flat_dim)
+        num_re_in = (p_w * re_m).reshape(b, l, flat_dim)
+        num_im_in = (p_w * im_m).reshape(b, l, flat_dim)
         
-        # Broadcast implicite de la division (..., 1, M) vers (..., H, M)
-        re = num_re * inv_den
-        im = num_im * inv_den
+        # Concaténation sur l'axe des features
+        merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
+        
+        # LE SEUL ET UNIQUE SCAN
+        cumsum = jnp.cumsum(merged, axis=1)
+        
+        # Split post-calcul
+        den, num_re, num_im = jnp.split(cumsum, 3, axis=-1)
 
-        # --- 6. PROJECTION ---
-        re_flat = re.reshape(b, l, self.K, H * self.M)
-        im_flat = im.reshape(b, l, self.K, H * self.M)
+        # --- 5. NORM & PROJ ---
+        inv_den = 1.0 / jnp.maximum(den, 1e-4)
+        re = (num_re * inv_den).reshape(b, l, self.K, H * self.M)
+        im = (num_im * inv_den).reshape(b, l, self.K, H * self.M)
 
-        mean_sq = (jnp.sum(jnp.square(re_flat), -1) + jnp.sum(jnp.square(im_flat), -1)) / (2 * H * self.M)
+        # Fusion Norm
+        mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
         rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
 
         split_dim = H * self.M
@@ -417,8 +412,8 @@ class SeqCondAttention(nn.Module):
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
         scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        y_re = jnp.dot(re_flat * rsqrt * scale[:split_dim], W_re)
-        y_im = jnp.dot(im_flat * rsqrt * scale[split_dim:], W_im)
+        y_re = jnp.dot(re * rsqrt * scale[:split_dim], W_re)
+        y_im = jnp.dot(im * rsqrt * scale[split_dim:], W_im)
 
         y = (y_re + y_im).reshape(b, l, d_inner)
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
@@ -427,6 +422,7 @@ class SeqCondAttention(nn.Module):
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
         
         return out
+
 
 
 class SeqCondBlock(nn.Module):
