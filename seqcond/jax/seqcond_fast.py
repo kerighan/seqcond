@@ -463,6 +463,7 @@ class SeqCondBlock(nn.Module):
     dropout: float = 0.0
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None
+    derivative_order: Optional[int] = 0
 
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
