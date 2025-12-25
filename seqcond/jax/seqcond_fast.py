@@ -438,7 +438,6 @@ class SeqCondBlock(nn.Module):
     derivative_order: int = 0
     dropout: float = 0.0
     conv_kernel_size: int = 4
-    conv_kernel: Optional[int] = None
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None  # forwarded to SeqCondAttention for fixed-length dist
 
@@ -458,7 +457,6 @@ class SeqCondBlock(nn.Module):
             derivative_order=self.derivative_order,
             dropout=self.dropout,
             conv_kernel_size=self.conv_kernel_size,
-            conv_kernel=self.conv_kernel,
             maxlen=self.maxlen,
         )(normed, mask, deterministic)
         return x + mixed
