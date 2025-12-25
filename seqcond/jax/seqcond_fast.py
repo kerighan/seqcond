@@ -426,9 +426,11 @@ class SeqCondAttention(nn.Module):
         re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)
         im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
 
-        re = re.reshape(B, L, K, H * M)
-        im = im.reshape(B, L, K, H * M)
-        split_dim = H * M
+        # Flatten all trailing dims after (B,L,K)
+        re = re.reshape(B, L, K, -1)
+        im = im.reshape(B, L, K, -1)
+        split_dim = re.shape[-1]
+
 
         mean_sq = (
             (jnp.sum(jnp.square(re).astype(jnp.float32), axis=-1) +
