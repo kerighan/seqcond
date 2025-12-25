@@ -108,7 +108,6 @@ class SeqCondModel(nn.Module):
     tie_weights: bool = True
     qk_norm: bool = False
     qk_norm_eps: float = 1e-6
-    use_conv: bool = True
     conv_kernel_size: int = 4
     remat: bool = True
 
@@ -168,7 +167,6 @@ class SeqCondModel(nn.Module):
                     num_anchor_heads=self.num_anchor_heads,
                     derivative_order=self.derivative_order,
                     dropout=self.dropout,
-                    use_conv=self.use_conv,
                     conv_kernel_size=self.conv_kernel_size,
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
@@ -239,7 +237,6 @@ class SeqCondModelV2(nn.Module):
     tie_weights: bool = True
     qk_norm: bool = False
     qk_norm_eps: float = 1e-6
-    use_conv: bool = True
     conv_kernel_size: int = 4
     remat: bool = True
 
@@ -298,7 +295,6 @@ class SeqCondModelV2(nn.Module):
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
                     dropout=self.dropout,
-                    use_conv=self.use_conv,
                     conv_kernel_size=self.conv_kernel_size,
                     name=f"seqcond_block_{seqcond_idx}",
                 )
@@ -399,7 +395,6 @@ def create_seqcond_model(
     tie_weights: bool = True,
     qk_norm: bool = False,
     qk_norm_eps: float = 1e-6,
-    use_conv: bool = True,
     conv_kernel_size: int = 4,
     remat: bool = True,
 ) -> SeqCondModel:
@@ -423,7 +418,6 @@ def create_seqcond_model(
         tie_weights=tie_weights,
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
-        use_conv=use_conv,
         conv_kernel_size=conv_kernel_size,
         remat=remat,
     )
@@ -446,7 +440,6 @@ def create_seqcond_model_v2(
     tie_weights: bool = True,
     qk_norm: bool = False,
     qk_norm_eps: float = 1e-6,
-    use_conv: bool = True,
     conv_kernel_size: int = 4,
     remat: bool = True,
 ) -> SeqCondModelV2:
@@ -468,7 +461,6 @@ def create_seqcond_model_v2(
         tie_weights=tie_weights,
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
-        use_conv=use_conv,
         conv_kernel_size=conv_kernel_size,
         remat=remat,
     )
