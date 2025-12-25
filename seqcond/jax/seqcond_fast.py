@@ -284,14 +284,15 @@ from typing import Optional
 class SeqCondAttention(nn.Module):
     num_heads: int = 32
     key_heads: Optional[int] = None   # Si None, utilise num_heads
-    num_anchor_heads: int = 4         # Têtes à décroissance lente
+    num_anchor_heads: int = 4         # Têtes à décroissance lente (Mémoire long terme)
     num_thetas: int = 1               # Dimension M (Spectral)
     derivative_order: int = 2         # Ordre de Taylor pour la modulation
     conv_kernel_size: int = 4         # Taille du kernel de convolution locale
-    expand_factor: int = 2            # <--- C'est ici ! 2 = 140k tokens/s. Mets 1 pour accélérer.
+    expand_factor: int = 2            # <--- CRITIQUE : 2 = 140k tokens/s. Mets 1 pour max speed.
     dropout: float = 0.0
     maxlen: Optional[int] = None      # Pour le calcul des positions relatives si besoin
 
+    # Précision
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
@@ -313,11 +314,11 @@ class SeqCondAttention(nn.Module):
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
         
         # Convolution Depthwise Causale (Token Mixing Local)
-        # feature_group_count = features => Depthwise
+        # feature_group_count = features => Depthwise (efficace)
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
-            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (gauche)
+            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (Gauche uniquement)
             feature_group_count=z.shape[-1], 
             use_bias=False, # Pas de bias ici pour économiser
             name="conv"
@@ -328,7 +329,7 @@ class SeqCondAttention(nn.Module):
         x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
-        # Masquage optionnel (padding mask)
+        # Masquage optionnel (ex: padding mask)
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
@@ -351,7 +352,7 @@ class SeqCondAttention(nn.Module):
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
         
-        # B. Decay Weights (Time constant)
+        # B. Decay Weights (Constante de temps)
         pos = jnp.arange(l, dtype=jnp.float32)
         w_list = []
         
