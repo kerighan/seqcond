@@ -399,7 +399,10 @@ class SeqCondAttention(nn.Module):
         # ---- 5) Spectral modulation (fused sincos) ----
         theta = self.param("theta", self._init_theta, (1, 1, K, H, M)).astype(self.param_dtype)
         phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)  # (B,L,K,H,M)
-        cos_b, sin_b = jax.lax.sincos(phi)
+        # cos_b, sin_b = jax.lax.sincos(phi)
+        cos_b = jnp.cos(phi)
+        sin_b = jnp.sin(phi)
+
 
         re_m = cos_b.astype(self.compute_dtype)
         im_m = sin_b.astype(self.compute_dtype)
