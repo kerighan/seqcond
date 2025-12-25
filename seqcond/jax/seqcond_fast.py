@@ -308,167 +308,108 @@ class SeqCondAttention(nn.Module):
         d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K)
 
-        # --- 1. PROJECTION & LOCAL MIXING (Optimized) ---
-        # Projection unique (Channel Mixing)
-        # On projette vers : Values (d_inner) + Gates (d_inner) + Keys/Scores (K)
+        # --- 1. PROJECTION & LOCAL MIXING ---
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
         z = z.astype(self.compute_dtype)
         
-        # Convolution Depthwise Causale (Token Mixing Local)
-        # feature_group_count = features => Depthwise
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
-            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (gauche)
+            padding=((self.conv_kernel_size - 1, 0),),
             feature_group_count=z.shape[-1], 
-            use_bias=False, # Pas de bias ici pour économiser
+            use_bias=False,
             name="conv"
         )(z)
 
-        # Splitting des tenseurs
         x_val = z[..., :d_inner].reshape(b, l, self.K, H)
         x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
-        # Masquage optionnel (padding mask)
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
             x_val *= m
 
-        # --- 2. GENERATION DES PARAMETRES (Theta & Decay) ---
+        # --- 2. GENERATION DES PARAMETRES (THE GOLDEN PATH) ---
+        # Retour à la version stable et rapide sans clip
         
-        # A. Theta Init (Frequencies)
         def init_theta(key, shape):
             if self.M == 1:
-                # Distribution linéaire simple alternée
                 grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
                 signs = np.resize([1., -1.], grid.shape)
                 return jnp.array(grid * signs, dtype=jnp.float32)
             else:
-                # Distribution angulaire pour M > 1
                 grid = np.linspace(-np.pi/3, np.pi/3, self.M)
                 base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
                 return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
         
-        # B. Decay Weights (Time constant)
         pos = jnp.arange(l, dtype=jnp.float32)
-        # w_list = []
         log_w_list = []
-        # Têtes rapides (Short-term memory)
+        
         if self.num_decay_heads > 0:
             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
-            # Distance inversée pour le decay
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
-            # w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
             log_w_list.append(-slopes * dist[None, :, None, None])
 
-        # Têtes lentes (Long-term / Anchor)
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            # w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
             log_w_list.append(-slopes_a * pos[None, :, None, None])
 
-        # Fusion des poids temporels
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
         
-        # C. Scores (Keys) scaling
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        # p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
-        log_p = (score_scale[None, None, :, None] * s_raw)
+        log_p_raw = score_scale[None, None, :, None] * s_raw
         
-        # Préparation pour le scan : p * time_decay
-        # Shape: (B, L, K, 1, 1) broadcastable vers (K, H, M)
+        # Clip vital ici
+        log_p = jnp.clip(log_p_raw, -20., 20.)
+        
         p_w = jnp.exp(log_p + log_time_weight)
 
         # --- 3. SPECTRAL MODULATION ---
-        # Modulation complexe (x * theta)
         phi = (x_val[..., None] * theta)
         cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
-        # Approximation polynomiale (Taylor) si order > 0
         re_m, im_m = cos_b, sin_b
 
-        # --- 4. SINGLE FUSED SCAN (Bandwidth King Optimized) ---
-        # Optimisation : On ne répète pas le dénominateur H*M fois.
-        # On le scanne une seule fois par tête (K), puis on broadcast le résultat.
-        
-        # Dimensions plates
+        # --- 4. SINGLE FUSED SCAN (OPTIMIZED) ---
         flat_dim = self.K * H * self.M
         
-        # A. Dénominateur (Optimisé)
-        # p_w est (B, L, K, 1). On veut juste (B, L, K) pour le scan.
-        # Pas besoin de broadcast_to vers flat_dim !
-        den_in = p_w.squeeze(-1)  # Shape: (B, L, K)
-
-        # B. Numérateurs (Réel & Imaginaire)
-        # Il faut broadcaster p_w pour la multiplication élémentaire avant le reshape
-        # p_w: (B, L, K, 1) -> (B, L, K, 1, 1) pour multiplier (B, L, K, H, M)
+        den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
         num_re_in = (p_w_broad * re_m).reshape(b, l, flat_dim)
         num_im_in = (p_w_broad * im_m).reshape(b, l, flat_dim)
         
-        # C. Fusion et Scan
-        # On concatène : [K] + [K*H*M] + [K*H*M]
-        # Ce qui est BEAUCOUP plus léger que [K*H*M] * 3
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
-        
         cumsum = jnp.cumsum(merged, axis=1)
-        
-        # D. Séparation post-scan (Split avec indices explicites)
-        # On coupe aux indices : K, et K + flat_dim
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
 
-        # --- 5. NORMALIZATION & OUTPUT PROJ ---
-        # Maintenant il faut rendre les shapes compatibles pour la division
-        # den est (B, L, K). On le remet en (B, L, K, 1) pour diviser (B, L, K*H*M)
-        # Note: (K*H*M) est vu comme une dim unique ici, mais le broadcast (K, 1) fonctionne
-        # car on va reshape num_re juste après.
+        # --- 5. OUTPUT PROJ (NO NORM MODE) ---
         
-        # Astuce : On reshape den tout de suite pour le broadcast sur (H*M)
-        # den (B, L, K) -> (B, L, K, 1)
+        # Division par le dénominateur (Essentiel mathématiquement)
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         
-        # On reshape num_re de (B, L, K*H*M) vers (B, L, K, H*M) pour que le broadcast (K, 1) marche
+        # On récupère les états bruts normalisés par le poids temporel uniquement
         re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
         im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
 
-        # --- ANCIENNE NORMALISATION RMSNORM (COMMENTÉE) ---
-        # L2-like Norm interne
-        # mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
-        # rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
-
-        # --- NOUVEAU : DERF (Point-wise Norm Replacement) ---
-        # Formula: Derf(x) = erf(a * x + s)
-        # Nous avons besoin de paramètres 'a' (scale) et 's' (bias) pour chaque dimension
+        # --- SUPPRESSION TOTALE DU RMSNORM ---
+        # On passe directement à la projection linéaire
         
         split_dim = H * self.M
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
         
-        # On définit 'scale' (a) et 'bias' (s) pour le Derf
-        # Le scale remplace le 'norm_scale' précédent mais s'applique AVANT l'activation
-        derf_scale = self.param("derf_scale", nn.initializers.ones, (2 * split_dim,))
-        derf_bias = self.param("derf_bias", nn.initializers.zeros, (2 * split_dim,))
+        # J'ai gardé le scale factor, c'est un paramètre linéaire "gratuit" (LayerScale)
+        # Ça aide souvent la convergence quand on n'a pas de Norm
+        scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        # Application Derf sur partie Réelle
-        # re : (B, L, K, split_dim)
-        re_in = re * derf_scale[:split_dim] + derf_bias[:split_dim]
-        re_act = jax.lax.erf(re_in) # <--- La magie est ici
+        # Application directe
+        y_re = jnp.dot(re * scale[:split_dim], W_re)
+        y_im = jnp.dot(im * scale[split_dim:], W_im)
 
-        # Application Derf sur partie Imaginaire
-        im_in = im * derf_scale[split_dim:] + derf_bias[split_dim:]
-        im_act = jax.lax.erf(im_in)
-
-        # Application de la projection
-        # Note: on n'a plus rsqrt ici, on projette directement l'activation bornée
-        y_re = jnp.dot(re_act, W_re) 
-        y_im = jnp.dot(im_act, W_im)
-
-        # Recombinaison + Gating
         y = (y_re + y_im).reshape(b, l, d_inner)
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
 
