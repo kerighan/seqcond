@@ -920,7 +920,7 @@ class Trainer:
                     tokens_delta = self.data_loader.tokens_since_last_check()
                     current_tokens_seen = self.data_loader.tokens_seen
 
-                self._log_progress(
+                last_log_time = self._log_progress(
                     macro_step,
                     tc.total_steps,
                     metrics,
@@ -930,7 +930,6 @@ class Trainer:
                     current_tokens_seen,
                 )
                 metrics.reset()
-                last_log_time = time.time()
 
             if macro_step > 0 and macro_step % tc.generate_every_n_steps == 0:
                 self._generate_sample(macro_step)
@@ -955,8 +954,12 @@ class Trainer:
         last_log_time: float,
         tokens_delta: int = 0,
         tokens_seen: int = 0,
-    ):
+    ) -> float:
         """Log training progress."""
+        # This is now the only place we should be calling device_get for metrics
+        # We sync FIRST to ensure accurate timing (Sync-to-Sync)
+        results = jax.device_get(metrics.result())
+        
         current_time = time.time()
         elapsed = current_time - last_log_time
         log_interval = self.train_config.log_every_n_steps
@@ -971,9 +974,6 @@ class Trainer:
         eta_h = int(eta_seconds // 3600)
         eta_m = int((eta_seconds % 3600) // 60)
         eta_s = int(eta_seconds % 60)
-
-        # This is now the only place we should be calling device_get for metrics
-        results = jax.device_get(metrics.result())
 
         print(
             f"Step {macro_step:6d}/{total_steps} | "
@@ -993,6 +993,8 @@ class Trainer:
                 "tokens_seen": tokens_seen,
             }
             self._wandb.log(log_data, step=macro_step)
+            
+        return current_time
 
     def _generate_sample(self, step: int):
         """Generate a text sample (dual pad modes: fixed, power2)."""
