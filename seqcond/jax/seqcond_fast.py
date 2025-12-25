@@ -396,51 +396,45 @@ class SeqCondAttention(nn.Module):
         p = (jax.nn.softplus(logits) + self.eps).astype(self.compute_dtype)   # (B,L,K,1)
         p_w = p * time_weight                                                # (B,L,K,1)
 
-        # ---- 5) Spectral modulation (fused sincos) ----
+        # ---- 5) Spectral modulation ----
         theta = self.param("theta", self._init_theta, (1, 1, K, H, M)).astype(self.param_dtype)
-        phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)  # (B,L,K,H,M)
-        # cos_b, sin_b = jax.lax.sincos(phi)
+        phi = (x_val.astype(self.param_dtype)[..., None] * theta).astype(self.param_dtype)
+
         cos_b = jnp.cos(phi)
         sin_b = jnp.sin(phi)
 
         re_m = cos_b.astype(self.compute_dtype)
         im_m = sin_b.astype(self.compute_dtype)
 
-        # ---- 6) Causal aggregation (no giant broadcast/concat) ----
+        # ---- 6) Causal aggregation (robust broadcasting) ----
         den = jnp.cumsum(p_w.astype(jnp.float32), axis=1)  # (B,L,K,1)
 
-        # (B,L,K,H,M): broadcast p_w with explicit singleton axes (cheap)
-        pw5 = p_w[..., None, None]
-        num_re = jnp.cumsum((pw5 * re_m).astype(jnp.float32), axis=1)
-        num_im = jnp.cumsum((pw5 * im_m).astype(jnp.float32), axis=1)
+        pw = p_w.astype(jnp.float32)  # (B,L,K,1)
+        pw = pw.reshape(pw.shape + (1,) * (re_m.ndim - pw.ndim))
 
-        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(self.compute_dtype)  # (B,L,K,1)
+        num_re = jnp.cumsum(pw * re_m.astype(jnp.float32), axis=1)
+        num_im = jnp.cumsum(pw * im_m.astype(jnp.float32), axis=1)
 
-        # re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)     # (B,L,K,H,M)
-        # im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
+        inv_den = (1.0 / jnp.maximum(den, self.eps)).astype(jnp.float32)  # (B,L,K,1)
+        inv_den = inv_den.reshape(inv_den.shape + (1,) * (re_m.ndim - inv_den.ndim))
 
-        # # ---- 7) Mix (H*M -> H) + cheap RMS-like normalization ----
-        # re = re.reshape(B, L, K, H * M)
-        # im = im.reshape(B, L, K, H * M)
+        re = (num_re * inv_den).astype(self.compute_dtype)
+        im = (num_im * inv_den).astype(self.compute_dtype)
 
-        re = (num_re * inv_den[..., None, None]).astype(self.compute_dtype)
-        im = (num_im * inv_den[..., None, None]).astype(self.compute_dtype)
-
-        # Flatten all trailing dims after (B,L,K)
+        # ---- 7) Mix + RMS-like norm (flatten trailing dims) ----
         re = re.reshape(B, L, K, -1)
         im = im.reshape(B, L, K, -1)
         split_dim = re.shape[-1]
 
-
         mean_sq = (
             (jnp.sum(jnp.square(re).astype(jnp.float32), axis=-1) +
              jnp.sum(jnp.square(im).astype(jnp.float32), axis=-1))
-            / jnp.float32(2 * H * M)
+            / jnp.float32(2 * split_dim)
         )  # (B,L,K)
 
         rsqrt = jax.lax.rsqrt(mean_sq + 1e-5).astype(self.compute_dtype)
 
-        # split_dim = H * M
+        # Mix to head-dim H (so output is (B,L,K,H) -> (B,L,d_inner))
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H)).astype(self.param_dtype)
         scale = self.param("mix_scale", nn.initializers.ones, (2 * split_dim,)).astype(self.param_dtype)
@@ -463,6 +457,7 @@ class SeqCondAttention(nn.Module):
             out = nn.Dropout(rate=self.dropout)(out, deterministic=deterministic)
 
         return out.astype(x.dtype)
+
 
 
 class SeqCondBlock(nn.Module):
