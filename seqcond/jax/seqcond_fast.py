@@ -379,11 +379,11 @@ class SeqCondAttention(nn.Module):
         # C. Scores (Keys) scaling
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         # p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
-        log_p = (score_scale[None, None, :, None] * s_raw)
+        log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20.0, 20.0)
         
         # Préparation pour le scan : p * time_decay
         # Shape: (B, L, K, 1, 1) broadcastable vers (K, H, M)
-        p_w = jnp.exp(jnp.clip(log_p + log_time_weight, -20.0, 20.0))
+        p_w = jnp.exp(log_p + log_time_weight)
 
         # --- 3. SPECTRAL MODULATION ---
         # Modulation complexe (x * theta)
