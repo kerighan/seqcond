@@ -288,7 +288,7 @@ class SeqCondAttention(nn.Module):
     num_thetas: int = 1               # Dimension M (Spectral)
     derivative_order: int = 2         # Ordre de Taylor pour la modulation
     conv_kernel_size: int = 4         # Taille du kernel de convolution locale
-    expand_factor: int = 2            # <--- CRITIQUE : 2 = 140k tokens/s. Mets 1 pour max speed.
+    expand_factor: int = 1            # <--- CRITIQUE : 2 = 140k tokens/s. Mets 1 pour max speed.
     dropout: float = 0.0
     maxlen: Optional[int] = None      # Pour le calcul des positions relatives si besoin
 
@@ -312,13 +312,14 @@ class SeqCondAttention(nn.Module):
         # Projection unique (Channel Mixing)
         # On projette vers : Values (d_inner) + Gates (d_inner) + Keys/Scores (K)
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
+        z = z.astype(self.compute_dtype)
         
         # Convolution Depthwise Causale (Token Mixing Local)
-        # feature_group_count = features => Depthwise (efficace)
+        # feature_group_count = features => Depthwise
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
-            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (Gauche uniquement)
+            padding=((self.conv_kernel_size - 1, 0),), # Padding causal (gauche)
             feature_group_count=z.shape[-1], 
             use_bias=False, # Pas de bias ici pour économiser
             name="conv"
@@ -329,7 +330,7 @@ class SeqCondAttention(nn.Module):
         x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
-        # Masquage optionnel (ex: padding mask)
+        # Masquage optionnel (padding mask)
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
@@ -352,7 +353,7 @@ class SeqCondAttention(nn.Module):
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
         
-        # B. Decay Weights (Constante de temps)
+        # B. Decay Weights (Time constant)
         pos = jnp.arange(l, dtype=jnp.float32)
         w_list = []
         
@@ -371,7 +372,7 @@ class SeqCondAttention(nn.Module):
             w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
 
         # Fusion des poids temporels
-        time_weight = jnp.concatenate(w_list, axis=2).astype(jnp.float32)
+        time_weight = jnp.concatenate(w_list, axis=2)
         
         # C. Scores (Keys) scaling
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
@@ -379,11 +380,11 @@ class SeqCondAttention(nn.Module):
         
         # Préparation pour le scan : p * time_decay
         # Shape: (B, L, K, 1, 1) broadcastable vers (K, H, M)
-        p_w = (p * time_weight)[..., None] 
+        p_w = (p * time_weight) 
 
         # --- 3. SPECTRAL MODULATION ---
         # Modulation complexe (x * theta)
-        phi = (x_val[..., None] * theta).astype(jnp.float32)
+        phi = (x_val[..., None] * theta)
         cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
 
         # Approximation polynomiale (Taylor) si order > 0
@@ -397,34 +398,51 @@ class SeqCondAttention(nn.Module):
                 poly += w[2] * -jnp.square(x_val[..., None])
             re_m, im_m = poly * cos_b, poly * sin_b
 
-        # --- 4. SINGLE FUSED SCAN (Bandwidth King) ---
-        # Optimisation critique : On concatène tout pour faire 1 seul cumsum (prefix sum)
+        # --- 4. SINGLE FUSED SCAN (Bandwidth King Optimized) ---
+        # Optimisation : On ne répète pas le dénominateur H*M fois.
+        # On le scanne une seule fois par tête (K), puis on broadcast le résultat.
         
+        # Dimensions plates
         flat_dim = self.K * H * self.M
         
-        # A. Dénominateur (p_w)
-        # Broadcast explicite nécessaire pour concaténer sur l'axe features
-        den_in = jnp.broadcast_to(p_w, (b, l, self.K, H, self.M)).reshape(b, l, flat_dim)
-        
+        # A. Dénominateur (Optimisé)
+        # p_w est (B, L, K, 1). On veut juste (B, L, K) pour le scan.
+        # Pas besoin de broadcast_to vers flat_dim !
+        den_in = p_w.squeeze(-1)  # Shape: (B, L, K)
+
         # B. Numérateurs (Réel & Imaginaire)
-        # p_w * modulation
-        num_re_in = (p_w * re_m).reshape(b, l, flat_dim)
-        num_im_in = (p_w * im_m).reshape(b, l, flat_dim)
+        # Il faut broadcaster p_w pour la multiplication élémentaire avant le reshape
+        # p_w: (B, L, K, 1) -> (B, L, K, 1, 1) pour multiplier (B, L, K, H, M)
+        p_w_broad = p_w[..., None]
+        num_re_in = (p_w_broad * re_m).reshape(b, l, flat_dim)
+        num_im_in = (p_w_broad * im_m).reshape(b, l, flat_dim)
         
         # C. Fusion et Scan
+        # On concatène : [K] + [K*H*M] + [K*H*M]
+        # Ce qui est BEAUCOUP plus léger que [K*H*M] * 3
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
-        cumsum = jnp.cumsum(merged, axis=1) # Le scan linéaire
         
-        # D. Séparation post-scan
-        den, num_re, num_im = jnp.split(cumsum, 3, axis=-1)
+        cumsum = jnp.cumsum(merged, axis=1)
+        
+        # D. Séparation post-scan (Split avec indices explicites)
+        # On coupe aux indices : K, et K + flat_dim
+        den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
 
         # --- 5. NORMALIZATION & OUTPUT PROJ ---
-        # Normalisation par le dénominateur accumulé
-        inv_den = 1.0 / jnp.maximum(den, 1e-4)
-        re = (num_re * inv_den).reshape(b, l, self.K, H * self.M)
-        im = (num_im * inv_den).reshape(b, l, self.K, H * self.M)
+        # Maintenant il faut rendre les shapes compatibles pour la division
+        # den est (B, L, K). On le remet en (B, L, K, 1) pour diviser (B, L, K*H*M)
+        # Note: (K*H*M) est vu comme une dim unique ici, mais le broadcast (K, 1) fonctionne
+        # car on va reshape num_re juste après.
+        
+        # Astuce : On reshape den tout de suite pour le broadcast sur (H*M)
+        # den (B, L, K) -> (B, L, K, 1)
+        inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
+        
+        # On reshape num_re de (B, L, K*H*M) vers (B, L, K, H*M) pour que le broadcast (K, 1) marche
+        re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
+        im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
 
-        # L2-like Norm interne (RMSNorm sur les composantes complexes)
+        # L2-like Norm interne
         mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
         rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
 
@@ -451,7 +469,7 @@ class SeqCondAttention(nn.Module):
 class SeqCondBlock(nn.Module):
     num_heads: int = 32
     key_heads: Optional[int] = None
-    expand_factor: float = 2.0
+    expand_factor: float = 1.0
     num_thetas: int = 1
     num_anchor_heads: int = 0
     conv_kernel_size: int = 4
