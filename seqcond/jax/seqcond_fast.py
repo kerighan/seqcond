@@ -281,7 +281,7 @@ import flax.linen as nn
 import numpy as np
 from typing import Optional
 
-class SeqCondAttentionBestNow(nn.Module):
+class SeqCondAttention(nn.Module):
     """
     Best-now test option (TPU-friendly):
     - depthwise causal conv on the ORIGINAL width (D) to keep it cheap
@@ -470,7 +470,7 @@ class SeqCondBlock(nn.Module):
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
         h = nn.RMSNorm(epsilon=self.norm_eps, dtype=self.compute_dtype, param_dtype=self.param_dtype)(x)
-        h = SeqCondAttentionBestNow(
+        h = SeqCondAttention(
             num_heads=self.num_heads,
             key_heads=self.key_heads,
             expand_factor=self.expand_factor,
