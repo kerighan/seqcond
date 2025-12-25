@@ -355,40 +355,38 @@ class SeqCondAttention(nn.Module):
         
         # B. Decay Weights (Time constant)
         pos = jnp.arange(l, dtype=jnp.float32)
-        # w_list = []
-        log_w_list = []
+        w_list = []
+        
         # Têtes rapides (Short-term memory)
         if self.num_decay_heads > 0:
             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             # Distance inversée pour le decay
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
-            # w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
-            log_w_list.append(-slopes * dist[None, :, None, None])
+            w_list.append(jnp.exp(-slopes * dist[None, :, None, None]))
 
         # Têtes lentes (Long-term / Anchor)
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            # w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
-            log_w_list.append(-slopes_a * pos[None, :, None, None])
+            w_list.append(jnp.exp(-slopes_a * pos[None, :, None, None]))
 
         # Fusion des poids temporels
-        log_time_weight = jnp.concatenate(log_w_list, axis=2)
+        time_weight = jnp.concatenate(w_list, axis=2)
         
         # C. Scores (Keys) scaling
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        # p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
-        log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20.0, 20.0)
+        p = jnp.exp(jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.))
         
         # Préparation pour le scan : p * time_decay
         # Shape: (B, L, K, 1, 1) broadcastable vers (K, H, M)
-        p_w = jnp.exp(log_p + log_time_weight)
+        p_w = (p * time_weight) 
 
         # --- 3. SPECTRAL MODULATION ---
         # Modulation complexe (x * theta)
         phi = (x_val[..., None] * theta)
         cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
+
         # Approximation polynomiale (Taylor) si order > 0
         re_m, im_m = cos_b, sin_b
 
