@@ -436,19 +436,37 @@ class SeqCondAttention(nn.Module):
         re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
         im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
 
+        # --- ANCIENNE NORMALISATION RMSNORM (COMMENTÉE) ---
         # L2-like Norm interne
-        mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
-        rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
+        # mean_sq = (jnp.sum(jnp.square(re), -1) + jnp.sum(jnp.square(im), -1)) / (2 * H * self.M)
+        # rsqrt = jax.lax.rsqrt(mean_sq[..., None] + 1e-5).astype(x.dtype)
 
-        # Projection de sortie complexe -> réel
+        # --- NOUVEAU : DERF (Point-wise Norm Replacement) ---
+        # Formula: Derf(x) = erf(a * x + s)
+        # Nous avons besoin de paramètres 'a' (scale) et 's' (bias) pour chaque dimension
+        
         split_dim = H * self.M
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
-        scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
+        
+        # On définit 'scale' (a) et 'bias' (s) pour le Derf
+        # Le scale remplace le 'norm_scale' précédent mais s'applique AVANT l'activation
+        derf_scale = self.param("derf_scale", nn.initializers.ones, (2 * split_dim,))
+        derf_bias = self.param("derf_bias", nn.initializers.zeros, (2 * split_dim,))
+
+        # Application Derf sur partie Réelle
+        # re : (B, L, K, split_dim)
+        re_in = re * derf_scale[:split_dim] + derf_bias[:split_dim]
+        re_act = jax.lax.erf(re_in) # <--- La magie est ici
+
+        # Application Derf sur partie Imaginaire
+        im_in = im * derf_scale[split_dim:] + derf_bias[split_dim:]
+        im_act = jax.lax.erf(im_in)
 
         # Application de la projection
-        y_re = jnp.dot(re * rsqrt * scale[:split_dim], W_re)
-        y_im = jnp.dot(im * rsqrt * scale[split_dim:], W_im)
+        # Note: on n'a plus rsqrt ici, on projette directement l'activation bornée
+        y_re = jnp.dot(re_act, W_re) 
+        y_im = jnp.dot(im_act, W_im)
 
         # Recombinaison + Gating
         y = (y_re + y_im).reshape(b, l, d_inner)

@@ -40,6 +40,7 @@ def parse_args():
     grp_model.add_argument("--derivative", type=int, default=None, dest="derivative_order", help="Override derivative order (0, 1, 2)")
     grp_model.add_argument("--anchor", type=int, default=None, dest="num_anchor_heads", help="Override number of anchor heads")
     grp_model.add_argument("--seqcond-heads", type=int, default=None, help="Override number of seqcond heads")
+    grp_model.add_argument("--expand", type=float, default=2.0, dest="expand_factor", help="Override expand factor")
     grp_model.add_argument("--maxlen", type=int, default=1024, help="Context length (affects model and training)")
 
     # Training Configuration Overrides
@@ -83,7 +84,7 @@ def get_config(args) -> Config:
     model_overrides = {}
     
     # Direct mappings (name matches)
-    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type", "seqcond_ratio"]:
+    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type", "seqcond_ratio", "expand_factor"]:
         val = getattr(args, field)
         if val is not None:
             model_overrides[field] = val

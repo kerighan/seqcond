@@ -109,6 +109,7 @@ class SeqCondModel(nn.Module):
     qk_norm: bool = False
     qk_norm_eps: float = 1e-6
     conv_kernel_size: int = 4
+    expand_factor: float = 2.0
     remat: bool = True
 
     def setup(self):
@@ -166,6 +167,7 @@ class SeqCondModel(nn.Module):
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
                     derivative_order=self.derivative_order,
+                    expand_factor=self.expand_factor,
                     dropout=self.dropout,
                     conv_kernel_size=self.conv_kernel_size,
                     maxlen=self.maxlen,
@@ -238,6 +240,7 @@ class SeqCondModelV2(nn.Module):
     qk_norm: bool = False
     qk_norm_eps: float = 1e-6
     conv_kernel_size: int = 4
+    expand_factor: float = 2.0
     remat: bool = True
 
     def setup(self):
@@ -294,6 +297,7 @@ class SeqCondModelV2(nn.Module):
                     num_heads=_seqcond_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
+                    expand_factor=self.expand_factor,
                     dropout=self.dropout,
                     conv_kernel_size=self.conv_kernel_size,
                     name=f"seqcond_block_{seqcond_idx}",
@@ -396,6 +400,7 @@ def create_seqcond_model(
     qk_norm: bool = False,
     qk_norm_eps: float = 1e-6,
     conv_kernel_size: int = 4,
+    expand_factor: float = 2.0,
     remat: bool = True,
 ) -> SeqCondModel:
     """Create a SeqCond model."""
@@ -419,6 +424,7 @@ def create_seqcond_model(
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
         conv_kernel_size=conv_kernel_size,
+        expand_factor=expand_factor,
         remat=remat,
     )
 
@@ -441,6 +447,7 @@ def create_seqcond_model_v2(
     qk_norm: bool = False,
     qk_norm_eps: float = 1e-6,
     conv_kernel_size: int = 4,
+    expand_factor: float = 2.0,
     remat: bool = True,
 ) -> SeqCondModelV2:
     """Create a SeqCond V2 model with dynamic thetas."""
@@ -462,6 +469,7 @@ def create_seqcond_model_v2(
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
         conv_kernel_size=conv_kernel_size,
+        expand_factor=expand_factor,
         remat=remat,
     )
 

@@ -27,6 +27,7 @@ class SeqCondAttentionV2(nn.Module):
     use_conv: bool = True
     conv_kernel_size: int = 4
     conv_kernel: Optional[int] = None
+    expand_factor: float = 1.0
 
     def setup(self):
         if self.key_heads is not None and int(self.key_heads) != int(self.num_heads):
@@ -73,7 +74,7 @@ class SeqCondAttentionV2(nn.Module):
         deterministic: bool = True,
     ) -> jnp.ndarray:
         b, l, d_model = x.shape
-        d_inner = d_model
+        d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K)
         k, h = self.K, H
 
@@ -270,6 +271,7 @@ class SeqCondBlockV2(nn.Module):
     conv_kernel_size: int = 4
     conv_kernel: Optional[int] = None
     norm_eps: float = 1e-5
+    expand_factor: float = 1.0
 
     def setup(self):
         self.norm = RMSNorm(epsilon=self.norm_eps)
@@ -282,6 +284,7 @@ class SeqCondBlockV2(nn.Module):
             use_conv=self.use_conv,
             conv_kernel_size=self.conv_kernel_size,
             conv_kernel=self.conv_kernel,
+            expand_factor=self.expand_factor,
         )
 
     def __call__(

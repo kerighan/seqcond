@@ -36,6 +36,7 @@ class ModelConfig:
     derivative_order: int = 0
     num_anchor_heads: int = 0
     conv_kernel_size: int = 4
+    expand_factor: float = 2.0
     use_positional_embedding: bool = False
     seqcond_ratio: int = 5  # Interleaving ratio
 
