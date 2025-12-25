@@ -303,15 +303,22 @@ class SeqCondAttention(nn.Module):
         d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K) # Dim par tête
 
-        # --- 1. PROJECTION & CONVOLUTION (Local Mixing) ---
-        # Value + Gate + Scores (tout en une projection)
+        # --- 1. PROJECTION & CONVOLUTION (Optimized) ---
+        # Value + Gate + Scores
         z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
         
-        # Causal Conv 1D (Optimisé avec padding manuel)
-        z = jnp.pad(z, ((0, 0), (self.conv_kernel_size - 1, 0), (0, 0)))
-        z = nn.Conv(features=z.shape[-1], kernel_size=(self.conv_kernel_size,), 
-                    padding="VALID", feature_group_count=z.shape[-1], name="conv")(z)
-
+        # FIX DU PADDING HELL :
+        # On passe le tuple ((left, right),) directement à nn.Conv
+        # XLA gère ça en interne sans briser l'alignement mémoire (Zero-Copy implicit padding)
+        padding_tuple = ((self.conv_kernel_size - 1, 0),)
+        
+        z = nn.Conv(
+            features=z.shape[-1], 
+            kernel_size=(self.conv_kernel_size,), 
+            padding=padding_tuple,  # <--- MAGIE ICI
+            feature_group_count=z.shape[-1], 
+            name="conv"
+        )(z)
         # Split: Value, Gate (SwiGLU style), Scores
         x_val = z[..., :d_inner].reshape(b, l, self.K, H)
         x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
