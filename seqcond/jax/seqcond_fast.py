@@ -444,7 +444,7 @@ class SeqCondAttention(nn.Module):
 
 class SeqCondBlock(nn.Module):
     num_heads: int = 32
-    key_heads: Optional[int] = None
+    num_query_heads: Optional[int] = 4
     expand_factor: float = 1.0
     num_thetas: int = 1
     num_anchor_heads: int = 0
@@ -462,7 +462,7 @@ class SeqCondBlock(nn.Module):
         h = nn.RMSNorm(epsilon=self.norm_eps, dtype=self.compute_dtype, param_dtype=self.param_dtype)(x)
         h = SeqCondAttention(
             num_heads=self.num_heads,
-            key_heads=self.key_heads,
+            num_query_heads=self.num_query_heads,
             expand_factor=self.expand_factor,
             num_thetas=self.num_thetas,
             num_anchor_heads=self.num_anchor_heads,
