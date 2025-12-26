@@ -403,8 +403,10 @@ class SeqCondAttention(nn.Module):
         # den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         den = jnp.cumsum(den_in, axis=1)  # (B,L,K)
         # (B,L,K,H,M) directement, pas besoin de flatten
-        num_re = jnp.cumsum(p_w[..., None] * re_k, axis=1)  # (B,L,K,H,M)
-        num_im = jnp.cumsum(p_w[..., None] * im_k, axis=1)
+        # num_re = jnp.cumsum(p_w[..., None] * re_k, axis=1)  # (B,L,K,H,M)
+        # num_im = jnp.cumsum(p_w[..., None] * im_k, axis=1)
+        num_re = jax.lax.associative_scan(jnp.add, p_w_broad * re_k, axis=1)
+        num_im = jax.lax.associative_scan(jnp.add, p_w_broad * im_k, axis=1)
 
         # inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         # state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
