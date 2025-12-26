@@ -346,7 +346,7 @@ class SeqCondAttention(nn.Module):
         # GQA Spectrale directe : Le Dense sort directement les coeffs complexes du filtre
         # (B, L, D) -> (B, L, K', H, M, 2)
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
-        q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
+        q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2).astype(self.compute_dtype)
         
         # Pas de modulation ici ! Le réseau apprend le vecteur complexe directement.
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
@@ -366,6 +366,7 @@ class SeqCondAttention(nn.Module):
                 return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
+        theta = theta.astype(self.compute_dtype)
 
         # Decay Log-Space
         pos = jnp.arange(l, dtype=jnp.float32)
@@ -380,14 +381,15 @@ class SeqCondAttention(nn.Module):
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
             log_w_list.append(-slopes_a * pos[None, :, None, None])
             
-        log_time_weight = jnp.concatenate(log_w_list, axis=2)
+        log_time_weight = jnp.concatenate(log_w_list, axis=2).astype(jnp.float32)
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
-        p_w = jnp.exp(log_p + log_time_weight)
+        p_w = jnp.exp(log_p + log_time_weight).astype(self.compute_dtype)
 
         # Modulation Mémoire (Indispensable pour encoder la position/temps)
-        phi_k = (k_val[..., None] * theta)
-        re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
+        phi_k = (k_val[..., None].astype(self.compute_dtype) * theta)
+        re_k = jnp.cos(phi_k).astype(self.compute_dtype)
+        im_k = jnp.sin(phi_k).astype(self.compute_dtype)
 
         # Scan
         flat_dim = self.K * H * self.M
@@ -450,8 +452,10 @@ class SeqCondAttention(nn.Module):
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
         scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        y_re = jnp.dot(out_re * scale[:split_dim], W_re)
-        y_im = jnp.dot(out_im * scale[split_dim:], W_im)
+        # y_re = jnp.dot(out_re * scale[:split_dim], W_re)
+        # y_im = jnp.dot(out_im * scale[split_dim:], W_im)
+        y_re = jnp.einsum("blkh,hh->blkh", out_re * scale[:split_dim], W_re)
+        y_im = jnp.einsum("blkh,hh->blkh", out_im * scale[split_dim:], W_im)
 
         y = jax.nn.silu((y_re + y_im).reshape(b, l, d_inner))
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y)
