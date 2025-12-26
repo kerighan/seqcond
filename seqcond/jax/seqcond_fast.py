@@ -404,23 +404,35 @@ class SeqCondAttention(nn.Module):
         state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
         state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
-        # =================================================================
-        # 4. RÉSONANCE & INTÉGRATION (CONVOLUTION)
+# =================================================================
+        # 4. RÉSONANCE & INTÉGRATION (OPTIMISÉE MEMOIRE)
         # =================================================================
         
-        # Répétition GQA (K' -> K)
-        if self.n_rep > 1:
-            q_re = jnp.repeat(q_re, self.n_rep, axis=2)
-            q_im = jnp.repeat(q_im, self.n_rep, axis=2)
+        # Astuce : On reshape pour isoler les groupes GQA
+        # State : (B, L, K, H, M) -> (B, L, K_q, N_rep, H, M)
+        # Cela ne coûte RIEN (c'est juste des métadonnées)
+        state_re = state_re.reshape(b, l, self.K_q, self.n_rep, H, self.M)
+        state_im = state_im.reshape(b, l, self.K_q, self.n_rep, H, self.M)
 
-        # Produit Hermitien : <State, Filter>
-        # (State_re + i State_im) * (Q_re - i Q_im)
-        match_re = state_re * q_re + state_im * q_im
-        match_im = state_im * q_re - state_re * q_im
+        # Query : (B, L, K_q, H, M) -> (B, L, K_q, 1, H, M)
+        # On ajoute une dimension 1 pour le broadcast. 
+        # ON NE FAIT PAS DE REPEAT EXPLICITE !
+        q_re = q_re.reshape(b, l, self.K_q, 1, H, self.M)
+        q_im = q_im.reshape(b, l, self.K_q, 1, H, self.M)
+
+        # PRODUIT HERMITIEN + INTÉGRATION FUSIONNÉE
+        # XLA va voir : "Je dois multiplier un tenseur (..., N_rep, ...) par un (..., 1, ...)"
+        # Il va broadcaster à la volée dans les registres et sommer immédiatement sur M.
+        # Aucune écriture intermédiaire en VRAM du tenseur (B, L, K, H, M).
         
-        # Somme sur l'axe Spectral M (Intégrale)
-        out_re = jnp.sum(match_re, axis=-1) # (B, L, K, H)
-        out_im = jnp.sum(match_im, axis=-1)
+        # (State_re * Q_re + State_im * Q_im) -> Somme sur M (axis=-1)
+        # Note : Le broadcast (1 vs N_rep) se fait automatiquement ici
+        out_re = jnp.sum(state_re * q_re + state_im * q_im, axis=-1) 
+        out_im = jnp.sum(state_im * q_re - state_re * q_im, axis=-1)
+        
+        # Résultat : out_re est (B, L, K_q, N_rep, H). On remet à plat vers (K, H)
+        out_re = out_re.reshape(b, l, self.K, H)
+        out_im = out_im.reshape(b, l, self.K, H)
 
         # =================================================================
         # 5. SORTIE
