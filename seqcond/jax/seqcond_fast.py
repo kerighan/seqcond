@@ -367,7 +367,6 @@ class SeqCondAttention(nn.Module):
                 grid = np.linspace(-np.pi/3, np.pi/3, self.M)
                 base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
                 return jnp.array(base, dtype=jnp.float32)
-
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
         theta = theta.astype(self.compute_dtype)
 
