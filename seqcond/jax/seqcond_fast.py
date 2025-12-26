@@ -395,18 +395,18 @@ class SeqCondAttention(nn.Module):
         flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
-        num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
-        num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
+        # num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
+        # num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         
         # merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
         # cumsum = jnp.cumsum(merged, axis=1)
         # den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         den = jnp.cumsum(den_in, axis=1)  # (B,L,K)
         # (B,L,K,H,M) directement, pas besoin de flatten
-        # num_re = jnp.cumsum(p_w[..., None] * re_k, axis=1)  # (B,L,K,H,M)
-        # num_im = jnp.cumsum(p_w[..., None] * im_k, axis=1)
-        num_re = jax.lax.associative_scan(jnp.add, p_w_broad * re_k, axis=1)
-        num_im = jax.lax.associative_scan(jnp.add, p_w_broad * im_k, axis=1)
+        num_re = jnp.cumsum(p_w_broad * re_k, axis=1)  # (B,L,K,H,M)
+        num_im = jnp.cumsum(p_w_broad * im_k, axis=1)
+        # num_re = jax.lax.associative_scan(jnp.add, p_w_broad * re_k, axis=1)
+        # num_im = jax.lax.associative_scan(jnp.add, p_w_broad * im_k, axis=1)
 
         # inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         # state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
