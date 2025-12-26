@@ -11,6 +11,7 @@ from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 from .seqcond_fast import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
 from .weight_tied_dense import WeightTiedDense
+from .bivector import TransformerDecoderBlock as BivectorBlock
 
 
 class TransformerModel(nn.Module):
@@ -51,6 +52,82 @@ class TransformerModel(nn.Module):
                 qk_norm=self.qk_norm,
                 qk_norm_eps=self.qk_norm_eps,
                 name=f"transformer_block_{i}",
+            )
+            for i in range(self.num_layers)
+        ]
+        if self.tie_weights:
+            self.output_projection = WeightTiedDense(
+                vocab_size=self.vocab_size,
+                use_bias=False,
+                name="output_projection",
+            )
+        else:
+            self.output_projection = nn.Dense(
+                self.vocab_size,
+                use_bias=False,
+                name="output_projection",
+            )
+
+    def __call__(
+        self,
+        inputs: jnp.ndarray,
+        deterministic: bool = True,
+    ) -> jnp.ndarray:
+        b, l = inputs.shape
+        mask = inputs != 0
+
+        x = self.embedding(inputs)
+        cos, sin = get_rope_embeddings(l, self.cos_emb, self.sin_emb, b, self.num_heads)
+
+        for block in self.blocks:
+            x = block(x, cos=cos, sin=sin, mask=mask, deterministic=deterministic)
+
+        if self.tie_weights:
+            logits = self.output_projection(x, self.embedding.embedding)
+        else:
+            logits = self.output_projection(x)
+
+        return logits
+
+
+class BivectorModel(nn.Module):
+    d_model: int = 256
+    d_ff: int = 768
+    num_layers: int = 12
+    num_heads: int = 8
+    num_kv_heads: Optional[int] = None
+    vocab_size: int = 100300
+    maxlen: int = 1024
+    dropout: float = 0.0
+    tie_weights: bool = True
+    qk_norm: bool = False
+    qk_norm_eps: float = 1e-6
+    remat: bool = True
+
+    def setup(self):
+        self.embedding = nn.Embed(
+            num_embeddings=self.vocab_size,
+            features=self.d_model,
+            name="token_embedding",
+        )
+        self.cos_emb, self.sin_emb = precompute_freqs(
+            self.maxlen, self.d_model // self.num_heads
+        )
+        
+        Block = BivectorBlock
+        if self.remat:
+            Block = nn.remat(Block)
+
+        self.blocks = [
+            Block(
+                d_model=self.d_model,
+                num_heads=self.num_heads,
+                d_ff=self.d_ff,
+                num_kv_heads=self.num_kv_heads,
+                dropout=self.dropout,
+                qk_norm=self.qk_norm,
+                qk_norm_eps=self.qk_norm_eps,
+                name=f"bivector_block_{i}",
             )
             for i in range(self.num_layers)
         ]
@@ -365,6 +442,37 @@ def create_transformer_model(
 ) -> TransformerModel:
     """Create a Transformer model."""
     return TransformerModel(
+        d_model=d_model,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        vocab_size=vocab_size,
+        maxlen=maxlen,
+        dropout=dropout,
+        tie_weights=tie_weights,
+        qk_norm=qk_norm,
+        qk_norm_eps=qk_norm_eps,
+        remat=remat,
+    )
+
+
+def create_bivector_model(
+    d_model: int = 256,
+    d_ff: int = 768,
+    num_layers: int = 12,
+    num_heads: int = 8,
+    num_kv_heads: Optional[int] = None,
+    vocab_size: int = 100300,
+    maxlen: int = 1024,
+    dropout: float = 0.0,
+    tie_weights: bool = True,
+    qk_norm: bool = False,
+    qk_norm_eps: float = 1e-6,
+    remat: bool = True,
+) -> BivectorModel:
+    """Create a Bivector model."""
+    return BivectorModel(
         d_model=d_model,
         d_ff=d_ff,
         num_layers=num_layers,

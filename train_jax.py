@@ -31,7 +31,7 @@ def parse_args():
 
     # Model Configuration Overrides
     grp_model = parser.add_argument_group("Model Overrides")
-    grp_model.add_argument("--model-type", choices=["seqcond", "transformer"], default=None, help="Override model architecture type")
+    grp_model.add_argument("--model-type", choices=["seqcond", "transformer", "bivector"], default=None, help="Override model architecture type")
     grp_model.add_argument("--num-layers", type=int, default=None, help="Override number of layers")
     grp_model.add_argument("--d-model", type=int, default=None, help="Override model dimension")
     grp_model.add_argument("--d-ff", type=int, default=None, help="Override feed-forward dimension")

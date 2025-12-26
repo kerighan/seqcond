@@ -281,24 +281,34 @@ import flax.linen as nn
 import numpy as np
 from typing import Optional
 
-class SeqCondAttention(nn.Module):
-    num_heads: int = 32
-    key_heads: Optional[int] = None   # Si None, utilise num_heads
-    num_anchor_heads: int = 4         # Têtes à décroissance lente (Mémoire long terme)
-    num_thetas: int = 1               # Dimension M (Spectral)
-    derivative_order: int = 2         # Ordre de Taylor pour la modulation
-    conv_kernel_size: int = 4         # Taille du kernel de convolution locale
-    expand_factor: int = 1            # <--- CRITIQUE : 2 = 140k tokens/s. Mets 1 pour max speed.
-    dropout: float = 0.0
-    maxlen: Optional[int] = None      # Pour le calcul des positions relatives si besoin
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import numpy as np
+from typing import Optional
 
-    # Précision
+class SeqCondAttention(nn.Module):
+    # Dimensions
+    num_heads: int = 32          # K (Mémoire)
+    num_query_heads: int = 4     # K' (Recherche - GQA)
+    num_anchor_heads: int = 4    # Long terme
+    num_thetas: int = 8          # M (Résolution Spectrale)
+    
+    # Paramètres
+    conv_kernel_size: int = 4
+    expand_factor: int = 1       # Speed Mode
+    dropout: float = 0.0
+    maxlen: Optional[int] = None
+    
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        # Configuration des dimensions
-        self.K = self.key_heads if self.key_heads is not None else self.num_heads
+        assert self.num_heads % self.num_query_heads == 0
+        self.n_rep = self.num_heads // self.num_query_heads
+        
+        self.K = self.num_heads
+        self.K_q = self.num_query_heads
         self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
 
@@ -308,31 +318,43 @@ class SeqCondAttention(nn.Module):
         d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K)
 
-        # --- 1. PROJECTION & LOCAL MIXING ---
-        z = nn.Dense(d_inner * 2 + self.K, use_bias=False, name="in_proj")(x)
-        z = z.astype(self.compute_dtype)
+        # =================================================================
+        # 1. ENCODAGE MÉMOIRE (SIGNAL)
+        # =================================================================
+        z_mem = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj_mem")(x)
+        z_mem = z_mem.astype(self.compute_dtype)
         
-        z = nn.Conv(
-            features=z.shape[-1], 
+        z_mem = nn.Conv(
+            features=z_mem.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
             padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=z.shape[-1], 
-            use_bias=False,
-            name="conv"
-        )(z)
+            feature_group_count=z_mem.shape[-1], 
+            use_bias=False, name="conv_mem"
+        )(z_mem)
 
-        x_val = z[..., :d_inner].reshape(b, l, self.K, H)
-        x_gate = jax.nn.silu(z[..., d_inner : 2 * d_inner])
-        s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
+        k_val = z_mem[..., :d_inner].reshape(b, l, self.K, H)
+        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
-            x_val *= m
+            k_val *= m
 
-        # --- 2. GENERATION DES PARAMETRES (THE GOLDEN PATH) ---
-        # Retour à la version stable et rapide sans clip
+        # =================================================================
+        # 2. GÉNÉRATION DU FILTRE (QUERY)
+        # =================================================================
+        # GQA Spectrale directe : Le Dense sort directement les coeffs complexes du filtre
+        # (B, L, D) -> (B, L, K', H, M, 2)
+        q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
+        q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
         
+        # Pas de modulation ici ! Le réseau apprend le vecteur complexe directement.
+        q_re, q_im = q_raw[..., 0], q_raw[..., 1]
+
+        # =================================================================
+        # 3. ÉTAT & SCAN (ECF)
+        # =================================================================
+        # Base Spectrale (Pour la mémoire uniquement)
         def init_theta(key, shape):
             if self.M == 1:
                 grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
@@ -344,74 +366,75 @@ class SeqCondAttention(nn.Module):
                 return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
-        
+
+        # Decay Log-Space
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
-        
         if self.num_decay_heads > 0:
             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
             log_w_list.append(-slopes * dist[None, :, None, None])
-
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
             log_w_list.append(-slopes_a * pos[None, :, None, None])
-
+            
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
-        
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        log_p_raw = score_scale[None, None, :, None] * s_raw
-        
-        # Clip vital ici
-        log_p = jnp.clip(log_p_raw, -20., 20.)        
+        log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
-        # --- 3. SPECTRAL MODULATION ---
-        phi = (x_val[..., None] * theta)
-        cos_b, sin_b = jnp.cos(phi), jnp.sin(phi)
-        re_m, im_m = cos_b, sin_b
+        # Modulation Mémoire (Indispensable pour encoder la position/temps)
+        phi_k = (k_val[..., None] * theta)
+        re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
 
-        # --- 4. SINGLE FUSED SCAN (OPTIMIZED) ---
+        # Scan
         flat_dim = self.K * H * self.M
-        
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
-        num_re_in = (p_w_broad * re_m).reshape(b, l, flat_dim)
-        num_im_in = (p_w_broad * im_m).reshape(b, l, flat_dim)
+        num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
+        num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
         cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
-
-        # --- 5. OUTPUT PROJ (NO NORM MODE) ---
         
-        # Division par le dénominateur (Essentiel mathématiquement)
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
-        
-        # On récupère les états bruts normalisés par le poids temporel uniquement
-        re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
-        im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
+        state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
+        state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
-        # --- SUPPRESSION TOTALE DU RMSNORM ---
-        # On passe directement à la projection linéaire
+        # =================================================================
+        # 4. RÉSONANCE & INTÉGRATION (CONVOLUTION)
+        # =================================================================
         
-        split_dim = H * self.M
+        # Répétition GQA (K' -> K)
+        if self.n_rep > 1:
+            q_re = jnp.repeat(q_re, self.n_rep, axis=2)
+            q_im = jnp.repeat(q_im, self.n_rep, axis=2)
+
+        # Produit Hermitien : <State, Filter>
+        # (State_re + i State_im) * (Q_re - i Q_im)
+        match_re = state_re * q_re + state_im * q_im
+        match_im = state_im * q_re - state_re * q_im
+        
+        # Somme sur l'axe Spectral M (Intégrale)
+        out_re = jnp.sum(match_re, axis=-1) # (B, L, K, H)
+        out_im = jnp.sum(match_im, axis=-1)
+
+        # =================================================================
+        # 5. SORTIE
+        # =================================================================
+        split_dim = H
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (split_dim, H))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (split_dim, H))
-        
-        # J'ai gardé le scale factor, c'est un paramètre linéaire "gratuit" (LayerScale)
-        # Ça aide souvent la convergence quand on n'a pas de Norm
         scale = self.param("norm_scale", nn.initializers.ones, (2 * split_dim,))
 
-        # Application directe
-        y_re = jnp.dot(re * scale[:split_dim], W_re)
-        y_im = jnp.dot(im * scale[split_dim:], W_im)
+        y_re = jnp.dot(out_re * scale[:split_dim], W_re)
+        y_im = jnp.dot(out_im * scale[split_dim:], W_im)
 
-        y = (y_re + y_im).reshape(b, l, d_inner)
-        y = jax.nn.silu(y)
-        out = nn.Dense(d_model, use_bias=False, name="out_proj")(y * x_gate)
+        y = jax.nn.silu((y_re + y_im).reshape(b, l, d_inner))
+        out = nn.Dense(d_model, use_bias=False, name="out_proj")(y)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)

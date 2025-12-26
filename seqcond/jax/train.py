@@ -21,6 +21,7 @@ from .model import (
     create_seqcond_model,
     create_seqcond_model_v2,
     create_transformer_model,
+    create_bivector_model,
     create_optimizer,
     warmup_cosine_decay_schedule,
     init_model,
@@ -82,6 +83,21 @@ def create_model_from_config(config: ModelConfig):
     """Create a model from a ModelConfig."""
     if config.model_type == "transformer":
         return create_transformer_model(
+            d_model=config.d_model,
+            d_ff=config.d_ff,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            vocab_size=config.vocab_size,
+            maxlen=config.maxlen,
+            dropout=config.dropout,
+            tie_weights=config.tie_weights,
+            qk_norm=config.qk_norm,
+            qk_norm_eps=config.qk_norm_eps,
+            remat=config.remat,
+        )
+    elif config.model_type == "bivector":
+        return create_bivector_model(
             d_model=config.d_model,
             d_ff=config.d_ff,
             num_layers=config.num_layers,

@@ -12,7 +12,7 @@ class ModelConfig:
     """Configuration for model architecture."""
 
     # Model type
-    model_type: Literal["transformer", "seqcond"] = "seqcond"
+    model_type: Literal["transformer", "seqcond", "bivector"] = "seqcond"
 
     # Core architecture
     d_model: int = 768
@@ -48,6 +48,8 @@ class ModelConfig:
     def name(self) -> str:
         """Generate a descriptive name for the model."""
         if self.model_type == "transformer":
+            base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}-h{self.num_heads}"
+        elif self.model_type == "bivector":
             base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}-h{self.num_heads}"
         elif self.model_type == "seqcond":
             base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
