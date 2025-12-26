@@ -318,12 +318,23 @@ class SeqCondAttention(nn.Module):
         d_inner = int(d_model * self.expand_factor)
         H = max(1, d_inner // self.K)
 
+        # Dims
+        dim_k = d_inner
+        dim_decay = self.K
+        dim_q = self.K_q * H * self.M * 2
+        
+        total_dim = dim_k + dim_decay + dim_q
+
         # =================================================================
         # 1. ENCODAGE MÉMOIRE (SIGNAL)
         # =================================================================
-        z_mem = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj_mem")(x)
-        z_mem = z_mem.astype(self.compute_dtype)
-        
+        z = nn.Dense(total_dim, use_bias=False, name="in_proj_mem")(x)
+        z = z.astype(self.compute_dtype)
+        # On ne veut conv que sur la mémoire (K_val) et le decay, pas sur Q (qui est "futur")
+        # Split rapide
+        z_mem = z[..., :dim_k + dim_decay]
+        q_raw = z[..., dim_k + dim_decay:]
+
         z_mem = nn.Conv(
             features=z_mem.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
@@ -334,22 +345,14 @@ class SeqCondAttention(nn.Module):
 
         k_val = z_mem[..., :d_inner].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
+        # Query Reshape (Directement en complexe, pas de modulation inutile)
+        q_raw = q_raw.reshape(b, l, self.K_q, H_state, self.M, 2)
+        q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
             k_val *= m
-
-        # =================================================================
-        # 2. GÉNÉRATION DU FILTRE (QUERY)
-        # =================================================================
-        # GQA Spectrale directe : Le Dense sort directement les coeffs complexes du filtre
-        # (B, L, D) -> (B, L, K', H, M, 2)
-        q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
-        q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2).astype(self.compute_dtype)
-        
-        # Pas de modulation ici ! Le réseau apprend le vecteur complexe directement.
-        q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
         # =================================================================
         # 3. ÉTAT & SCAN (ECF)
@@ -392,10 +395,10 @@ class SeqCondAttention(nn.Module):
         im_k = jnp.sin(phi_k).astype(self.compute_dtype)
 
         # Scan
-        flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
         
+        # flat_dim = self.K * H * self.M
         # num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
         # num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         # merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
