@@ -404,7 +404,7 @@ class SeqCondAttention(nn.Module):
         state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
         state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
-# =================================================================
+        # =================================================================
         # 4. RÉSONANCE & INTÉGRATION (OPTIMISÉE MEMOIRE)
         # =================================================================
         
@@ -424,7 +424,7 @@ class SeqCondAttention(nn.Module):
         # XLA va voir : "Je dois multiplier un tenseur (..., N_rep, ...) par un (..., 1, ...)"
         # Il va broadcaster à la volée dans les registres et sommer immédiatement sur M.
         # Aucune écriture intermédiaire en VRAM du tenseur (B, L, K, H, M).
-        
+
         # (State_re * Q_re + State_im * Q_im) -> Somme sur M (axis=-1)
         # Note : Le broadcast (1 vs N_rep) se fait automatiquement ici
         out_re = jnp.sum(state_re * q_re + state_im * q_im, axis=-1) 
