@@ -346,7 +346,7 @@ class SeqCondAttention(nn.Module):
         k_val = z_mem[..., :d_inner].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
         # Query Reshape (Directement en complexe, pas de modulation inutile)
-        q_raw = q_raw.reshape(b, l, self.K_q, H_state, self.M, 2)
+        q_raw = q_raw.reshape(b, l, self.K_q, self.H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
         if mask is not None:
