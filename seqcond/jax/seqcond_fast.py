@@ -395,9 +395,9 @@ class SeqCondAttention(nn.Module):
         flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
+        
         # num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
         # num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
-        
         # merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
         # cumsum = jnp.cumsum(merged, axis=1)
         # den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
