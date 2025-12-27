@@ -314,7 +314,7 @@ class SeqCondAttention(nn.Module):
     def __call__(self, x, mask=None, deterministic=True):
         b, l, d_model = x.shape
         d_inner = int(d_model * self.expand_factor)
-        H = max(1, d_inner // self.K)
+        H = max(1, d_inner // (self.K * self.M))
 
         # =================================================================
         # 1. ENCODAGE MÉMOIRE (SIGNAL)
