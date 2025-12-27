@@ -298,7 +298,7 @@ class SeqCondAttention(nn.Module):
     
     # --- CONFIGURATION HYBRIDE ---
     expand_factor: int = 1       # INPUT: 1 (Scan Rapide & Léger)
-    out_expand_factor: int = 2   # OUTPUT: 2 (Gros Cerveau SwiGLU)
+    out_expand_factor: int = 3   # OUTPUT: 2 (Gros Cerveau SwiGLU)
     # -----------------------------
 
     dropout: float = 0.0
