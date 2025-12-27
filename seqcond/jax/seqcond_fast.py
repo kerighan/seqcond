@@ -290,16 +290,13 @@ from typing import Optional
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
     num_heads: int = 32          # K
-    num_anchor_heads: int = 4    # Mémoire Long terme
-    num_thetas: int = 8          # M (Résolution Spectrale)
+    num_anchor_heads: int = 4
+    num_thetas: int = 8          # M
     
     # Paramètres Locaux
     conv_kernel_size: int = 4
-    
-    # --- CONFIGURATION HYBRIDE ---
-    expand_factor: int = 1       # INPUT: 1 (Scan Rapide & Léger)
-    out_expand_factor: int = 3   # OUTPUT: 2 (Gros Cerveau SwiGLU)
-    # -----------------------------
+    expand_factor: int = 1       # Input Slim (Scan)
+    out_expand_factor: int = 2   # Output Fat (SwiGLU)
 
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -319,15 +316,12 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // self.K)
 
         # =================================================================
-        # 1. ENCODAGE MÉMOIRE (Slim & Fast)
+        # 1. ENCODAGE MÉMOIRE (Slim & Shared)
         # =================================================================
-        # On projette vers Key/Value (d_inner) + Decay (K)
-        # Pas de Query séparé, pas de Gate complexe ici.
-        
+        # Ici on garde le partage pour l'extraction de features bas niveau
         z = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj")(x)
         z = z.astype(self.compute_dtype)
         
-        # Mélange Local (Conv1D)
         z = nn.Conv(
             features=z.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
@@ -336,7 +330,6 @@ class SeqCondAttention(nn.Module):
             use_bias=False, name="conv"
         )(z)
 
-        # Séparation
         k_val = z[..., :d_inner].reshape(b, l, self.K, H)
         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
 
@@ -346,23 +339,16 @@ class SeqCondAttention(nn.Module):
             k_val *= m
 
         # =================================================================
-        # 2. PARAMÈTRES SPECTRAUX (ECF Core)
+        # 2. SCAN SPECTRAL (ECF Core)
         # =================================================================
-        
-        # A. Theta Géométrique (Zipf law friendly)
         def init_theta(key, shape):
-            if self.M == 1:
-                grid = np.linspace(0.1, 1.5, self.K * H).reshape(1, 1, self.K, H, 1)
-                signs = np.resize([1., -1.], grid.shape)
-                return jnp.array(grid * signs, dtype=jnp.float32)
-            else:
-                grid = np.linspace(-np.pi/3, np.pi/3, self.M)
-                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-                return jnp.array(base, dtype=jnp.float32)
+            grid = np.linspace(-np.pi/3, np.pi/3, self.M)
+            base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+            return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
 
-        # B. Decay (Log-Space Stability)
+        # Decay Log-Space
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
@@ -370,30 +356,23 @@ class SeqCondAttention(nn.Module):
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
             log_w_list.append(-slopes * dist[None, :, None, None])
-            
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
             log_w_list.append(-slopes_a * pos[None, :, None, None])
             
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
-        
-        # C. Score / Poids
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
-        # D. Modulation (Signal)
         phi_k = (k_val[..., None] * theta)
         re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
 
-        # =================================================================
-        # 3. SCAN OPTIMISÉ (L'Intégrale Temporelle)
-        # =================================================================
+        # Scan
         flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
-        
         num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
         num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         
@@ -401,58 +380,54 @@ class SeqCondAttention(nn.Module):
         cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
-        # Normalisation par la masse (Moyenne pondérée)
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         
-        # ÉTAT SPECTRAL (ECF) - C'est le résumé de l'histoire
-        state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
-        state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
+        # On garde K séparé ici : (B, L, K, H * M)
+        # C'est l'input pour le per-head SwiGLU
+        state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den[..., None])
+        state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den[..., None])
 
         # =================================================================
-        # 4. READOUT EXPANSÉ (Le "SwiGLU Fat")
+        # 4. READOUT INDÉPENDANT PAR TÊTE (EINSUM SWIGLU)
         # =================================================================
-        # C'est ici qu'on change tout.
-        # Au lieu de projeter H -> H, on projette H*M -> H * out_expand
-        
-        # 1. Projection Linéaire de l'ECF (Inversion Fourier Neuronale)
-        # On passe de l'espace fréquentiel (H*M) à l'espace de features élargi (dim_expand)
+        # C'est ici le changement majeur.
+        # Au lieu de projeter tout le monde avec la même matrice, on a K matrices.
         
         dim_expand = H * self.out_expand_factor
-        
-        # Le facteur 2 est pour le SwiGLU (Gate + Value)
         dim_swiglu = dim_expand * 2
+        input_dim = H * self.M # Dimension spectrale par tête
         
-        # Projection Complexe -> Réel Large
-        # Input : H * M (Toutes les fréquences)
-        input_dim = H * self.M
+        # Poids : (K, Input_Dim, Output_Dim)
+        # Chaque tête a ses propres poids de décodage.
+        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
+        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
         
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (input_dim, dim_swiglu))
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (input_dim, dim_swiglu))
+        # Scale par tête
+        scale = self.param("norm_scale", nn.initializers.ones, (self.K, 1, 2 * input_dim))
         
-        # LayerScale pour stabiliser l'entrée du MLP
-        scale = self.param("norm_scale", nn.initializers.ones, (2 * input_dim,))
+        # On applique le scale sur l'axe des features (last dim)
+        state_re_scaled = state_re * scale[..., :input_dim]
+        state_im_scaled = state_im * scale[..., input_dim:]
 
-        # Projection massive
-        # On laisse le réseau choisir comment combiner les fréquences M
-        # state_re : (..., H*M)
-        y_re = jnp.dot(state_re * scale[:input_dim], W_re)
-        y_im = jnp.dot(state_im * scale[input_dim:], W_im)
+        # EINSUM MAGIQUE
+        # b: batch, l: length, k: heads, m: input_dim, n: output_dim
+        # blkm (State) * kmn (Weights) -> blkn (Output)
+        # Le 'k' est préservé et apparait dans les deux termes -> Multiplication indépendante
         
-        # Somme (Réel + Imaginaire)
-        y_raw = y_re + y_im  # Shape: (B, L, K, dim_swiglu)
+        y_re = jnp.einsum('blkm,kmn->blkn', state_re_scaled, W_re)
+        y_im = jnp.einsum('blkm,kmn->blkn', state_im_scaled, W_im)
+        
+        y_raw = y_re + y_im # (B, L, K, dim_swiglu)
 
-        # 2. Mécanisme SwiGLU (Gated Linear Unit)
-        # C'est ça qui donne la "profondeur" logique et remplace la convolution complexe
+        # SwiGLU
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
+        y_activated = y_val * jax.nn.silu(y_gate) # (B, L, K, dim_expand)
         
-        # Activation SiLU sur la gate * Value
-        y_activated = y_val * jax.nn.silu(y_gate)
-        
-        # Résultat : (B, L, K, dim_expand)
-        # On remet à plat pour la projection finale
-        y_flat = y_activated.reshape(b, l, -1) # (B, L, d_inner * out_expand)
+        # Flatten pour le mélange final
+        y_flat = y_activated.reshape(b, l, -1) # (B, L, K * dim_expand)
 
-        # 3. Projection Finale (Down-projection)
+        # Projection Finale (Mélange global des têtes)
+        # C'est la seule fois où les têtes communiquent entre elles
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y_flat)
 
         if self.dropout > 0:
