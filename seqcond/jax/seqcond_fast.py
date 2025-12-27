@@ -447,8 +447,8 @@ class SeqCondAttention(nn.Module):
         
         # 5. On remet à plat vers K pour le reste du réseau
         # (B, L, K', n_rep, H) -> (B, L, K, H)
-        out_re = out_re_g.reshape(b, l, self.K, self.H)
-        out_im = out_im_g.reshape(b, l, self.K, self.H)
+        out_re = out_re_g.reshape(b, l, self.K, H)
+        out_im = out_im_g.reshape(b, l, self.K, H)
 
         # =================================================================
         # 5. READOUT + SKIP CONNECTION (HIGHWAY)
