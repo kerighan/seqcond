@@ -354,11 +354,7 @@ class SeqCondAttention(nn.Module):
         # q_mag = jnp.sqrt(jnp.square(q_re) + jnp.square(q_im) + 1e-6)
         # q_re = q_re * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
         # q_im = q_im * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
-
         # =================================================================
-        # 3. ÉTAT & SCAN (ECF)
-        # =================================================================
-# =================================================================
         # 2. PARAMÈTRES SPECTRAUX (CORRIGÉS)
         # =================================================================
         
@@ -406,6 +402,10 @@ class SeqCondAttention(nn.Module):
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
+        # =================================================================
+        # 3. ÉTAT & SCAN (ECF)
+        # =================================================================
+        
         # Modulation Mémoire
         phi_k = (k_val[..., None] * theta)
         re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
