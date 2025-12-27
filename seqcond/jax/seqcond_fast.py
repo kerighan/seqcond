@@ -358,10 +358,33 @@ class SeqCondAttention(nn.Module):
         # =================================================================
         # 3. ÉTAT & SCAN (ECF)
         # =================================================================
+# =================================================================
+        # 2. PARAMÈTRES SPECTRAUX (CORRIGÉS)
+        # =================================================================
+        
+        # A. Theta Géométrique & Unilatéral (No Zero, No Negative)
         def init_theta(key, shape):
-            grid = np.linspace(-np.pi/3, np.pi/3, self.M)
-            base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-            return jnp.array(base, dtype=jnp.float32)
+            # On veut couvrir des longueurs d'onde lambda de 2 tokens à MaxLen (ex: 1000)
+            # theta = 2 * pi / lambda
+            # lambda_min = 2      -> theta_max = pi
+            # lambda_max = 10000  -> theta_min = 2 * pi / 10000
+            
+            # Pour éviter les hautes fréquences trop bruitées (aliasing), on s'arrête un peu avant pi.
+            # Disons max_theta = 3.0
+            # Min theta = 0.001 (Mémoire long terme)
+            
+            if self.M == 1:
+                # Si M=1, on garde une valeur moyenne raisonnable
+                return jnp.full((1, 1, self.K, H, 1), 0.1, dtype=jnp.float32)
+            else:
+                # Distribution Logarithmique (Geomspace)
+                # On évite 0 et on reste positif.
+                # Shape cible : (M,)
+                grid = np.geomspace(0.001, 3.0, self.M)
+                
+                # On broadcast sur (1, 1, K, H, M)
+                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+                return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
 
