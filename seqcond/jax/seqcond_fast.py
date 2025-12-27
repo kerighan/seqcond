@@ -285,7 +285,7 @@ from typing import Optional
 class SeqCondAttention(nn.Module):
     # Dimensions
     num_heads: int = 32          # K (Mémoire)
-    num_query_heads: int = 4     # K' (Recherche - GQA)
+    num_query_heads: int = 6     # K' (Recherche - GQA)
     num_anchor_heads: int = 4
     num_thetas: int = 8          # M (Résolution Spectrale)
     
