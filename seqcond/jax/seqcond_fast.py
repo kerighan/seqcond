@@ -425,8 +425,8 @@ class SeqCondAttention(nn.Module):
         
         # 1. On reshape l'État (Mémoire) pour exposer les groupes GQA
         # State: (B, L, K, H, M) -> (B, L, K', n_rep, H, M)
-        state_re_g = state_re.reshape(b, l, self.K_q, self.n_rep, self.H, self.M)
-        state_im_g = state_im.reshape(b, l, self.K_q, self.n_rep, self.H, self.M)
+        state_re_g = state_re.reshape(b, l, self.K_q, self.n_rep, H, self.M)
+        state_im_g = state_im.reshape(b, l, self.K_q, self.n_rep, H, self.M)
         
         # 2. On prépare le Query (Filtre) pour le broadcast
         # Query: (B, L, K', H, M) -> (B, L, K', 1, H, M)
