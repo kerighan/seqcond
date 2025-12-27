@@ -277,27 +277,23 @@ from .norm import RMSNorm
 
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
-import numpy as np
-from typing import Optional
-
-import jax
-import jax.numpy as jnp
 from flax import linen as nn
 import numpy as np
 from typing import Optional
 
-class SeqCondAttention(nn.Module):
-    # Dimensions Architecture
-    num_heads: int = 32          # K
-    num_anchor_heads: int = 4
-    num_thetas: int = 8          # M
-    
-    # Paramètres Locaux
-    conv_kernel_size: int = 4
-    expand_factor: int = 1       # Input Slim (Scan)
-    out_expand_factor: int = 2   # Output Fat (SwiGLU)
 
+class SeqCondAttention(nn.Module):
+    # Dimensions
+    num_heads: int = 32          # K (Mémoire)
+    num_query_heads: int = 4     # K' (Recherche - GQA)
+    num_anchor_heads: int = 4
+    num_thetas: int = 8          # M (Résolution Spectrale)
+    
+    # Paramètres
+    conv_kernel_size: int = 4
+    expand_factor: int = 1       # Input Slim (Scan Rapide)
+    out_expand_factor: int = 2   # Output Fat (Cerveau SwiGLU)
+    
     dropout: float = 0.0
     maxlen: Optional[int] = None
     
@@ -305,7 +301,12 @@ class SeqCondAttention(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self):
+        # Vérification GQA
+        assert self.num_heads % self.num_query_heads == 0
+        self.n_rep = self.num_heads // self.num_query_heads
+        
         self.K = self.num_heads
+        self.K_q = self.num_query_heads
         self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
 
@@ -316,22 +317,23 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // self.K)
 
         # =================================================================
-        # 1. ENCODAGE MÉMOIRE (Slim & Shared)
+        # 1. ENCODAGE MÉMOIRE (SIGNAL)
         # =================================================================
-        # Ici on garde le partage pour l'extraction de features bas niveau
-        z = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj")(x)
-        z = z.astype(self.compute_dtype)
+        # Projection vers Key/Value (d_inner) + Decay (K)
+        z_mem = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj_mem")(x)
+        z_mem = z_mem.astype(self.compute_dtype)
         
-        z = nn.Conv(
-            features=z.shape[-1], 
+        # Conv Locale
+        z_mem = nn.Conv(
+            features=z_mem.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
             padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=z.shape[-1], 
-            use_bias=False, name="conv"
-        )(z)
+            feature_group_count=z_mem.shape[-1], 
+            use_bias=False, name="conv_mem"
+        )(z_mem)
 
-        k_val = z[..., :d_inner].reshape(b, l, self.K, H)
-        s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
+        k_val = z_mem[..., :d_inner].reshape(b, l, self.K, H)
+        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
@@ -339,7 +341,22 @@ class SeqCondAttention(nn.Module):
             k_val *= m
 
         # =================================================================
-        # 2. SCAN SPECTRAL (ECF Core)
+        # 2. GÉNÉRATION DU FILTRE (QUERY)
+        # =================================================================
+        # Le réseau apprend directement les coefficients complexes du filtre
+        # (B, L, D) -> (B, L, K', H, M, 2)
+        q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
+        q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
+        
+        q_re, q_im = q_raw[..., 0], q_raw[..., 1]
+        
+        # Stabilisation optionnelle du filtre (RMSNorm sur le filtre)
+        # q_mag = jnp.sqrt(jnp.square(q_re) + jnp.square(q_im) + 1e-6)
+        # q_re = q_re * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
+        # q_im = q_im * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
+
+        # =================================================================
+        # 3. ÉTAT & SCAN (ECF)
         # =================================================================
         def init_theta(key, shape):
             grid = np.linspace(-np.pi/3, np.pi/3, self.M)
@@ -366,6 +383,7 @@ class SeqCondAttention(nn.Module):
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
+        # Modulation Mémoire
         phi_k = (k_val[..., None] * theta)
         re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
 
@@ -380,58 +398,223 @@ class SeqCondAttention(nn.Module):
         cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
-        # CORRECTION 1 : inv_den est déjà (B, L, K, 1)
+        # Normalisation
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         
-        # On multiplie directement. Pas de [..., None] supplémentaire !
-        # (B, L, K, H*M) * (B, L, K, 1) -> (B, L, K, H*M)
-        state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
-        state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
+        # State: (B, L, K, H, M)
+        # Attention: inv_den est (B, L, K, 1). Le broadcast se fait sur (H, M) qui sont flatten dans num_re
+        # Il faut juste reshape num_re avant la multiplication ou laisser le broadcast opérer
+        state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
+        state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
         # =================================================================
-        # 4. READOUT INDÉPENDANT PAR TÊTE (EINSUM SWIGLU)
+        # 4. RÉSONANCE & INTÉGRALE (CONVOLUTION)
         # =================================================================
         
+        # Répétition GQA (K' -> K)
+        if self.n_rep > 1:
+            q_re = jnp.repeat(q_re, self.n_rep, axis=2)
+            q_im = jnp.repeat(q_im, self.n_rep, axis=2)
+
+        # Produit Hermitien : <State, Filter>
+        # (State_re + i State_im) * (Q_re - i Q_im)
+        match_re = state_re * q_re + state_im * q_im
+        match_im = state_im * q_re - state_re * q_im
+        
+        # INTÉGRALE : Somme sur M
+        # Le résultat est (B, L, K, H)
+        out_re = jnp.sum(match_re, axis=-1) 
+        out_im = jnp.sum(match_im, axis=-1)
+
+        # =================================================================
+        # 5. READOUT "FAT" (Per-Head SwiGLU via Einsum)
+        # =================================================================
+        
+        # Expansion du cerveau logique
         dim_expand = H * self.out_expand_factor
         dim_swiglu = dim_expand * 2
-        input_dim = H * self.M 
         
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
+        # Poids Indépendants par Tête (K matrices différentes)
+        # Input dim est H (car M a été intégré)
+        # Shape: (K, H, dim_swiglu)
+        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
+        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
         
-        # CORRECTION 2 : Shape du scale pour broadcaster sur (B, L, K, D)
-        # Il faut que K soit à l'avant-dernière position ou géré par broadcast
-        # Le plus simple : (1, 1, K, D)
-        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * input_dim))
+        # Scale par tête (1, 1, K, 1) pour broadcast sur (B, L, K, H)
+        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, H))
         
-        # On applique le scale
-        scale_re = scale[..., :input_dim]
-        scale_im = scale[..., input_dim:]
+        out_re_scaled = out_re * scale
+        out_im_scaled = out_im * scale
         
-        state_re_scaled = state_re * scale_re
-        state_im_scaled = state_im * scale_im
-
-        # EINSUM (Maintenant state_re_scaled est bien 4D : blkm)
-        y_re = jnp.einsum('blkm,kmn->blkn', state_re_scaled, W_re)
-        y_im = jnp.einsum('blkm,kmn->blkn', state_im_scaled, W_im)
+        # Einsum : blkh (Input) * khn (Weights) -> blkn (Output)
+        # Chaque tête k utilise sa propre matrice W[k] pour transformer son vecteur h
+        y_re = jnp.einsum('blkh,khn->blkn', out_re_scaled, W_re)
+        y_im = jnp.einsum('blkh,khn->blkn', out_im_scaled, W_im)
         
+        # Fusion
         y_raw = y_re + y_im # (B, L, K, dim_swiglu)
-
-        # SwiGLU
+        
+        # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
         y_activated = y_val * jax.nn.silu(y_gate) # (B, L, K, dim_expand)
         
-        # Flatten pour le mélange final
+        # Flatten
         y_flat = y_activated.reshape(b, l, -1) # (B, L, K * dim_expand)
 
-        # Projection Finale (Mélange global des têtes)
-        # C'est la seule fois où les têtes communiquent entre elles
+        # Projection Finale
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
         
         return out
+
+# VERSION LATEST SANS CONVOLUTION SPECTRALE
+# class SeqCondAttention(nn.Module):
+#     # Dimensions Architecture
+#     num_heads: int = 32          # K
+#     num_anchor_heads: int = 4
+#     num_thetas: int = 8          # M
+    
+#     # Paramètres Locaux
+#     conv_kernel_size: int = 4
+#     expand_factor: int = 1       # Input Slim (Scan)
+#     out_expand_factor: int = 2   # Output Fat (SwiGLU)
+
+#     dropout: float = 0.0
+#     maxlen: Optional[int] = None
+    
+#     compute_dtype: jnp.dtype = jnp.bfloat16
+#     param_dtype: jnp.dtype = jnp.float32
+
+#     def setup(self):
+#         self.K = self.num_heads
+#         self.M = self.num_thetas
+#         self.num_decay_heads = self.K - self.num_anchor_heads
+
+#     @nn.compact
+#     def __call__(self, x, mask=None, deterministic=True):
+#         b, l, d_model = x.shape
+#         d_inner = int(d_model * self.expand_factor)
+#         H = max(1, d_inner // self.K)
+
+#         # =================================================================
+#         # 1. ENCODAGE MÉMOIRE (Slim & Shared)
+#         # =================================================================
+#         # Ici on garde le partage pour l'extraction de features bas niveau
+#         z = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj")(x)
+#         z = z.astype(self.compute_dtype)
+        
+#         z = nn.Conv(
+#             features=z.shape[-1], 
+#             kernel_size=(self.conv_kernel_size,), 
+#             padding=((self.conv_kernel_size - 1, 0),),
+#             feature_group_count=z.shape[-1], 
+#             use_bias=False, name="conv"
+#         )(z)
+
+#         k_val = z[..., :d_inner].reshape(b, l, self.K, H)
+#         s_raw = z[..., -self.K:].reshape(b, l, self.K, 1)
+
+#         if mask is not None:
+#             m = mask.astype(x.dtype)[:, :, None, None]
+#             s_raw *= m
+#             k_val *= m
+
+#         # =================================================================
+#         # 2. SCAN SPECTRAL (ECF Core)
+#         # =================================================================
+#         def init_theta(key, shape):
+#             grid = np.linspace(-np.pi/3, np.pi/3, self.M)
+#             base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+#             return jnp.array(base, dtype=jnp.float32)
+
+#         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
+
+#         # Decay Log-Space
+#         pos = jnp.arange(l, dtype=jnp.float32)
+#         log_w_list = []
+#         if self.num_decay_heads > 0:
+#             d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
+#             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
+#             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
+#             log_w_list.append(-slopes * dist[None, :, None, None])
+#         if self.num_anchor_heads > 0:
+#             a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
+#             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
+#             log_w_list.append(-slopes_a * pos[None, :, None, None])
+            
+#         log_time_weight = jnp.concatenate(log_w_list, axis=2)
+#         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
+#         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
+#         p_w = jnp.exp(log_p + log_time_weight)
+
+#         phi_k = (k_val[..., None] * theta)
+#         re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
+
+#         # Scan
+#         flat_dim = self.K * H * self.M
+#         den_in = p_w.squeeze(-1)
+#         p_w_broad = p_w[..., None]
+#         num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
+#         num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
+        
+#         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
+#         cumsum = jnp.cumsum(merged, axis=1)
+#         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
+        
+#         # CORRECTION 1 : inv_den est déjà (B, L, K, 1)
+#         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
+        
+#         # On multiplie directement. Pas de [..., None] supplémentaire !
+#         # (B, L, K, H*M) * (B, L, K, 1) -> (B, L, K, H*M)
+#         state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
+#         state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
+
+#         # =================================================================
+#         # 4. READOUT INDÉPENDANT PAR TÊTE (EINSUM SWIGLU)
+#         # =================================================================
+        
+#         dim_expand = H * self.out_expand_factor
+#         dim_swiglu = dim_expand * 2
+#         input_dim = H * self.M 
+        
+#         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
+#         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
+        
+#         # CORRECTION 2 : Shape du scale pour broadcaster sur (B, L, K, D)
+#         # Il faut que K soit à l'avant-dernière position ou géré par broadcast
+#         # Le plus simple : (1, 1, K, D)
+#         scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * input_dim))
+        
+#         # On applique le scale
+#         scale_re = scale[..., :input_dim]
+#         scale_im = scale[..., input_dim:]
+        
+#         state_re_scaled = state_re * scale_re
+#         state_im_scaled = state_im * scale_im
+
+#         # EINSUM (Maintenant state_re_scaled est bien 4D : blkm)
+#         y_re = jnp.einsum('blkm,kmn->blkn', state_re_scaled, W_re)
+#         y_im = jnp.einsum('blkm,kmn->blkn', state_im_scaled, W_im)
+        
+#         y_raw = y_re + y_im # (B, L, K, dim_swiglu)
+
+#         # SwiGLU
+#         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
+#         y_activated = y_val * jax.nn.silu(y_gate) # (B, L, K, dim_expand)
+        
+#         # Flatten pour le mélange final
+#         y_flat = y_activated.reshape(b, l, -1) # (B, L, K * dim_expand)
+
+#         # Projection Finale (Mélange global des têtes)
+#         # C'est la seule fois où les têtes communiquent entre elles
+#         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y_flat)
+
+#         if self.dropout > 0:
+#             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
+        
+#         return out
 
 
 class SeqCondBlock(nn.Module):
