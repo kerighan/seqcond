@@ -282,17 +282,23 @@ import numpy as np
 from typing import Optional
 
 
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import numpy as np
+from typing import Optional
+
 class SeqCondAttention(nn.Module):
-    # Dimensions
-    num_heads: int = 32          # K (Mémoire)
-    num_query_heads: int = 6     # K' (Recherche - GQA)
+    # Dimensions Architecture
+    num_heads: int = 32          # K
+    num_query_heads: int = 6     # K'
     num_anchor_heads: int = 4
-    num_thetas: int = 8          # M (Résolution Spectrale)
+    num_thetas: int = 8          # M
     
-    # Paramètres
+    # Paramètres Locaux
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim (Scan Rapide)
-    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU)
+    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -301,7 +307,6 @@ class SeqCondAttention(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        # Vérification GQA
         assert self.num_heads % self.num_query_heads == 0
         self.n_rep = self.num_heads // self.num_query_heads
         
@@ -315,24 +320,19 @@ class SeqCondAttention(nn.Module):
         b, l, d_model = x.shape
         d_inner = int(d_model * self.expand_factor)
         
-        # 1. On calcule H réduit (Budget Constant)
-        # H est la dimension spatiale par tête
+        # 1. Budget Constant : On adapte H pour garder la taille du Scan fixe
+        # Si M augmente, H diminue.
         H = max(1, d_inner // (self.K * self.M))
         
-        # 2. On calcule la dimension totale nécessaire pour la mémoire
-        # C'est ce qu'on va projeter. Ce sera < d_inner si M > 1.
+        # Dimension réelle projetée pour la mémoire
         memory_dim = self.K * H 
 
         # =================================================================
         # 1. ENCODAGE MÉMOIRE (SIGNAL)
         # =================================================================
-        # CORRECTION : On projette vers memory_dim (réduit), pas d_inner.
-        # z_mem contient : Les Valeurs (memory_dim) + Les Decays (K)
-        
         z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
         
-        # Conv Locale
         z_mem = nn.Conv(
             features=z_mem.shape[-1], 
             kernel_size=(self.conv_kernel_size,), 
@@ -340,6 +340,7 @@ class SeqCondAttention(nn.Module):
             feature_group_count=z_mem.shape[-1], 
             use_bias=False, name="conv_mem"
         )(z_mem)
+
         k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
 
@@ -351,48 +352,33 @@ class SeqCondAttention(nn.Module):
         # =================================================================
         # 2. GÉNÉRATION DU FILTRE (QUERY)
         # =================================================================
-        # Le réseau apprend directement les coefficients complexes du filtre
-        # (B, L, D) -> (B, L, K', H, M, 2)
+        # On apprend directement le filtre complexe (Amplitude + Phase relative)
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
         q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
-        
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
-        
-        # Stabilisation optionnelle du filtre (RMSNorm sur le filtre)
-        # q_mag = jnp.sqrt(jnp.square(q_re) + jnp.square(q_im) + 1e-6)
-        # q_re = q_re * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
-        # q_im = q_im * jax.lax.rsqrt(jnp.mean(jnp.square(q_mag), axis=-1, keepdims=True) + 1e-6)
+
         # =================================================================
-        # 2. PARAMÈTRES SPECTRAUX (CORRIGÉS)
+        # 3. ÉTAT SPECTRAL & SCAN
         # =================================================================
         
-        # A. Theta Géométrique & Unilatéral (No Zero, No Negative)
+        # A. Theta Géométrique (Unilatéral)
         def init_theta(key, shape):
-            # On veut couvrir des longueurs d'onde lambda de 2 tokens à MaxLen (ex: 1000)
-            # theta = 2 * pi / lambda
-            # lambda_min = 2      -> theta_max = pi
-            # lambda_max = 10000  -> theta_min = 2 * pi / 10000
-            
-            # Pour éviter les hautes fréquences trop bruitées (aliasing), on s'arrête un peu avant pi.
-            # Disons max_theta = 3.0
-            # Min theta = 0.001 (Mémoire long terme)
-            
-            if self.M == 1:
-                # Si M=1, on garde une valeur moyenne raisonnable
-                return jnp.full((1, 1, self.K, H, 1), 0.1, dtype=jnp.float32)
-            else:
-                # Distribution Logarithmique (Geomspace)
-                # On évite 0 et on reste positif.
-                # Shape cible : (M,)
-                grid = np.geomspace(0.001, 3.0, self.M)
-                
-                # On broadcast sur (1, 1, K, H, M)
-                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-                return jnp.array(base, dtype=jnp.float32)
+            # On évite 0. On couvre large.
+            grid = np.geomspace(0.001, 3.0, self.M)
+            base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+            return jnp.array(base, dtype=jnp.float32)
 
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
 
-        # Decay Log-Space
+        # B. Intégrale Apprenable (Correction Riemann) - NOUVEAU
+        # On apprend les "dx" de l'intégrale. 
+        # Shape (1, 1, 1, 1, M) pour broadcaster sur (B, L, K, H, M)
+        quadrature_weights = self.param("quadrature_weights", 
+                                      nn.initializers.constant(1.0 / self.M), 
+                                      (1, 1, 1, 1, self.M))
+        w_int = jax.nn.softplus(quadrature_weights) # Toujours positif
+
+        # C. Decay (Log-Space)
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
@@ -410,15 +396,10 @@ class SeqCondAttention(nn.Module):
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
-        # =================================================================
-        # 3. ÉTAT & SCAN (ECF)
-        # =================================================================
-        
-        # Modulation Mémoire
+        # D. Modulation & Scan
         phi_k = (k_val[..., None] * theta)
         re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
 
-        # Scan
         flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
         p_w_broad = p_w[..., None]
@@ -433,64 +414,87 @@ class SeqCondAttention(nn.Module):
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         
         # State: (B, L, K, H, M)
-        # Attention: inv_den est (B, L, K, 1). Le broadcast se fait sur (H, M) qui sont flatten dans num_re
-        # Il faut juste reshape num_re avant la multiplication ou laisser le broadcast opérer
         state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
         state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
-        # =================================================================
-        # 4. RÉSONANCE & INTÉGRALE (CONVOLUTION)
+# =================================================================
+        # 4. RÉSONANCE & INTÉGRALE PONDÉRÉE (ZERO-COPY GQA)
         # =================================================================
         
-        # Répétition GQA (K' -> K)
-        if self.n_rep > 1:
-            q_re = jnp.repeat(q_re, self.n_rep, axis=2)
-            q_im = jnp.repeat(q_im, self.n_rep, axis=2)
-
-        # Produit Hermitien : <State, Filter>
-        # (State_re + i State_im) * (Q_re - i Q_im)
-        match_re = state_re * q_re + state_im * q_im
-        match_im = state_im * q_re - state_re * q_im
+        # On ne fait PAS de jnp.repeat. On utilise le broadcasting.
         
-        # INTÉGRALE : Somme sur M
-        # Le résultat est (B, L, K, H)
-        out_re = jnp.sum(match_re, axis=-1) 
-        out_im = jnp.sum(match_im, axis=-1)
+        # 1. On reshape l'État (Mémoire) pour exposer les groupes GQA
+        # State: (B, L, K, H, M) -> (B, L, K', n_rep, H, M)
+        state_re_g = state_re.reshape(b, l, self.K_q, self.n_rep, self.H, self.M)
+        state_im_g = state_im.reshape(b, l, self.K_q, self.n_rep, self.H, self.M)
+        
+        # 2. On prépare le Query (Filtre) pour le broadcast
+        # Query: (B, L, K', H, M) -> (B, L, K', 1, H, M)
+        q_re_g = q_re[..., None, :, :] 
+        q_im_g = q_im[..., None, :, :]
+
+        # 3. Produit Hermitien (Broadcasting automatique sur n_rep)
+        match_re = state_re_g * q_re_g + state_im_g * q_im_g
+        match_im = state_im_g * q_re_g - state_re_g * q_im_g
+        
+        # 4. Intégrale pondérée par w_int
+        # w_int est (1, 1, 1, 1, M). Le broadcast fonctionne car il aligne la droite (M).
+        
+        # Somme sur M (Dernier axe)
+        # Résultat : (B, L, K', n_rep, H)
+        out_re_g = jnp.sum(match_re * w_int, axis=-1) 
+        out_im_g = jnp.sum(match_im * w_int, axis=-1)
+        
+        # 5. On remet à plat vers K pour le reste du réseau
+        # (B, L, K', n_rep, H) -> (B, L, K, H)
+        out_re = out_re_g.reshape(b, l, self.K, self.H)
+        out_im = out_im_g.reshape(b, l, self.K, self.H)
 
         # =================================================================
-        # 5. READOUT "FAT" (Per-Head SwiGLU via Einsum)
+        # 5. READOUT + SKIP CONNECTION (HIGHWAY)
         # =================================================================
         
         # Expansion du cerveau logique
         dim_expand = H * self.out_expand_factor
         dim_swiglu = dim_expand * 2
         
-        # Poids Indépendants par Tête (K matrices différentes)
-        # Input dim est H (car M a été intégré)
-        # Shape: (K, H, dim_swiglu)
+        # --- A. Chemin Spectral (Scan) ---
+        # Readout indépendant par tête (Einsum)
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
-        
-        # Scale par tête (1, 1, K, 1) pour broadcast sur (B, L, K, H)
         scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, H))
         
+        # Gate initial pour laisser le Skip dominer au début
+        res_gate = self.param("spectral_gate_scale", nn.initializers.zeros, (1,))
+
         out_re_scaled = out_re * scale
         out_im_scaled = out_im * scale
         
-        # Einsum : blkh (Input) * khn (Weights) -> blkn (Output)
-        # Chaque tête k utilise sa propre matrice W[k] pour transformer son vecteur h
         y_re = jnp.einsum('blkh,khn->blkn', out_re_scaled, W_re)
         y_im = jnp.einsum('blkh,khn->blkn', out_im_scaled, W_im)
         
-        # Fusion
-        y_raw = y_re + y_im # (B, L, K, dim_swiglu)
+        # (B, L, K, dim_swiglu)
+        y_spectral = (y_re + y_im) * res_gate
+
+        # --- B. Chemin Direct (Skip Connection) - NOUVEAU ---
+        # On projette x directement vers la dimension du SwiGLU.
+        # Cela donne au MLP un accès direct au token courant, comme un Transformer.
+        # Dimension totale = K * dim_swiglu
+        
+        total_swiglu_dim = self.K * dim_swiglu
+        y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
+        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
+
+        # --- FUSION ---
+        # Le gradient passe directement par y_direct au début.
+        y_raw = y_spectral + y_direct
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
-        y_activated = y_val * jax.nn.silu(y_gate) # (B, L, K, dim_expand)
+        y_activated = y_val * jax.nn.silu(y_gate)
         
         # Flatten
-        y_flat = y_activated.reshape(b, l, -1) # (B, L, K * dim_expand)
+        y_flat = y_activated.reshape(b, l, -1) 
 
         # Projection Finale
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y_flat)
