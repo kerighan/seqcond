@@ -314,13 +314,22 @@ class SeqCondAttention(nn.Module):
     def __call__(self, x, mask=None, deterministic=True):
         b, l, d_model = x.shape
         d_inner = int(d_model * self.expand_factor)
+        
+        # 1. On calcule H réduit (Budget Constant)
+        # H est la dimension spatiale par tête
         H = max(1, d_inner // (self.K * self.M))
+        
+        # 2. On calcule la dimension totale nécessaire pour la mémoire
+        # C'est ce qu'on va projeter. Ce sera < d_inner si M > 1.
+        memory_dim = self.K * H 
 
         # =================================================================
         # 1. ENCODAGE MÉMOIRE (SIGNAL)
         # =================================================================
-        # Projection vers Key/Value (d_inner) + Decay (K)
-        z_mem = nn.Dense(d_inner + self.K, use_bias=False, name="in_proj_mem")(x)
+        # CORRECTION : On projette vers memory_dim (réduit), pas d_inner.
+        # z_mem contient : Les Valeurs (memory_dim) + Les Decays (K)
+        
+        z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
         
         # Conv Locale
@@ -331,8 +340,7 @@ class SeqCondAttention(nn.Module):
             feature_group_count=z_mem.shape[-1], 
             use_bias=False, name="conv_mem"
         )(z_mem)
-
-        k_val = z_mem[..., :d_inner].reshape(b, l, self.K, H)
+        k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
 
         if mask is not None:
