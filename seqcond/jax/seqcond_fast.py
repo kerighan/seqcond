@@ -380,40 +380,38 @@ class SeqCondAttention(nn.Module):
         cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
+        # CORRECTION 1 : inv_den est déjà (B, L, K, 1)
         inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         
-        # On garde K séparé ici : (B, L, K, H * M)
-        # C'est l'input pour le per-head SwiGLU
-        state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den[..., None])
-        state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den[..., None])
+        # On multiplie directement. Pas de [..., None] supplémentaire !
+        # (B, L, K, H*M) * (B, L, K, 1) -> (B, L, K, H*M)
+        state_re = (num_re.reshape(b, l, self.K, H * self.M) * inv_den)
+        state_im = (num_im.reshape(b, l, self.K, H * self.M) * inv_den)
 
         # =================================================================
         # 4. READOUT INDÉPENDANT PAR TÊTE (EINSUM SWIGLU)
         # =================================================================
-        # C'est ici le changement majeur.
-        # Au lieu de projeter tout le monde avec la même matrice, on a K matrices.
         
         dim_expand = H * self.out_expand_factor
         dim_swiglu = dim_expand * 2
-        input_dim = H * self.M # Dimension spectrale par tête
+        input_dim = H * self.M 
         
-        # Poids : (K, Input_Dim, Output_Dim)
-        # Chaque tête a ses propres poids de décodage.
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
         
-        # Scale par tête
-        scale = self.param("norm_scale", nn.initializers.ones, (self.K, 1, 2 * input_dim))
+        # CORRECTION 2 : Shape du scale pour broadcaster sur (B, L, K, D)
+        # Il faut que K soit à l'avant-dernière position ou géré par broadcast
+        # Le plus simple : (1, 1, K, D)
+        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * input_dim))
         
-        # On applique le scale sur l'axe des features (last dim)
-        state_re_scaled = state_re * scale[..., :input_dim]
-        state_im_scaled = state_im * scale[..., input_dim:]
+        # On applique le scale
+        scale_re = scale[..., :input_dim]
+        scale_im = scale[..., input_dim:]
+        
+        state_re_scaled = state_re * scale_re
+        state_im_scaled = state_im * scale_im
 
-        # EINSUM MAGIQUE
-        # b: batch, l: length, k: heads, m: input_dim, n: output_dim
-        # blkm (State) * kmn (Weights) -> blkn (Output)
-        # Le 'k' est préservé et apparait dans les deux termes -> Multiplication indépendante
-        
+        # EINSUM (Maintenant state_re_scaled est bien 4D : blkm)
         y_re = jnp.einsum('blkm,kmn->blkn', state_re_scaled, W_re)
         y_im = jnp.einsum('blkm,kmn->blkn', state_im_scaled, W_im)
         
