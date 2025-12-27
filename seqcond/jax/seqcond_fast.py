@@ -292,7 +292,7 @@ class SeqCondAttention(nn.Module):
     # Paramètres
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim (Scan Rapide)
-    out_expand_factor: int = 2   # Output Fat (Cerveau SwiGLU)
+    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU)
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
