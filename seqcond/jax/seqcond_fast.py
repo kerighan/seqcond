@@ -359,6 +359,7 @@ class SeqCondAttention(nn.Module):
         # =================================================================
         # On apprend directement le filtre complexe (Amplitude + Phase relative)
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
+        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
