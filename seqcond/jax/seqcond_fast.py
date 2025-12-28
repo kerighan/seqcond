@@ -407,8 +407,9 @@ class SeqCondAttention(nn.Module):
         p_w = jnp.exp(log_p + log_time_weight)
 
         # D. Modulation & Scan
-        phi_k = (k_val[..., None] * theta)
-        re_k, im_k = jnp.cos(phi_k), jnp.sin(phi_k)
+        k_val_expand = k_val[..., None]
+        phi_k = (k_val_expand * theta)
+        re_k, im_k = k_val_expand * jnp.cos(phi_k), k_val_expand * jnp.sin(phi_k)
 
         flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
