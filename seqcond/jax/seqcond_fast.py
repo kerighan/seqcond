@@ -343,6 +343,11 @@ class SeqCondAttention(nn.Module):
 
         k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
+        
+        # --- STABILISATION DU SIGNAL ---
+        # On normalise l'amplitude avant la modulation spectrale.
+        # Cela garantit que l'état est une somme de vecteurs d'énergie comparable.
+        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
@@ -360,23 +365,27 @@ class SeqCondAttention(nn.Module):
         # =================================================================
         # 3. ÉTAT SPECTRAL & SCAN
         # =================================================================
-        
-        # A. Theta Géométrique (Unilatéral)
+        # A. Theta Géométrique
+        # On le calcule en numpy pour avoir accès aux valeurs pour les deltas
+        theta_min, theta_max = 0.001, 3.0
+        # On génère la grille 1D
+        # shape: (M,)
+        grid_1d = np.geomspace(theta_min, theta_max, self.M)
+        # On rajoute les bords pour calculer les diffs
+        padded_grid = np.concatenate([[theta_min], grid_1d, [theta_max]])
+        diffs = padded_grid[1:] - padded_grid[:-1]
+        # On moyenne pour centrer sur le point
+        delta_thetas = (diffs[:-1] + diffs[1:]) / 2.0
+        # On fige ces poids ! Ce sont des constantes physiques liées à la résolution.
+        # Shape: (1, 1, 1, 1, M)
+        w_int = jnp.array(delta_thetas, dtype=jnp.float32).reshape(1, 1, 1, 1, self.M)
+
+        # B. Paramètre Theta
+        # On utilise la même grille pour l'init
         def init_theta(key, shape):
-            # On évite 0. On couvre large.
-            grid = np.geomspace(0.001, 3.0, self.M)
-            base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
+            base = np.tile(grid_1d.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
             return jnp.array(base, dtype=jnp.float32)
-
         theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
-
-        # B. Intégrale Apprenable (Correction Riemann) - NOUVEAU
-        # On apprend les "dx" de l'intégrale. 
-        # Shape (1, 1, 1, 1, M) pour broadcaster sur (B, L, K, H, M)
-        quadrature_weights = self.param("quadrature_weights", 
-                                      nn.initializers.constant(1.0 / self.M), 
-                                      (1, 1, 1, 1, self.M))
-        w_int = jax.nn.softplus(quadrature_weights) # Toujours positif
 
         # C. Decay (Log-Space)
         pos = jnp.arange(l, dtype=jnp.float32)
@@ -417,7 +426,7 @@ class SeqCondAttention(nn.Module):
         state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
         state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
-# =================================================================
+        # =================================================================
         # 4. RÉSONANCE & INTÉGRALE PONDÉRÉE (ZERO-COPY GQA)
         # =================================================================
         
@@ -430,8 +439,8 @@ class SeqCondAttention(nn.Module):
         
         # 2. On prépare le Query (Filtre) pour le broadcast
         # Query: (B, L, K', H, M) -> (B, L, K', 1, H, M)
-        q_re_g = q_re[..., None, :, :] 
-        q_im_g = q_im[..., None, :, :]
+        q_re_g = q_re[:, :, :, None, :, :]
+        q_im_g = q_im[:, :, :, None, :, :]
 
         # 3. Produit Hermitien (Broadcasting automatique sur n_rep)
         match_re = state_re_g * q_re_g + state_im_g * q_im_g
@@ -463,9 +472,17 @@ class SeqCondAttention(nn.Module):
         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
         W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
         scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, H))
-        
-        # Gate initial pour laisser le Skip dominer au début
-        res_gate = self.param("spectral_gate_scale", nn.initializers.zeros, (1,))
+
+        # --- DYNAMIC GATING (Le changement est ici) ---
+        # Au lieu d'un paramètre scalaire, on apprend une projection depuis x
+        # On projette vers K (une gate par tête) pour être économe.
+        # On initialise le bias à -3.0 pour fermer la porte au début.
+        gate_proj = nn.Dense(self.K, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.constant(-3.0), name="spectral_gate_proj")        
+        # Calcul de la gate dynamique (B, L, K)
+        # Sigmoid pour borner entre 0 (Ignorer mémoire) et 1 (Utiliser mémoire)
+        spectral_gate = jax.nn.sigmoid(gate_proj(x)).astype(self.compute_dtype)
+        # On reshape pour broadcaster sur la dimension SwiGLU: (B, L, K, 1)
+        spectral_gate = spectral_gate[..., None]
 
         out_re_scaled = out_re * scale
         out_im_scaled = out_im * scale
@@ -474,7 +491,7 @@ class SeqCondAttention(nn.Module):
         y_im = jnp.einsum('blkh,khn->blkn', out_im_scaled, W_im)
         
         # (B, L, K, dim_swiglu)
-        y_spectral = (y_re + y_im) * res_gate
+        y_spectral = (y_re + y_im) * spectral_gate
 
         # --- B. Chemin Direct (Skip Connection) - NOUVEAU ---
         # On projette x directement vers la dimension du SwiGLU.
