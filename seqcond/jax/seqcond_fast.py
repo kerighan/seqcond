@@ -343,7 +343,7 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
     num_heads: int = 32          # K
-    num_query_heads: int = 12    # K'
+    num_query_heads: int = 6    # K'
     num_anchor_heads: int = 4
     num_thetas: int = 8          # M
     
