@@ -328,7 +328,7 @@ class SeqCondAttention(nn.Module):
         memory_dim = self.K * H 
 
         # =================================================================
-        # 1. ENCODAGE MÉMOIRE (SIGNAL)
+        # 1. ENCODAGE MÉMOIRE
         # =================================================================
         z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
@@ -343,11 +343,9 @@ class SeqCondAttention(nn.Module):
 
         k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)
         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
-        
-        # --- STABILISATION DU SIGNAL ---
-        # On normalise l'amplitude avant la modulation spectrale.
-        # Cela garantit que l'état est une somme de vecteurs d'énergie comparable.
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+
+        # Stabilisation (RMSNorm sur K conseillé mais désactivé selon ton choix)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
@@ -355,40 +353,63 @@ class SeqCondAttention(nn.Module):
             k_val *= m
 
         # =================================================================
-        # 2. GÉNÉRATION DU FILTRE (QUERY)
+        # 2. QUERY
         # =================================================================
-        # On apprend directement le filtre complexe (Amplitude + Phase relative)
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
         # =================================================================
-        # 3. ÉTAT SPECTRAL & SCAN
+        # 3. GRILLE SPECTRALE (CORRIGÉE M=1)
         # =================================================================
-        # A. Theta Géométrique
-        # On le calcule en numpy pour avoir accès aux valeurs pour les deltas
+        
+        # A. Init Diversifiée
+        def init_theta_raw(key, shape):
+            if self.M == 1:
+                # Étalement sur les têtes K
+                grid = np.geomspace(0.001, 3.0, self.K)
+                grid = grid.reshape(1, 1, self.K, 1, 1)
+                # Broadcast sur H
+                base = np.tile(grid, (1, 1, 1, shape[3], 1))
+            else:
+                grid = np.geomspace(0.001, 3.0, self.M)
+                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, shape[3], 1))
+            return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
+
+        theta_d_raw = self.param("theta_d_raw", init_theta_raw, (1, 1, self.K, H, self.M))
+        
+        # B. Construction Monotone
+        theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
+        theta_accum = jnp.cumsum(theta_d, axis=-1)
+        
+        # C. Rescaling Physique
         theta_min, theta_max = 0.001, 3.0
-        # On génère la grille 1D
-        # shape: (M,)
-        grid_1d = np.geomspace(theta_min, theta_max, self.M)
-        # On rajoute les bords pour calculer les diffs
-        padded_grid = np.concatenate([[theta_min], grid_1d, [theta_max]])
-        diffs = padded_grid[1:] - padded_grid[:-1]
-        # On moyenne pour centrer sur le point
-        delta_thetas = (diffs[:-1] + diffs[1:]) / 2.0
-        # On fige ces poids ! Ce sont des constantes physiques liées à la résolution.
-        # Shape: (1, 1, 1, 1, M)
-        w_int = jnp.array(delta_thetas, dtype=jnp.float32).reshape(1, 1, 1, 1, self.M)
+        scale_range = theta_max - theta_min
+        total_sum = theta_accum[..., -1:] 
+        theta = theta_min + (theta_accum / total_sum) * scale_range
+        
+        # D. Poids d'Intégration (Sécurité M=1)
+        if self.M == 1:
+            # Si M=1, l'intégrale est juste un produit
+            w_int = jnp.ones((1, 1, self.K, H, 1), dtype=jnp.float32)
+        else:
+            # Trapèze
+            dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
+            dtheta = dtheta_raw * (scale_range / total_sum)
+            
+            w0 = dtheta[..., :1] * 0.5
+            w_mid = 0.5 * (dtheta[..., :-1] + dtheta[..., 1:])
+            wL = dtheta[..., -1:] * 0.5
+            
+            w_int = jnp.concatenate([w0, w_mid, wL], axis=-1)
+            # Normalisation optionnelle
+            # w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
 
-        # B. Paramètre Theta
-        # On utilise la même grille pour l'init
-        def init_theta(key, shape):
-            base = np.tile(grid_1d.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-            return jnp.array(base, dtype=jnp.float32)
-        theta = self.param("theta", init_theta, (1, 1, self.K, H, self.M))
-
-        # C. Decay (Log-Space)
+        # =================================================================
+        # 4. SCAN & INTEGRALE
+        # =================================================================
+        # A. Decay (Log-Space)
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
@@ -406,7 +427,7 @@ class SeqCondAttention(nn.Module):
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
-        # D. Modulation & Scan
+        # B. Modulation & Scan
         k_val_expand = k_val[..., None]
         phi_k = (k_val_expand * theta)
         re_k, im_k = k_val_expand * jnp.cos(phi_k), k_val_expand * jnp.sin(phi_k)
@@ -431,14 +452,14 @@ class SeqCondAttention(nn.Module):
         # =================================================================
         # 4. RÉSONANCE & INTÉGRALE PONDÉRÉE (ZERO-COPY GQA)
         # =================================================================
-        
-        # On ne fait PAS de jnp.repeat. On utilise le broadcasting.
-        
+
         # 1. On reshape l'État (Mémoire) pour exposer les groupes GQA
         # State: (B, L, K, H, M) -> (B, L, K', n_rep, H, M)
         state_re_g = state_re.reshape(b, l, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(b, l, self.K_q, self.n_rep, H, self.M)
-        
+        # 2. Reshape w_int pour matcher GQA
+        # w_int est (1, 1, K, H, M) -> On doit le splitter en (1, 1, K', n_rep, H, M)
+        w_int_g = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
         # 2. On prépare le Query (Filtre) pour le broadcast
         # Query: (B, L, K', H, M) -> (B, L, K', 1, H, M)
         q_re_g = q_re[:, :, :, None, :, :]
@@ -453,8 +474,8 @@ class SeqCondAttention(nn.Module):
         
         # Somme sur M (Dernier axe)
         # Résultat : (B, L, K', n_rep, H)
-        out_re_g = jnp.sum(match_re * w_int, axis=-1) 
-        out_im_g = jnp.sum(match_im * w_int, axis=-1)
+        out_re_g = jnp.sum(match_re * w_int_g, axis=-1) 
+        out_im_g = jnp.sum(match_im * w_int_g, axis=-1)
         
         # 5. On remet à plat vers K pour le reste du réseau
         # (B, L, K', n_rep, H) -> (B, L, K, H)
@@ -501,12 +522,13 @@ class SeqCondAttention(nn.Module):
         # Dimension totale = K * dim_swiglu
         
         total_swiglu_dim = self.K * dim_swiglu
-        y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
-        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
+        # y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
+        # y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
 
         # --- FUSION ---
         # Le gradient passe directement par y_direct au début.
-        y_raw = y_spectral + y_direct
+        # y_raw = y_spectral + y_direct
+        y_raw = y_spectral
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
