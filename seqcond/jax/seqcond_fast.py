@@ -354,6 +354,7 @@ class SeqCondAttention(nn.Module):
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
+    chunk_size: int = 0
     
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
@@ -491,8 +492,10 @@ class SeqCondAttention(nn.Module):
         num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
-        # cumsum = jnp.cumsum(merged, axis=1)
-        cumsum = cumsum_chunked(merged, axis=1, chunk=32)
+        if self.chunk_size > 0:
+            cumsum = cumsum_chunked(merged, axis=1, chunk=self.chunk_size)
+        else:
+            cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
         # Normalisation
@@ -768,6 +771,7 @@ class SeqCondBlock(nn.Module):
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None
     derivative_order: Optional[int] = 0
+    chunk_size: int = 0
 
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
@@ -783,6 +787,7 @@ class SeqCondBlock(nn.Module):
             conv_kernel_size=self.conv_kernel_size,
             dropout=self.dropout,
             maxlen=self.maxlen,
+            chunk_size=self.chunk_size,
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(h, mask=mask, deterministic=deterministic)

@@ -42,6 +42,7 @@ def parse_args():
     grp_model.add_argument("--seqcond-heads", type=int, default=None, help="Override number of seqcond heads")
     grp_model.add_argument("--expand", type=float, default=1.0, dest="expand_factor", help="Override expand factor")
     grp_model.add_argument("--maxlen", type=int, default=1024, help="Context length (affects model and training)")
+    grp_model.add_argument("--chunk", type=int, default=0, dest="chunk_size", help="Chunk size for cumsum (0 = normal)")
 
     # Training Configuration Overrides
     grp_train = parser.add_argument_group("Training Overrides")
@@ -84,7 +85,7 @@ def get_config(args) -> Config:
     model_overrides = {}
     
     # Direct mappings (name matches)
-    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type", "seqcond_ratio", "expand_factor"]:
+    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "model_type", "seqcond_ratio", "expand_factor", "chunk_size"]:
         val = getattr(args, field)
         if val is not None:
             model_overrides[field] = val

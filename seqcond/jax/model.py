@@ -510,6 +510,7 @@ def create_seqcond_model(
     conv_kernel_size: int = 4,
     expand_factor: float = 2.0,
     remat: bool = True,
+    chunk_size: int = 0,
 ) -> SeqCondModel:
     """Create a SeqCond model."""
     return SeqCondModel(
@@ -534,6 +535,7 @@ def create_seqcond_model(
         conv_kernel_size=conv_kernel_size,
         expand_factor=expand_factor,
         remat=remat,
+        chunk_size=chunk_size,
     )
 
 
