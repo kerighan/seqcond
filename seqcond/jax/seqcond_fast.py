@@ -355,7 +355,7 @@ class SeqCondAttention(nn.Module):
     dropout: float = 0.0
     maxlen: Optional[int] = None
     chunk_size: int = 0
-    
+
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
@@ -578,17 +578,48 @@ class SeqCondAttention(nn.Module):
         # Dimension totale = K * dim_swiglu
         
         total_swiglu_dim = self.K * dim_swiglu
-        y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
-        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
+        # y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
+        # y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
+        # =================================================================
+        # B. CHEMIN DIRECT (ALIGNED BROADCAST SKIP)
+        # =================================================================
+        # On garde expand_factor=3 (Puissance) mais on optimise le Skip.
+        
+        # 1. ALIGNEMENT (Le "Low Rank" intelligent)
+        # On projette x dans un espace de même taille (ou légèrement différent)
+        # pour l'orienter correctement avant duplication.
+        # Coût : 1 D^2 (négligeable comparé aux 6 D^2 du full skip)
+        
+        align_dim = d_model 
+        x_aligned = nn.Dense(align_dim, use_bias=False, name="skip_align")(x)
+        
+        # 2. TILING (Expansion gratuite)
+        # On cible la VALUE du SwiGLU (dim_expand) pour l'injection
+        # Rappel : dim_swiglu = 2 * dim_expand (Gate + Value)
+        dim_val = dim_expand 
+        total_val_dim = self.K * dim_val
+        
+        # Combien de fois faut-il répéter x_aligned ?
+        n_repeats = (total_val_dim + align_dim - 1) // align_dim
+        
+        # Tile & Slice
+        y_direct_flat = jnp.tile(x_aligned, (1, 1, n_repeats))
+        y_direct_flat = y_direct_flat[..., :total_val_dim]
+        
+        # Reshape (B, L, K, dim_val)
+        y_direct = y_direct_flat.reshape(b, l, self.K, dim_val)
 
         # --- FUSION ---
-        # Le gradient passe directement par y_direct au début.
-        y_raw = y_spectral + y_direct
-        # y_raw = y_spectral
+        # 1. Split Spectral (Gate / Value)
+        # y_spectral est (B, L, K, dim_swiglu) -> 2 * (B, L, K, dim_val)
+        y_val, y_gate = jnp.split(y_spectral, 2, axis=-1)
         
-        # SwiGLU Activation
-        y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
-        y_activated = y_val * jax.nn.silu(y_gate)
+        # 2. Injection dans la VALUE
+        # On ajoute un scale pour que l'init soit douce
+        highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
+        
+        y_val_mixed = y_val + (y_direct * highway_scale)
+        y_activated = y_val_mixed * jax.nn.silu(y_gate)
         
         # Flatten
         y_flat = y_activated.reshape(b, l, -1) 
