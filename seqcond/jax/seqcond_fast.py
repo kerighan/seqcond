@@ -282,11 +282,63 @@ import numpy as np
 from typing import Optional
 
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-import numpy as np
-from typing import Optional
+def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarray:
+    """
+    Drop-in replacement for jnp.cumsum(x, axis=axis) using chunked scan.
+
+    Requirements:
+      - axis dimension length must be static or at least known at compile.
+      - best when L is large (>= 512). For small L, plain cumsum may be faster.
+
+    Semantics:
+      - Exact prefix sum along `axis`, same as jnp.cumsum.
+    """
+    if axis < 0:
+        axis = x.ndim + axis
+
+    # Move target axis to 1 for convenience: (B, L, ...)
+    x_perm = jnp.moveaxis(x, axis, 1)
+    B = x_perm.shape[0]
+    L = x_perm.shape[1]
+    tail_shape = x_perm.shape[2:]
+
+    # Pad L to multiple of chunk
+    pad = (-L) % chunk
+    if pad:
+        pad_width = [(0, 0), (0, pad)] + [(0, 0)] * (x_perm.ndim - 2)
+        x_pad = jnp.pad(x_perm, pad_width)
+    else:
+        x_pad = x_perm
+
+    Lp = x_pad.shape[1]
+    n_chunks = Lp // chunk
+
+    # Reshape into chunks: (B, n_chunks, chunk, ...)
+    x_chunks = x_pad.reshape((B, n_chunks, chunk) + tail_shape)
+
+    # 1) cumsum inside each chunk
+    intra = jnp.cumsum(x_chunks, axis=2)
+
+    # 2) carry = sum of each chunk (last element of intra)
+    chunk_sums = intra[:, :, -1, ...]  # (B, n_chunks, ...)
+
+    # 3) prefix sums of chunk sums => offset for each chunk
+    # offsets[c] = sum_{i < c} chunk_sums[i]
+    offsets = jnp.cumsum(chunk_sums, axis=1)
+    offsets = jnp.concatenate(
+        [jnp.zeros_like(offsets[:, :1, ...]), offsets[:, :-1, ...]],
+        axis=1
+    )  # (B, n_chunks, ...)
+
+    # 4) add offsets to every element in chunk
+    out_chunks = intra + offsets[:, :, None, ...]
+
+    # Unchunk + unpad + restore axis
+    out = out_chunks.reshape((B, Lp) + tail_shape)
+    out = out[:, :L, ...]
+    out = jnp.moveaxis(out, 1, axis)
+    return out
+
 
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
@@ -439,7 +491,8 @@ class SeqCondAttention(nn.Module):
         num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
         
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
-        cumsum = jnp.cumsum(merged, axis=1)
+        # cumsum = jnp.cumsum(merged, axis=1)
+        cumsum = cumsum_chunked(merged, axis=1, chunk=128)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
         # Normalisation
