@@ -583,8 +583,8 @@ class SeqCondAttention(nn.Module):
 
         # --- FUSION ---
         # Le gradient passe directement par y_direct au début.
-        y_raw = y_spectral + y_direct
-        # y_raw = y_spectral
+        # y_raw = y_spectral + y_direct
+        y_raw = y_spectral
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
