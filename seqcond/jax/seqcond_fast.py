@@ -522,13 +522,13 @@ class SeqCondAttention(nn.Module):
         # Dimension totale = K * dim_swiglu
         
         total_swiglu_dim = self.K * dim_swiglu
-        # y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
-        # y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
+        y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
+        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
 
         # --- FUSION ---
         # Le gradient passe directement par y_direct au début.
-        # y_raw = y_spectral + y_direct
-        y_raw = y_spectral
+        y_raw = y_spectral + y_direct
+        # y_raw = y_spectral
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
