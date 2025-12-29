@@ -343,14 +343,14 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
     num_heads: int = 32          # K
-    num_query_heads: int = 6     # K'
+    num_query_heads: int = 12    # K'
     num_anchor_heads: int = 4
     num_thetas: int = 8          # M
     
     # Paramètres Locaux
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim (Scan Rapide)
-    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
+    out_expand_factor: int = 2   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -578,17 +578,17 @@ class SeqCondAttention(nn.Module):
         # Dimension totale = K * dim_swiglu
         
         total_swiglu_dim = self.K * dim_swiglu
-        y_direct = nn.Dense(total_swiglu_dim // 2, use_bias=False, name="skip_proj")(x)
-        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu // 2)
+        y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
+        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
 
         # --- FUSION ---
         # Le gradient passe directement par y_direct au début.
-        # y_raw = y_spectral + y_direct
-        y_raw = y_spectral
+        y_raw = y_spectral + y_direct
+        # y_raw = y_spectral
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
-        y_activated = (y_val) * jax.nn.silu(y_gate + y_direct)
+        y_activated = y_val * jax.nn.silu(y_gate)
         
         # Flatten
         y_flat = y_activated.reshape(b, l, -1) 
