@@ -250,7 +250,7 @@ class SeqCondModel(nn.Module):
                     conv_kernel_size=self.conv_kernel_size,
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
-                    chunk_size=chunk_size,
+                    chunk_size=self.chunk_size,
                 )
                 blocks.append(("seqcond", block))
                 seqcond_idx += 1
