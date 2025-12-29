@@ -492,7 +492,7 @@ class SeqCondAttention(nn.Module):
         
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
         # cumsum = jnp.cumsum(merged, axis=1)
-        cumsum = cumsum_chunked(merged, axis=1, chunk=256)
+        cumsum = cumsum_chunked(merged, axis=1, chunk=64)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
         # Normalisation
