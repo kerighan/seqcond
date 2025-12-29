@@ -343,14 +343,14 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
     num_heads: int = 32          # K
-    num_query_heads: int = 12    # K'
+    num_query_heads: int = 3    # K'
     num_anchor_heads: int = 4
     num_thetas: int = 8          # M
     
     # Paramètres Locaux
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim (Scan Rapide)
-    out_expand_factor: int = 2   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
+    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
