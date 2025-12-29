@@ -482,7 +482,8 @@ class SeqCondAttention(nn.Module):
 
         # B. Modulation & Scan
         k_val_expand = k_val[..., None]
-        phi_k = (k_val_expand * theta)
+        k_val_norm = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(k_val_expand)
+        phi_k = (k_val_norm * theta)
         re_k, im_k = k_val_expand * jnp.cos(phi_k), k_val_expand * jnp.sin(phi_k)
 
         flat_dim = self.K * H * self.M
