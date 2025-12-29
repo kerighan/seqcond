@@ -578,20 +578,8 @@ class SeqCondAttention(nn.Module):
         # Dimension totale = K * dim_swiglu
         
         total_swiglu_dim = self.K * dim_swiglu
-        # y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
-        # y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
-
-        # Combien de copies de x pour remplir le SwiGLU ?
-        n_repeats = (total_swiglu_dim + d_model - 1) // d_model
-        
-        # Tile : On répète x sur le dernier axe
-        # x: (B, L, D) -> (B, L, D * n_repeats)
-        y_direct_flat = jnp.tile(x, (1, 1, n_repeats))
-        # Slice : On coupe ce qui dépasse pour matcher exactement total_swiglu_dim
-        y_direct_flat = y_direct_flat[..., :total_swiglu_dim]
-        
-        # Reshape : (B, L, K, dim_swiglu)
-        y_direct = y_direct_flat.reshape(b, l, self.K, dim_swiglu)
+        y_direct = nn.Dense(total_swiglu_dim // 2, use_bias=False, name="skip_proj")(x)
+        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu // 2)
 
         # --- FUSION ---
         # Le gradient passe directement par y_direct au début.
@@ -600,7 +588,7 @@ class SeqCondAttention(nn.Module):
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
-        y_activated = y_val * jax.nn.silu(y_gate)
+        y_activated = (y_val + y_direct) * jax.nn.silu(y_gate)
         
         # Flatten
         y_flat = y_activated.reshape(b, l, -1) 
