@@ -588,7 +588,7 @@ class SeqCondAttention(nn.Module):
         
         # SwiGLU Activation
         y_val, y_gate = jnp.split(y_raw, 2, axis=-1)
-        y_activated = (y_val + y_direct) * jax.nn.silu(y_gate)
+        y_activated = (y_val) * jax.nn.silu(y_gate + y_direct)
         
         # Flatten
         y_flat = y_activated.reshape(b, l, -1) 
