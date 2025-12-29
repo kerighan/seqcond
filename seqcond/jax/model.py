@@ -188,6 +188,7 @@ class SeqCondModel(nn.Module):
     conv_kernel_size: int = 4
     expand_factor: float = 2.0
     remat: bool = True
+    chunk_size: int = 0
 
     def setup(self):
         _seqcond_heads = (
@@ -249,6 +250,7 @@ class SeqCondModel(nn.Module):
                     conv_kernel_size=self.conv_kernel_size,
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
+                    chunk_size=chunk_size,
                 )
                 blocks.append(("seqcond", block))
                 seqcond_idx += 1
