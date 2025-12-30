@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional
 
 
-class SeqCondAttentionUltraFastFixed(nn.Module):
+class SeqCondAttention(nn.Module):
     # Architecture
     num_heads: int = 12
     num_query_heads: int = 6
