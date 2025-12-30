@@ -180,7 +180,7 @@ class SeqCondAttention(nn.Module):
             phi = jnp.tanh(k_x_f32 * tanh_scale_broad) * theta 
             
             # Amplitude (Input Strength) * Decay
-            kvw = k_x_f32[..., None] * p_x[..., None] 
+            kvw = k_x_f32 * p_x[..., None] 
             
             re_x = (kvw * jnp.cos(phi))[..., 0]
             im_x = (kvw * jnp.sin(phi))[..., 0]
