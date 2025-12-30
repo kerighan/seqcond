@@ -638,8 +638,7 @@ class SeqCondAttention(nn.Module):
         self.M = self.num_thetas
         self.n_rep = self.K // self.K_q
         self.num_decay_heads = self.K - self.num_anchor_heads
-
-    @nn.compact
+@nn.compact
     def __call__(self, x, mask=None, deterministic=True):
         assert self.M == 1, "SeqCondAttentionFast currently implemented for M=1."
 
@@ -649,13 +648,17 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // (self.K * self.M))
         memory_dim = self.K * H
 
+        # On garde expand=2 pour payer le skip (compromis performance/poids)
+        # Mais tu peux remettre 3 si ta VRAM tient.
         dim_expand = H * self.out_expand_factor
         dim_swiglu_per_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_per_head
+        
+        # DeepSeek Latent Skip Ratio
         latent_dim = d_model // 4
 
         # ------------------------------------------------------------
-        # 1) Memory encoding (full sequence conv kept as-is)
+        # 1) Memory encoding
         # ------------------------------------------------------------
         z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
@@ -668,8 +671,8 @@ class SeqCondAttention(nn.Module):
             name="conv_mem",
         )(z_mem)
 
-        k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)      # (B,L,K,H)
-        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)         # (B,L,K,1)
+        k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)       # (B,L,K,H)
+        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)          # (B,L,K,1)
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
@@ -680,29 +683,30 @@ class SeqCondAttention(nn.Module):
         # 2) Query
         # ------------------------------------------------------------
         q_raw = nn.Dense(self.K_q * H * 1 * 2, use_bias=False, name="in_proj_query")(x)
+        # RMSNorm sur la Query est souvent bénéfique pour stabiliser le produit hermitien
+        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(b, l, self.K_q, H, 1, 2)
-        q_re, q_im = q_raw[..., 0], q_raw[..., 1]                     # (B,L,Kq,H,1)
+        q_re, q_im = q_raw[..., 0], q_raw[..., 1]                      # (B,L,Kq,H,1)
 
         # ------------------------------------------------------------
-        # 3) Theta (M=1) — keep your geom init, but recommend sigmoid bound
+        # 3) Theta (M=1 Optimized)
         # ------------------------------------------------------------
         theta_min, theta_max = 0.001, 3.0
 
         def init_theta_m1(key, shape):
             grid_k = np.geomspace(theta_min, theta_max, self.K).reshape(1, 1, self.K, 1, 1)
             base = np.tile(grid_k, (1, 1, 1, shape[3], 1))
-            # init raw so that sigmoid(raw) ~ (base-theta_min)/(theta_max-theta_min)
+            # Inverse Sigmoid approx
             u = (base - theta_min) / max(theta_max - theta_min, 1e-6)
             u = np.clip(u, 1e-4, 1 - 1e-4)
-            raw = np.log(u) - np.log(1 - u)  # logit
+            raw = np.log(u) - np.log(1 - u)
             return jnp.array(raw, dtype=jnp.float32)
 
         theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
         theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
-        w_int = jnp.ones((1, 1, self.K, H, 1), dtype=jnp.float32)
 
         # ------------------------------------------------------------
-        # 4) p_w (decay) — keep in fp32 for stability
+        # 4) Decay (p_w)
         # ------------------------------------------------------------
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
@@ -733,21 +737,34 @@ class SeqCondAttention(nn.Module):
         p_w = jnp.exp(log_p + log_time_weight)                          # (B,L,K,1) fp32
 
         # ------------------------------------------------------------
-        # 5) Precompute per-token inputs (still no big concat/cumsum)
+        # 5) Precompute inputs for Scan (AM-PM Stabilisé)
         # ------------------------------------------------------------
-        k_e = k_val[..., None].astype(jnp.float32)                      # (B,L,K,H,1)
-        pw_e = p_w[..., None]                                           # (B,L,K,1,1)
-        kvw = k_e * pw_e                                                # (B,L,K,H,1)
-        phi = jnp.tanh(k_e) * theta                                     # (B,L,K,H,1)
+        
+        # Stabilisation Phase : RMSNorm sur l'entrée de la rotation
+        k_phase = nn.RMSNorm(dtype=self.compute_dtype, name="phase_norm")(k_val)
+        k_phase = k_phase[..., None].astype(jnp.float32)
+        
+        # Modulation
+        phi = k_phase * theta
+        
+        # Amplitude brute conservée
+        k_amp = k_val[..., None].astype(jnp.float32)
+        pw_e = p_w[..., None]
+        kvw = k_amp * pw_e
 
         re_in = (kvw * jnp.cos(phi))[..., 0]                             # (B,L,K,H)
         im_in = (kvw * jnp.sin(phi))[..., 0]                             # (B,L,K,H)
         den_in = p_w[..., 0]                                             # (B,L,K)
+        
+        # FORCE FP32 pour le scan (évite le downcast silencieux)
+        den_in = den_in.astype(jnp.float32)
+        re_in = re_in.astype(jnp.float32)
+        im_in = im_in.astype(jnp.float32)
 
         # ------------------------------------------------------------
-        # 6) STREAMING over L in chunks with lax.scan
+        # 6) STREAMING SCAN (Chunked + Flash Readout)
         # ------------------------------------------------------------
-        C = self.chunk_size
+        C = self.seq_chunk
         pad = (-l) % C
         if pad:
             den_in = jnp.pad(den_in, ((0,0),(0,pad),(0,0)))
@@ -761,37 +778,51 @@ class SeqCondAttention(nn.Module):
 
         n_chunks = Lp // C
 
-        den_chunks = den_in.reshape(b, n_chunks, C, self.K)            # (B,NC,C,K)
-        re_chunks  = re_in.reshape(b, n_chunks, C, self.K, H)          # (B,NC,C,K,H)
+        # 1. Reshape en Chunks
+        den_chunks = den_in.reshape(b, n_chunks, C, self.K)             # (B,NC,C,K)
+        re_chunks  = re_in.reshape(b, n_chunks, C, self.K, H)           # (B,NC,C,K,H)
         im_chunks  = im_in.reshape(b, n_chunks, C, self.K, H)
-        qre_chunks = q_re.reshape(b, n_chunks, C, self.K_q, H, 1)      # (B,NC,C,Kq,H,1)
+        qre_chunks = q_re.reshape(b, n_chunks, C, self.K_q, H, 1)       # (B,NC,C,Kq,H,1)
         qim_chunks = q_im.reshape(b, n_chunks, C, self.K_q, H, 1)
+
+        # 2. SWAP AXES : (B, NC, ...) -> (NC, B, ...)
+        # C'est LA correction critique pour que scan fonctionne.
+        den_chunks = den_chunks.swapaxes(0, 1)
+        re_chunks  = re_chunks.swapaxes(0, 1)
+        im_chunks  = im_chunks.swapaxes(0, 1)
+        qre_chunks = qre_chunks.swapaxes(0, 1)
+        qim_chunks = qim_chunks.swapaxes(0, 1)
 
         def step(carry, xs):
             den_c, re_c, im_c = carry
             den_x, re_x, im_x, qre_x, qim_x = xs
 
+            # Cumsum local + Ajout du carry précédent
             den_ps = jnp.cumsum(den_x, axis=1) + den_c[:, None, :]      # (B,C,K)
             re_ps  = jnp.cumsum(re_x,  axis=1) + re_c[:, None, :, :]    # (B,C,K,H)
             im_ps  = jnp.cumsum(im_x,  axis=1) + im_c[:, None, :, :]
 
-            inv_den = 1.0 / jnp.maximum(den_ps, 1e-4)                   # fp32
+            # Normalisation (Division)
+            inv_den = 1.0 / jnp.maximum(den_ps, 1e-4)
             state_re = re_ps * inv_den[..., None]                       # (B,C,K,H)
             state_im = im_ps * inv_den[..., None]
 
-            # GQA reshape
+            # GQA reshape "Virtuel" (Zero-Copy via View)
             state_re_g = state_re.reshape(b, C, self.K_q, self.n_rep, H)
             state_im_g = state_im.reshape(b, C, self.K_q, self.n_rep, H)
 
             qre = qre_x[..., 0][:, :, :, None, :]                        # (B,C,Kq,1,H)
             qim = qim_x[..., 0][:, :, :, None, :]
 
+            # Flash Readout : Produit immédiat, pas de stockage du gros state
             out_re_g = state_re_g * qre + state_im_g * qim               # (B,C,Kq,nrep,H)
             out_im_g = state_im_g * qre - state_re_g * qim
 
+            # Flatten back to K
             out_re = out_re_g.reshape(b, C, self.K, H)
             out_im = out_im_g.reshape(b, C, self.K, H)
 
+            # Prepare next carry (Last element of chunk)
             new_carry = (den_ps[:, -1, :], re_ps[:, -1, :, :], im_ps[:, -1, :, :])
             return new_carry, (out_re, out_im)
 
@@ -801,40 +832,54 @@ class SeqCondAttention(nn.Module):
             jnp.zeros((b, self.K, H), dtype=jnp.float32),
         )
 
+        # Le scan itère sur l'axe 0 (N_Chunks)
         _, (out_re_chunks, out_im_chunks) = jax.lax.scan(
             step, init, (den_chunks, re_chunks, im_chunks, qre_chunks, qim_chunks), length=n_chunks
         )
 
+        # 3. SWAP BACK : (NC, B, ...) -> (B, NC, ...)
+        out_re_chunks = out_re_chunks.swapaxes(0, 1)
+        out_im_chunks = out_im_chunks.swapaxes(0, 1)
+
+        # 4. Final Reshape & Cast back to compute_dtype
         out_re = out_re_chunks.reshape(b, Lp, self.K, H)[:, :l, ...].astype(self.compute_dtype)
         out_im = out_im_chunks.reshape(b, Lp, self.K, H)[:, :l, ...].astype(self.compute_dtype)
 
         # ------------------------------------------------------------
-        # 7) Readout / SwiGLU / skip (identique)
+        # 7) Readout / Gating / Skip (Fusion)
         # ------------------------------------------------------------
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu_per_head))
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu_per_head))
-        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, H))
+        
+        # A. Readout Spectral (Concat Re/Im pour éviter l'annulation)
+        out_complex = jnp.concatenate([out_re, out_im], axis=-1)
+        W_readout = self.param("W_readout", nn.initializers.glorot_uniform(), (self.K, 2 * H, dim_swiglu_per_head))
+        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H))
+        
+        y_spectral_raw = jnp.einsum('blkf,kfn->blkn', out_complex * scale, W_readout)
 
+        # Spectral Gating (Input Gate)
         gate_proj = nn.Dense(self.K, kernel_init=nn.initializers.zeros,
                              bias_init=nn.initializers.constant(-3.0),
                              name="spectral_gate_proj")
-        spectral_gate = jax.nn.sigmoid(gate_proj(x)).astype(self.compute_dtype)[..., None]  # (B,L,K,1)
+        spectral_gate = jax.nn.sigmoid(gate_proj(x)).astype(self.compute_dtype)[..., None]
+        
+        y_spectral = y_spectral_raw * spectral_gate
 
-        y_re = jnp.einsum('blkh,khn->blkn', out_re * scale, W_re)
-        y_im = jnp.einsum('blkh,khn->blkn', out_im * scale, W_im)
-        y_spectral = (y_re + y_im) * spectral_gate
-
+        # B. DeepSeek Latent Skip (Low Rank)
         c_skip = nn.Dense(latent_dim, use_bias=False, name="skip_down")(x)
-        y_direct = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
-        y_direct = y_direct.reshape(b, l, self.K, dim_swiglu_per_head)
+        y_direct_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
+        y_direct = y_direct_raw.reshape(b, l, self.K, dim_swiglu_per_head)
 
+        # C. Fusion (Split & Add)
         y_val_spec, y_gate_spec = jnp.split(y_spectral, 2, axis=-1)
         y_val_dir,  y_gate_dir  = jnp.split(y_direct,  2, axis=-1)
 
         highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
+        
+        # Addition pure (ResNet style) sur les deux branches
         y_val = y_val_spec + y_val_dir * highway_scale
         y_gate = y_gate_spec + y_gate_dir * highway_scale
 
+        # SwiGLU
         y = y_val * jax.nn.silu(y_gate)
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y.reshape(b, l, -1))
 
