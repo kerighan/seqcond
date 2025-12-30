@@ -351,7 +351,7 @@ class SeqCondAttention(nn.Module):
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim (Scan Rapide)
     out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
-    
+
     dropout: float = 0.0
     maxlen: Optional[int] = None
     chunk_size: int = 0
@@ -498,6 +498,7 @@ class SeqCondAttention(nn.Module):
             
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
+        # tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
         p_w = jnp.exp(log_p + log_time_weight)
 
