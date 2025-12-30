@@ -417,52 +417,72 @@ class SeqCondAttention(nn.Module):
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
         q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
-
+        
         # =================================================================
-        # 3. GRILLE SPECTRALE (CORRIGÉE M=1)
+        # 3. GRILLE SPECTRALE (REFACTORISÉE)
         # =================================================================
-        
-        # A. Init Diversifiée
-        def init_theta_raw(key, shape):
-            if self.M == 1:
-                # Étalement sur les têtes K
-                grid = np.geomspace(0.001, 3.0, self.K)
-                grid = grid.reshape(1, 1, self.K, 1, 1)
-                # Broadcast sur H
-                base = np.tile(grid, (1, 1, 1, shape[3], 1))
-            else:
-                grid = np.geomspace(0.001, 3.0, self.M)
-                base = np.tile(grid.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, shape[3], 1))
-            return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
-
-        theta_d_raw = self.param("theta_d_raw", init_theta_raw, (1, 1, self.K, H, self.M))
-        
-        # B. Construction Monotone
-        theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
-        theta_accum = jnp.cumsum(theta_d, axis=-1)
-        
-        # C. Rescaling Physique
+        # Bornes physiques du spectre
         theta_min, theta_max = 0.001, 3.0
-        scale_range = theta_max - theta_min
-        total_sum = theta_accum[..., -1:] 
-        theta = theta_min + (theta_accum / total_sum) * scale_range
-        
-        # D. Poids d'Intégration (Sécurité M=1)
+
         if self.M == 1:
-            # Si M=1, l'intégrale est juste un produit
+            # --- CAS OPTIMISÉ M=1 (Single Frequency per Head) ---
+            # Ici, on veut que chaque tête (K) capture une fréquence différente.
+            # Pas d'intégrale, pas de cumsum. Juste un paramètre par tête.
+            
+            def init_theta_m1(key, shape):
+                # shape: (1, 1, K, H, 1)
+                # 1. On crée une gamme géométrique étalée sur les K têtes
+                grid_k = np.geomspace(theta_min, theta_max, self.K)
+                
+                # 2. Reshape pour matcher (1, 1, K, 1, 1)
+                grid_k = grid_k.reshape(1, 1, self.K, 1, 1)
+                
+                # 3. Broadcast sur H (chaque canal H d'une même tête partage la fréquence de base)
+                # Ou on peut ajouter du bruit si on veut que H varie aussi.
+                base = np.tile(grid_k, (1, 1, 1, shape[3], 1))
+                
+                # 4. Inverse Softplus pour l'initialisation
+                return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
+
+            # Paramètre direct (pas de delta)
+            theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
+            
+            # Softplus pour garantir la positivité. 
+            # On ne borne pas forcément à 3.0, on laisse le modèle aller chercher plus haut si besoin.
+            theta = jax.nn.softplus(theta_raw).astype(jnp.float32) + theta_min
+            
+            # Poids unitaire pour l'intégrale (produit simple)
             w_int = jnp.ones((1, 1, self.K, H, 1), dtype=jnp.float32)
         else:
-            # Trapèze
+            # --- CAS RIEMANN M>1 (Adaptive Integration) ---
+            # Ici, chaque tête possède un spectre interne de M fréquences.
+            def init_theta_deltas(key, shape):
+                # shape: (1, 1, K, H, M)
+                # On étale sur M (axe fréquentiel interne)
+                grid_m = np.geomspace(theta_min, theta_max, self.M)
+                base = np.tile(grid_m.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, shape[3], 1))
+                return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
+
+            theta_d_raw = self.param("theta_d_raw", init_theta_deltas, (1, 1, self.K, H, self.M))
+            
+            # Construction Monotone
+            theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
+            theta_accum = jnp.cumsum(theta_d, axis=-1)
+            
+            # Normalisation dans la plage [min, max]
+            scale_range = theta_max - theta_min
+            total_sum = theta_accum[..., -1:] 
+            theta = theta_min + (theta_accum / total_sum) * scale_range
+            
+            # Calcul des poids Trapèze (dtheta)
             dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
-            dtheta = dtheta_raw * (scale_range / total_sum)
+            dtheta = dtheta_raw * (scale_range / total_sum) # Correction d'échelle
             
             w0 = dtheta[..., :1] * 0.5
             w_mid = 0.5 * (dtheta[..., :-1] + dtheta[..., 1:])
             wL = dtheta[..., -1:] * 0.5
             
             w_int = jnp.concatenate([w0, w_mid, wL], axis=-1)
-            # Normalisation optionnelle
-            # w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
 
         # =================================================================
         # 4. SCAN & INTEGRALE
