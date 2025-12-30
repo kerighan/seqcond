@@ -342,10 +342,10 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
 
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
-    num_heads: int = 32          # K
+    num_heads: int = 12          # K
     num_query_heads: int = 6    # K'
-    num_anchor_heads: int = 4
-    num_thetas: int = 8          # M
+    num_anchor_heads: int = 0
+    num_thetas: int = 1          # M
     
     # Paramètres Locaux
     conv_kernel_size: int = 4
@@ -483,12 +483,13 @@ class SeqCondAttention(nn.Module):
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
-        p_w = jnp.exp(log_p + log_time_weight).astype(self.compute_dtype)
+        p_w = jnp.exp(log_p + log_time_weight)
 
         # B. Modulation & Scan
         k_val_expand = k_val[..., None]
         kvw = k_val_expand * p_w[..., None]
-        phi_k = (k_val_expand * theta)
+        # phi_k = (k_val_expand * theta)
+        phi_k = jnp.tanh(k_val_expand) * theta  # cheap norm
         re_k, im_k = kvw * jnp.cos(phi_k), kvw * jnp.sin(phi_k)
 
         den_in = p_w.squeeze(-1)
@@ -500,6 +501,7 @@ class SeqCondAttention(nn.Module):
             cumsum = cumsum_chunked(merged, axis=1, chunk=self.chunk_size)
         else:
             cumsum = jnp.cumsum(merged, axis=1)
+        cumsum = cumsum.astype(self.compute_dtype)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
         # State: (B, L, K, H, M)
