@@ -413,14 +413,11 @@ class SeqCondAttention(nn.Module):
                 # shape: (1, 1, K, H, 1)
                 # 1. On crée une gamme géométrique étalée sur les K têtes
                 grid_k = np.geomspace(theta_min, theta_max, self.K)
-                
                 # 2. Reshape pour matcher (1, 1, K, 1, 1)
                 grid_k = grid_k.reshape(1, 1, self.K, 1, 1)
-                
                 # 3. Broadcast sur H (chaque canal H d'une même tête partage la fréquence de base)
                 # Ou on peut ajouter du bruit si on veut que H varie aussi.
                 base = np.tile(grid_k, (1, 1, 1, shape[3], 1))
-                
                 # 4. Inverse Softplus pour l'initialisation
                 return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
 
@@ -487,8 +484,8 @@ class SeqCondAttention(nn.Module):
         p_w = jnp.exp(log_p + log_time_weight)
 
         # B. Modulation & Scan
-        k_val_expand = k_val[..., None, None]
-        kvw = k_val_expand * p_w[..., None, None]
+        k_val_expand = k_val[..., None]
+        kvw = k_val_expand * p_w[..., None]
         tanh_scale_broad = tanh_scale[None, None, :, None, None]
         phi_k = jnp.tanh(tanh_scale_broad * k_val_expand) * theta  # cheap norm
         re_k, im_k = kvw * jnp.cos(phi_k), kvw * jnp.sin(phi_k)
