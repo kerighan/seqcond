@@ -9,7 +9,7 @@ from typing import Optional
 
 class SeqCondAttention(nn.Module):
     # Architecture
-    num_heads: int = 12
+    num_headstanh_scale_broad: int = 12
     num_query_heads: int = 6
     num_anchor_heads: int = 0
     num_thetas: int = 1  # Strict M=1 pour la vitesse
@@ -120,7 +120,7 @@ class SeqCondAttention(nn.Module):
 
         # Tanh Scale Param
         tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
-        tanh_scale_broad = tanh_scale[None, None, :, None] # (1, 1, K, 1)
+        tanh_scale_broad = tanh_scale[None, None, :, None, None] # (1, 1, K, 1, 1)
 
         # ------------------------------------------------------------
         # 2. DÉFINITION DES POIDS MANUELS (Pour usage interne Scan)
@@ -175,7 +175,7 @@ class SeqCondAttention(nn.Module):
             
             # --- A. ON-THE-FLY COMPUTATION (SRAM) ---
             # 1. Modulation & AM-PM Stabilisée
-            k_x_f32 = k_x.astype(jnp.float32)
+            k_x_f32 = k_x.astype(jnp.float32)[..., None] # (B, C, K, H, 1)
             # Tanh scale contrôle la sensibilité
             phi = jnp.tanh(k_x_f32 * tanh_scale_broad) * theta 
             
