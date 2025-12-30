@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional
 
 
-class SeqCondAttentionFast(nn.Module):
+class SeqCondAttention(nn.Module):
     # Architecture Dimensions
     num_heads: int = 12          # K
     num_query_heads: int = 6     # K' (GQA)
