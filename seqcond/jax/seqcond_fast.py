@@ -438,8 +438,9 @@ class SeqCondAttention(nn.Module):
             theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
             theta = jax.nn.softplus(theta_raw).astype(jnp.float32) + theta_min
             # Poids unitaire
-            w_int = jnp.ones((1, 1, self.K, 1, H, 1), dtype=jnp.float32)
-            w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
+            # w_int = jnp.ones((1, 1, self.K, 1, H, 1), dtype=jnp.float32)
+            # w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
+            w_int = jnp.ones((1, 1, self.K_q, self.n_rep, H, 1), dtype=jnp.float32)
         else:
             # CAS M>1 : Intégrale de Riemann sur M
             def init_theta_deltas(key, shape):
@@ -553,7 +554,7 @@ class SeqCondAttention(nn.Module):
         # Produit Hermitien avec Query (B, L, Kq, 1, H, M)
         match_re = state_re_g * q_re + state_im_g * q_im
         match_im = state_im_g * q_re - state_re_g * q_im
-        
+
         # INTEGRALE (Somme pondérée sur M)
         # w_int a été préparé dans la section 2
         # (B, L, Kq, n_rep, H, M) * (1, 1, Kq, n_rep, H, M)
