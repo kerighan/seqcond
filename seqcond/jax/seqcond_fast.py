@@ -18,7 +18,7 @@ class SeqCondAttention(nn.Module):
     expand_factor: int = 1       # Input Slim
     out_expand_factor: int = 2   # Output Moderate (Sweet spot avec le Skip)
     
-    seq_chunk: int = 128  # Taille du Chunk (SRAM friendly)
+    chunk_size: int = 128  # Taille du Chunk (SRAM friendly)
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -136,7 +136,7 @@ class SeqCondAttention(nn.Module):
         # ------------------------------------------------------------
         # 3. CHUNKING & SWAP (Préparation Scan)
         # ------------------------------------------------------------
-        C = self.seq_chunk
+        C = self.chunk_size
         pad = (-l) % C
         if pad:
             # Helper de padding
