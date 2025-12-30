@@ -16,8 +16,8 @@ class SeqCondAttention(nn.Module):
 
     conv_kernel_size: int = 4
     expand_factor: int = 1       # Input Slim
-    out_expand_factor: int = 2   # Output Moderate (Sweet spot avec le Skip)
-    
+    out_expand_factor: int = 3   # Output Moderate (Sweet spot avec le Skip)
+
     chunk_size: int = 128  # Taille du Chunk (SRAM friendly)
     
     dropout: float = 0.0
