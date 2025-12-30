@@ -8,34 +8,31 @@ from typing import Optional
 
 
 class SeqCondAttention(nn.Module):
-    # Architecture Dimensions
-    num_heads: int = 12          # K
-    num_query_heads: int = 6     # K' (GQA)
+    # Architecture
+    num_heads: int = 12
+    num_query_heads: int = 6
     num_anchor_heads: int = 0
-    num_thetas: int = 1          # M=1 Optimized path
+    num_thetas: int = 1  # Strict M=1 pour la vitesse
 
-    # Hyper-paramètres
     conv_kernel_size: int = 4
-    expand_factor: int = 1       # Input Expansion
-    out_expand_factor: int = 2   # Output Expansion (2 est le sweet spot avec le Skip)
+    expand_factor: int = 1       # Input Slim
+    out_expand_factor: int = 2   # Output Moderate (Sweet spot avec le Skip)
     
-    # Tuning
-    chunk_size: int = 128         # Taille du Chunk pour le Scan (Flash-like)
+    seq_chunk: int = 128  # Taille du Chunk (SRAM friendly)
     
     dropout: float = 0.0
     maxlen: Optional[int] = None
-
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         assert self.num_heads % self.num_query_heads == 0
-        assert self.num_thetas == 1, "SeqCondAttentionFast is strict M=1."
+        assert self.num_thetas == 1, "UltraFast path is optimized for M=1"
         
         self.K = self.num_heads
         self.K_q = self.num_query_heads
-        self.M = self.num_thetas
         self.n_rep = self.K // self.K_q
+        self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
 
     @nn.compact
@@ -43,70 +40,56 @@ class SeqCondAttention(nn.Module):
         b, l, d_model = x.shape
         d_inner = int(d_model * self.expand_factor)
 
-        # Budget Constant (H est grand car M=1)
+        # Dimension de l'état (H est grand car M=1)
         H = max(1, d_inner // (self.K * self.M))
         memory_dim = self.K * H
 
-        # Dimensions SwiGLU
         dim_expand = H * self.out_expand_factor
         dim_swiglu_per_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_per_head
         
-        # Latent Skip Dimension (DeepSeek Style: D/4)
+        # DeepSeek Latent Dim (Compression du Skip)
         latent_dim = d_model // 4
 
         # ------------------------------------------------------------
-        # 1) Memory Encoding (Signal)
+        # 1. PRE-CALCULS LÉGERS (Inputs du Scan)
         # ------------------------------------------------------------
+        
+        # A. Memory Encoding (Conv reste dehors car séquentielle)
         z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
         z_mem = nn.Conv(
-            features=z_mem.shape[-1],
-            kernel_size=(self.conv_kernel_size,),
-            padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=z_mem.shape[-1],
-            use_bias=False,
-            name="conv_mem",
+            features=z_mem.shape[-1], kernel_size=(self.conv_kernel_size,), 
+            padding=((self.conv_kernel_size - 1, 0),), feature_group_count=z_mem.shape[-1], 
+            use_bias=False, name="conv_mem"
         )(z_mem)
 
-        k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)       # (B,L,K,H)
-        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)          # (B,L,K,1)
+        k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)       
+        s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)          
 
         if mask is not None:
             m = mask.astype(x.dtype)[:, :, None, None]
             s_raw *= m
             k_val *= m
 
-        # ------------------------------------------------------------
-        # 2) Query Generation
-        # ------------------------------------------------------------
-        # RMSNorm sur Q stabilise le produit hermitien (évite les valeurs géantes)
-        q_raw = nn.Dense(self.K_q * H * 1 * 2, use_bias=False, name="in_proj_query")(x)
+        # B. Query (RMSNorm importante ici)
+        q_raw = nn.Dense(self.K_q * H * 2, use_bias=False, name="in_proj_query")(x)
         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
-        q_raw = q_raw.reshape(b, l, self.K_q, H, 1, 2)
-        q_re, q_im = q_raw[..., 0], q_raw[..., 1]                      # (B,L,Kq,H,1)
+        q_raw = q_raw.reshape(b, l, self.K_q, H, 1, 2) 
 
-        # ------------------------------------------------------------
-        # 3) Theta (M=1 Optimized Init)
-        # ------------------------------------------------------------
+        # C. Theta (M=1 Optimized Init)
         theta_min, theta_max = 0.001, 3.0
-
         def init_theta_m1(key, shape):
-            # Étalement des fréquences sur les têtes (K)
             grid_k = np.geomspace(theta_min, theta_max, self.K).reshape(1, 1, self.K, 1, 1)
             base = np.tile(grid_k, (1, 1, 1, shape[3], 1))
-            # Inverse Sigmoid approx pour l'init
             u = (base - theta_min) / max(theta_max - theta_min, 1e-6)
             u = np.clip(u, 1e-4, 1 - 1e-4)
-            raw = np.log(u) - np.log(1 - u)
-            return jnp.array(raw, dtype=jnp.float32)
+            return jnp.array(np.log(u) - np.log(1 - u), dtype=jnp.float32)
 
         theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
         theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
 
-        # ------------------------------------------------------------
-        # 4) Decay (p_w)
-        # ------------------------------------------------------------
+        # D. Decay (p_w)
         pos = jnp.arange(l, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
@@ -114,171 +97,174 @@ class SeqCondAttention(nn.Module):
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
             dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
             log_w_list.append(-slopes * dist[None, :, None, None])
-
         if self.num_anchor_heads > 0:
             a_slopes = self.param("anchor_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1), (self.num_anchor_heads,))
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
             log_w_list.append(-slopes_a * pos[None, :, None, None])
-
+            
         log_time_weight = (jnp.concatenate(log_w_list, axis=2) if log_w_list else jnp.zeros((1, l, self.K, 1), jnp.float32))
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw.astype(jnp.float32), -20., 20.)
-        p_w = jnp.exp(log_p + log_time_weight)                          # (B,L,K,1) FP32
+        p_w = jnp.exp(log_p + log_time_weight) 
 
-        # ------------------------------------------------------------
-        # 5) Precompute Inputs for Scan (Avec TANH SCALE)
-        # ------------------------------------------------------------
-        
-        # A. Learnable Tanh Scale (Nouveau)
-        # Permet de contrôler la sensibilité de la rotation à l'amplitude de k
+        # E. Préparation des Skips & Gates (MatMul globaux optimisés)
+        # DeepSeek Latent Skip
+        c_skip = nn.Dense(latent_dim, use_bias=False, name="skip_down")(x)
+        y_direct_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
+        y_direct_raw = y_direct_raw.reshape(b, l, self.K, dim_swiglu_per_head)
+
+        # Spectral Gate Logits
+        gate_proj_w = self.param("gate_proj_w", nn.initializers.zeros, (d_model, self.K))
+        gate_proj_b = self.param("gate_proj_b", nn.initializers.constant(-3.0), (self.K,))
+        spec_gate_logits = jnp.dot(x, gate_proj_w) + gate_proj_b
+
+        # Tanh Scale Param
         tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
-        tanh_scale_broad = tanh_scale[None, None, :, None, None] # (1, 1, K, 1)
-        
-        # B. Modulation
-        k_val_float = k_val.astype(jnp.float32)
-        # "Cheap Norm" via Tanh scalé : préserve la non-linéarité
-        phi = jnp.tanh(k_val_float * tanh_scale_broad) * theta
-        
-        # C. Amplitude-Phase Coupling
-        # On garde l'amplitude brute k_val pour que les tokens forts pèsent lourd
-        kvw = k_val_float[..., None] * p_w[..., None]
-
-        re_in = (kvw * jnp.cos(phi))[..., 0]                             # (B,L,K,H)
-        im_in = (kvw * jnp.sin(phi))[..., 0]                             # (B,L,K,H)
-        den_in = p_w[..., 0]                                             # (B,L,K)
-        
-        # FORCE FP32 pour le scan (Sécurité absolue)
-        den_in = den_in.astype(jnp.float32)
-        re_in = re_in.astype(jnp.float32)
-        im_in = im_in.astype(jnp.float32)
+        tanh_scale_broad = tanh_scale[None, None, :, None] # (1, 1, K, 1)
 
         # ------------------------------------------------------------
-        # 6) STREAMING SCAN (Chunked + Flash Readout)
+        # 2. DÉFINITION DES POIDS MANUELS (Pour usage interne Scan)
         # ------------------------------------------------------------
-        C = self.chunk_size
+        # On définit les poids ici pour les utiliser dans 'step'
+        W_readout = self.param("W_readout", nn.initializers.glorot_uniform(), (self.K, 2 * H, dim_swiglu_per_head))
+        scale_readout = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H))
+        highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
+        
+        # W_out doit projeter la sortie du SwiGLU aplatie vers d_model
+        W_out = self.param("out_proj_w", nn.initializers.glorot_uniform(), (self.K * dim_expand, d_model)) 
+
+        # ------------------------------------------------------------
+        # 3. CHUNKING & SWAP (Préparation Scan)
+        # ------------------------------------------------------------
+        C = self.seq_chunk
         pad = (-l) % C
         if pad:
-            den_in = jnp.pad(den_in, ((0,0),(0,pad),(0,0)))
-            re_in  = jnp.pad(re_in,  ((0,0),(0,pad),(0,0),(0,0)))
-            im_in  = jnp.pad(im_in,  ((0,0),(0,pad),(0,0),(0,0)))
-            q_re   = jnp.pad(q_re,   ((0,0),(0,pad),(0,0),(0,0),(0,0)))
-            q_im   = jnp.pad(q_im,   ((0,0),(0,pad),(0,0),(0,0),(0,0)))
+            # Helper de padding
+            def p(t, val=0.): 
+                pad_width = ((0,0),(0,pad)) + ((0,0),)*(t.ndim-2)
+                return jnp.pad(t, pad_width, constant_values=val)
+            
+            k_val = p(k_val)
+            p_w   = p(p_w, 0.) # Padding decay à 0 = oubli
+            q_raw = p(q_raw)
+            y_direct_raw = p(y_direct_raw)
+            spec_gate_logits = p(spec_gate_logits, -1e9) # Gate fermée sur padding
             Lp = l + pad
         else:
             Lp = l
-
+        
         n_chunks = Lp // C
 
-        # 1. Reshape en Chunks
-        den_chunks = den_in.reshape(b, n_chunks, C, self.K)
-        re_chunks  = re_in.reshape(b, n_chunks, C, self.K, H)
-        im_chunks  = im_in.reshape(b, n_chunks, C, self.K, H)
-        qre_chunks = q_re.reshape(b, n_chunks, C, self.K_q, H, 1)
-        qim_chunks = q_im.reshape(b, n_chunks, C, self.K_q, H, 1)
+        # Reshape & Swap Axes: (B, L, ...) -> (NC, B, C, ...)
+        def to_chunks(t):
+            sh = t.shape
+            return t.reshape(b, n_chunks, C, *sh[2:]).swapaxes(0, 1)
 
-        # 2. SWAP AXES (Correctif Critique pour lax.scan)
-        # On passe de (B, NC, ...) à (NC, B, ...) pour itérer sur NC
-        den_chunks = den_chunks.swapaxes(0, 1)
-        re_chunks  = re_chunks.swapaxes(0, 1)
-        im_chunks  = im_chunks.swapaxes(0, 1)
-        qre_chunks = qre_chunks.swapaxes(0, 1)
-        qim_chunks = qim_chunks.swapaxes(0, 1)
+        k_chunks = to_chunks(k_val)         # (NC, B, C, K, H)
+        p_chunks = to_chunks(p_w)           # (NC, B, C, K, 1)
+        q_chunks = to_chunks(q_raw)         # (NC, B, C, Kq, H, 1, 2)
+        y_dir_chunks = to_chunks(y_direct_raw) # (NC, B, C, K, SwiGLU)
+        gate_chunks = to_chunks(spec_gate_logits) # (NC, B, C, K)
 
+        # ------------------------------------------------------------
+        # 4. LE KERNEL ULTRA-FUSED
+        # ------------------------------------------------------------
         def step(carry, xs):
             den_c, re_c, im_c = carry
-            den_x, re_x, im_x, qre_x, qim_x = xs
+            k_x, p_x, q_x, y_dir_x, gate_logits_x = xs
+            
+            # --- A. ON-THE-FLY COMPUTATION (SRAM) ---
+            # 1. Modulation & AM-PM Stabilisée
+            k_x_f32 = k_x.astype(jnp.float32)
+            # Tanh scale contrôle la sensibilité
+            phi = jnp.tanh(k_x_f32 * tanh_scale_broad) * theta 
+            
+            # Amplitude (Input Strength) * Decay
+            kvw = k_x_f32[..., None] * p_x[..., None] 
+            
+            re_x = (kvw * jnp.cos(phi))[..., 0]
+            im_x = (kvw * jnp.sin(phi))[..., 0]
+            den_x = p_x[..., 0].astype(jnp.float32)
 
-            # A. Cumsum local + Carry propagation
-            den_ps = jnp.cumsum(den_x, axis=1) + den_c[:, None, :]      # (B,C,K)
-            re_ps  = jnp.cumsum(re_x,  axis=1) + re_c[:, None, :, :]    # (B,C,K,H)
+            # --- B. SCAN LOCAL ---
+            den_ps = jnp.cumsum(den_x, axis=1) + den_c[:, None, :]
+            re_ps  = jnp.cumsum(re_x,  axis=1) + re_c[:, None, :, :]
             im_ps  = jnp.cumsum(im_x,  axis=1) + im_c[:, None, :, :]
 
-            # B. Normalisation (Division)
+            # --- C. READOUT (FUSED) ---
             inv_den = 1.0 / jnp.maximum(den_ps, 1e-4)
-            state_re = re_ps * inv_den[..., None]                       # (B,C,K,H)
+            state_re = re_ps * inv_den[..., None]
             state_im = im_ps * inv_den[..., None]
 
-            # C. GQA Reshape (Zero-Copy View)
+            # GQA View
             state_re_g = state_re.reshape(b, C, self.K_q, self.n_rep, H)
             state_im_g = state_im.reshape(b, C, self.K_q, self.n_rep, H)
-
-            qre = qre_x[..., 0][:, :, :, None, :]                        # (B,C,Kq,1,H)
-            qim = qim_x[..., 0][:, :, :, None, :]
-
-            # D. Flash Readout (Produit Hermitien immédiat)
-            # On ne stocke jamais le gros 'State' en VRAM, on sort directement l'Output
-            out_re_g = state_re_g * qre + state_im_g * qim               # (B,C,Kq,nrep,H)
-            out_im_g = state_im_g * qre - state_re_g * qim
-
+            
+            q_re = q_x[..., 0]
+            q_im = q_x[..., 1]
+            
+            # Hermitien Product
+            out_re_g = state_re_g * q_re + state_im_g * q_im
+            out_im_g = state_im_g * q_re - state_re_g * q_im
+            
+            # Flatten & Concat -> (B, C, K, 2H)
             out_re = out_re_g.reshape(b, C, self.K, H)
             out_im = out_im_g.reshape(b, C, self.K, H)
+            out_complex = jnp.concatenate([out_re, out_im], axis=-1).astype(self.compute_dtype)
 
-            # E. Carry pour le prochain chunk (Dernier élément)
+            # Projection Readout (Manuel)
+            # (B, C, K, 2H) @ (K, 2H, SwiGLU) -> (B, C, K, SwiGLU)
+            y_spectral_raw = jnp.einsum('bckf,kfn->bckn', out_complex * scale_readout, W_readout)
+            
+            # --- D. FUSION & SWIGLU (FUSED) ---
+            # Input Gating
+            spec_gate = jax.nn.sigmoid(gate_logits_x).astype(self.compute_dtype)[..., None]
+            y_spectral = y_spectral_raw * spec_gate
+
+            # Split Skip (DeepSeek)
+            y_val_dir, y_gate_dir = jnp.split(y_dir_x, 2, axis=-1)
+            y_val_spec, y_gate_spec = jnp.split(y_spectral, 2, axis=-1)
+
+            # Addition (ResNet style)
+            y_val = y_val_spec + y_val_dir * highway_scale
+            y_gate = y_gate_spec + y_gate_dir * highway_scale
+
+            # SwiGLU Activation
+            y_act = y_val * jax.nn.silu(y_gate) # (B, C, K, DimExpand)
+            
+            # --- E. OUTPUT PROJECTION (FUSED) ---
+            # Projection finale directe
+            y_flat = y_act.reshape(b, C, -1) # (B, C, K*DimExpand)
+            out_chunk = jnp.dot(y_flat, W_out) # (B, C, D)
+
+            # Next Carry
             new_carry = (den_ps[:, -1, :], re_ps[:, -1, :, :], im_ps[:, -1, :, :])
-            return new_carry, (out_re, out_im)
+            return new_carry, out_chunk
 
+        # Init Carry
         init = (
             jnp.zeros((b, self.K), dtype=jnp.float32),
             jnp.zeros((b, self.K, H), dtype=jnp.float32),
             jnp.zeros((b, self.K, H), dtype=jnp.float32),
         )
 
-        # Le scan mange les chunks (axe 0 de den_chunks)
-        _, (out_re_chunks, out_im_chunks) = jax.lax.scan(
-            step, init, (den_chunks, re_chunks, im_chunks, qre_chunks, qim_chunks), length=n_chunks
+        # ------------------------------------------------------------
+        # 5. EXECUTION
+        # ------------------------------------------------------------
+        # Le scan mange les chunks (axe 0) et recrache out_chunks (NC, B, C, D)
+        _, out_chunks = jax.lax.scan(
+            step, init, 
+            (k_chunks, p_chunks, q_chunks, y_dir_chunks, gate_chunks), 
+            length=n_chunks
         )
 
-        # 3. SWAP BACK & RESHAPE
-        out_re_chunks = out_re_chunks.swapaxes(0, 1)
-        out_im_chunks = out_im_chunks.swapaxes(0, 1)
-
-        out_re = out_re_chunks.reshape(b, Lp, self.K, H)[:, :l, ...].astype(self.compute_dtype)
-        out_im = out_im_chunks.reshape(b, Lp, self.K, H)[:, :l, ...].astype(self.compute_dtype)
-
-        # ------------------------------------------------------------
-        # 7) Readout / Gating / Skip (Fusion DeepSeek-Style)
-        # ------------------------------------------------------------
+        # 6. RECONSTRUCTION
+        # (NC, B, C, D) -> (B, NC, C, D) -> (B, L, D)
+        out = out_chunks.swapaxes(0, 1).reshape(b, Lp, d_model)[:, :l, :]
         
-        # A. Readout Spectral (Concat Re/Im)
-        out_complex = jnp.concatenate([out_re, out_im], axis=-1)
-        W_readout = self.param("W_readout", nn.initializers.glorot_uniform(), (self.K, 2 * H, dim_swiglu_per_head))
-        scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H))
-        
-        y_spectral_raw = jnp.einsum('blkf,kfn->blkn', out_complex * scale, W_readout)
-
-        # B. Spectral Input Gating
-        gate_proj = nn.Dense(self.K, kernel_init=nn.initializers.zeros,
-                             bias_init=nn.initializers.constant(-3.0),
-                             name="spectral_gate_proj")
-        spectral_gate = jax.nn.sigmoid(gate_proj(x)).astype(self.compute_dtype)[..., None]
-        y_spectral = y_spectral_raw * spectral_gate
-
-        # C. DeepSeek Latent Skip (Low Rank Decorrelated)
-        # Down (D -> D/4)
-        c_skip = nn.Dense(latent_dim, use_bias=False, name="skip_down")(x)
-        # Up (D/4 -> Gate + Value)
-        y_direct_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
-        y_direct = y_direct_raw.reshape(b, l, self.K, dim_swiglu_per_head)
-
-        # D. Fusion (Split & Add)
-        y_val_spec, y_gate_spec = jnp.split(y_spectral, 2, axis=-1)
-        y_val_dir,  y_gate_dir  = jnp.split(y_direct,  2, axis=-1)
-
-        highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
-        
-        # Addition (ResNet style) - Le meilleur des deux mondes
-        y_val = y_val_spec + y_val_dir * highway_scale
-        y_gate = y_gate_spec + y_gate_dir * highway_scale
-
-        # E. SwiGLU Activation
-        y = y_val * jax.nn.silu(y_gate)
-        
-        # F. Output Projection
-        out = nn.Dense(d_model, use_bias=False, name="out_proj")(y.reshape(b, l, -1))
-
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
-        
+            
         return out
 
 
