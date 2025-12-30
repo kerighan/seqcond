@@ -51,6 +51,7 @@ def parse_args():
     grp_train.add_argument("--fsdp", action="store_true", dest="full_shard_data_parallel", help="Enable FSDP")
     grp_train.add_argument("--freeze-thetas", action="store_true", help="Freeze theta parameters")
     grp_train.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+    grp_train.add_argument("--grad-accum-steps", type=int, default=None, help="Number of gradient accumulation steps")
     grp_train.add_argument("--total-steps", type=int, default=None, help="Override total training steps")
     grp_train.add_argument("--save-every-n-steps", type=int, default=None, help="Checkpoint interval")
     grp_train.add_argument("--log-every-n-steps", type=int, default=None, help="Logging interval")
@@ -136,7 +137,8 @@ def get_config(args) -> Config:
     # Map other training args if they are not None
     train_fields = [
         "batch_size", "total_steps", "save_every_n_steps", "log_every_n_steps", 
-        "wandb_project", "prefetch_batches", "base_lr", "generate_every_n_steps"
+        "wandb_project", "prefetch_batches", "base_lr", "generate_every_n_steps",
+        "grad_accum_steps"
     ]
     for field in train_fields:
         val = getattr(args, field)
