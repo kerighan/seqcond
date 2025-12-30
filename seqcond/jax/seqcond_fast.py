@@ -132,7 +132,7 @@ class SeqCondAttention(nn.Module):
         # A. Learnable Tanh Scale (Nouveau)
         # Permet de contrôler la sensibilité de la rotation à l'amplitude de k
         tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
-        tanh_scale_broad = tanh_scale[None, None, :, None] # (1, 1, K, 1)
+        tanh_scale_broad = tanh_scale[None, None, :, None, None] # (1, 1, K, 1)
         
         # B. Modulation
         k_val_float = k_val.astype(jnp.float32)
