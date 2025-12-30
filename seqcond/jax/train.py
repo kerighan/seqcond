@@ -123,6 +123,7 @@ def create_model_from_config(config: ModelConfig):
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
             seqcond_heads=config.seqcond_heads,
+            num_query_heads=config.num_query_heads,
             num_anchor_heads=config.num_anchor_heads,
             num_thetas=config.num_thetas,
             derivative_order=config.derivative_order,

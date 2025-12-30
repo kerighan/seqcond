@@ -177,6 +177,7 @@ class SeqCondModel(nn.Module):
     num_heads: int = 8
     num_kv_heads: Optional[int] = None
     seqcond_heads: Optional[int] = None
+    num_query_heads: int = 6
     num_anchor_heads: int = 0
     num_thetas: int = 4
     derivative_order: int = 0
@@ -242,6 +243,7 @@ class SeqCondModel(nn.Module):
             else:
                 block = SeqBlock(
                     num_heads=_seqcond_heads,
+                    num_query_heads=self.num_query_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
                     derivative_order=self.derivative_order,
@@ -501,6 +503,7 @@ def create_seqcond_model(
     num_heads: int = 8,
     num_kv_heads: Optional[int] = None,
     seqcond_heads: Optional[int] = None,
+    num_query_heads: int = 6,
     num_anchor_heads: int = 0,
     num_thetas: int = 4,
     derivative_order: int = 0,
@@ -526,6 +529,7 @@ def create_seqcond_model(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         seqcond_heads=seqcond_heads,
+        num_query_heads=num_query_heads,
         num_anchor_heads=num_anchor_heads,
         num_thetas=num_thetas,
         derivative_order=derivative_order,

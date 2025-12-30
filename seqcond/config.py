@@ -32,6 +32,7 @@ class ModelConfig:
 
     # SeqCond params
     seqcond_heads: int = 32
+    num_query_heads: int = 6
     num_thetas: int = 4
     derivative_order: int = 0
     num_anchor_heads: int = 0
@@ -85,7 +86,7 @@ class ModelConfig:
             d_ff=960 * 3,
             num_layers=32,
             num_heads=15,
-            seqcond_heads=30,
+            seqcond_heads=15,
             num_kv_heads=5,
             num_thetas=2,
             seqcond_ratio=7,
@@ -101,7 +102,7 @@ class ModelConfig:
             d_ff=1024 * 4,
             num_layers=24,
             num_heads=16,
-            seqcond_heads=64,
+            seqcond_heads=32,
             num_kv_heads=4,
         )
         defaults.update(kwargs)
