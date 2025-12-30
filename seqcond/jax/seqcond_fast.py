@@ -638,7 +638,8 @@ class SeqCondAttention(nn.Module):
         self.M = self.num_thetas
         self.n_rep = self.K // self.K_q
         self.num_decay_heads = self.K - self.num_anchor_heads
-@nn.compact
+
+    @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
         assert self.M == 1, "SeqCondAttentionFast currently implemented for M=1."
 
