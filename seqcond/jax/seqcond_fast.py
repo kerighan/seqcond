@@ -481,17 +481,17 @@ class SeqCondAttention(nn.Module):
         tanh_scale_b = tanh_scale[None, None, :, None, None]
 
         # A. Decay (Log-Space)
-        pos = jnp.arange(l, dtype=jnp.float32)
+        pos = jnp.arange(L, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
-            d_slopes = self.param("decay_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0]))-1), (self.num_decay_heads,))
-            slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1, 1)
-            dist = jnp.maximum(jnp.float32((self.maxlen or l) - 1) - pos, 0.)
-            log_w_list.append(-slopes * dist[None, :, None, None])
+            d_slopes = self.param("decay_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1), (self.num_decay_heads,))
+            slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1)
+            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.)
+            log_w_list.append(-slopes * dist[None, :, None])
         if self.num_anchor_heads > 0:
-            a_slopes = self.param("anchor_slopes", lambda r,s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0]))-1), (self.num_anchor_heads,))
-            slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
-            log_w_list.append(-slopes_a * pos[None, :, None, None])
+            a_slopes = self.param("anchor_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1), (self.num_anchor_heads,))
+            slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1)
+            log_w_list.append(-slopes_a * pos[None, :, None])
             
         log_time_weight = jnp.concatenate(log_w_list, axis=2) if log_w_list else jnp.zeros((1, L, self.K), dtype=jnp.float32)
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
