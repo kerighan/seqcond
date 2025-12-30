@@ -497,7 +497,7 @@ class SeqCondAttention(nn.Module):
 
         # --- DYNAMIC SWITCH ---
         # use_square_matrix = L <= self.matrix_threshold
-        use_square_matrix  True
+        use_square_matrix = True
         if use_square_matrix:
             # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
             
