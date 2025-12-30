@@ -1000,7 +1000,7 @@ class SeqCondBlock(nn.Module):
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None
     derivative_order: Optional[int] = 0
-    chunk_size: int = 0
+    chunk_size: int = 32
 
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
