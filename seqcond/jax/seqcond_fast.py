@@ -487,10 +487,9 @@ class SeqCondAttention(nn.Module):
         p_w = jnp.exp(log_p + log_time_weight)
 
         # B. Modulation & Scan
-        k_val_expand = k_val[..., None]
+        k_val_expand = k_val[..., None, None]
         kvw = k_val_expand * p_w[..., None]
-        tanh_scale_broad = tanh_scale[None, None, :, None]
-        # phi_k = (k_val_expand * theta)
+        tanh_scale_broad = tanh_scale[None, None, :, None, None]
         phi_k = jnp.tanh(tanh_scale_broad * k_val_expand) * theta  # cheap norm
         re_k, im_k = kvw * jnp.cos(phi_k), kvw * jnp.sin(phi_k)
 
