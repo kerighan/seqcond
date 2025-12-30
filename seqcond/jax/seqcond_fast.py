@@ -765,7 +765,7 @@ class SeqCondAttention(nn.Module):
         # ------------------------------------------------------------
         # 6) STREAMING SCAN (Chunked + Flash Readout)
         # ------------------------------------------------------------
-        C = self.seq_chunk
+        C = self.chunk_size
         pad = (-l) % C
         if pad:
             den_in = jnp.pad(den_in, ((0,0),(0,pad),(0,0)))
