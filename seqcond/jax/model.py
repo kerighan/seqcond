@@ -240,7 +240,6 @@ class SeqCondModel(nn.Module):
                 blocks.append(("transformer", block))
                 transformer_idx += 1
             else:
-                print(self.chunk_size)
                 block = SeqBlock(
                     num_heads=_seqcond_heads,
                     num_thetas=self.num_thetas,

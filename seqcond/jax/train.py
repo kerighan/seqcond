@@ -133,6 +133,7 @@ def create_model_from_config(config: ModelConfig):
             qk_norm_eps=config.qk_norm_eps,
             conv_kernel_size=config.conv_kernel_size,
             remat=config.remat,
+            chunk_size=config.chunk_size,
         )
     elif config.model_type == "seqcond2":
         return create_seqcond_model_v2(
