@@ -75,7 +75,8 @@ class SeqCondAttention(nn.Module):
         # B. Query (RMSNorm importante ici)
         q_raw = nn.Dense(self.K_q * H * 2, use_bias=False, name="in_proj_query")(x)
         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
-        q_raw = q_raw.reshape(b, l, self.K_q, H, 1, 2) 
+        # q_raw = q_raw.reshape(b, l, self.K_q, H, 1, 2) 
+        q_raw = q_raw.reshape(b, l, self.K_q, 1, H, 2)
 
         # C. Theta (M=1 Optimized Init)
         theta_min, theta_max = 0.001, 3.0
