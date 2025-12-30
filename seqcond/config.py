@@ -39,7 +39,7 @@ class ModelConfig:
     expand_factor: float = 2.0
     use_positional_embedding: bool = False
     seqcond_ratio: int = 5  # Interleaving ratio
-    chunk_size: int = 0
+    chunk_size: int = 128
 
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
