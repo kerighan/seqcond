@@ -439,7 +439,7 @@ class SeqCondAttention(nn.Module):
             theta = jax.nn.softplus(theta_raw).astype(jnp.float32) + theta_min
             # Poids unitaire
             w_int = jnp.ones((1, 1, self.K, 1, H, 1), dtype=jnp.float32)
-
+            w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
         else:
             # CAS M>1 : Intégrale de Riemann sur M
             def init_theta_deltas(key, shape):
