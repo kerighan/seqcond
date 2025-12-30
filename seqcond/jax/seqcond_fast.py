@@ -378,8 +378,14 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // (self.K * self.M))
         
         # Dimension réelle projetée pour la mémoire
-        memory_dim = self.K * H 
-
+        memory_dim = self.K * H
+        # Dimension flatten des phi'
+        flat_dim = self.K * H * self.M
+        # Expansion du cerveau logique
+        dim_expand = H * self.out_expand_factor
+        dim_swiglu_per_head = dim_expand * 2
+        dim_swiglu_total = self.K * dim_swiglu_per_head
+        latent_dim = d_model // 4   # latent skip
         # =================================================================
         # 1. ENCODAGE MÉMOIRE
         # =================================================================
@@ -409,7 +415,6 @@ class SeqCondAttention(nn.Module):
         # 2. QUERY
         # =================================================================
         q_raw = nn.Dense(self.K_q * H * self.M * 2, use_bias=False, name="in_proj_query")(x)
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(b, l, self.K_q, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -478,19 +483,17 @@ class SeqCondAttention(nn.Module):
         log_time_weight = jnp.concatenate(log_w_list, axis=2)
         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw, -20., 20.)
-        p_w = jnp.exp(log_p + log_time_weight)
+        p_w = jnp.exp(log_p + log_time_weight).astype(self.compute_dtype)
 
         # B. Modulation & Scan
         k_val_expand = k_val[..., None]
-        k_val_norm = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(k_val_expand)
-        phi_k = (k_val_norm * theta)
-        re_k, im_k = k_val_expand * jnp.cos(phi_k), k_val_expand * jnp.sin(phi_k)
+        kvw = k_val_expand * p_w[..., None]
+        phi_k = (k_val_expand * theta)
+        re_k, im_k = kvw * jnp.cos(phi_k), kvw * jnp.sin(phi_k)
 
-        flat_dim = self.K * H * self.M
         den_in = p_w.squeeze(-1)
-        p_w_broad = p_w[..., None]
-        num_re_in = (p_w_broad * re_k).reshape(b, l, flat_dim)
-        num_im_in = (p_w_broad * im_k).reshape(b, l, flat_dim)
+        num_re_in = re_k.reshape(b, l, flat_dim)
+        num_im_in = im_k.reshape(b, l, flat_dim)
         
         merged = jnp.concatenate([den_in, num_re_in, num_im_in], axis=-1)
         if self.chunk_size > 0:
@@ -499,10 +502,8 @@ class SeqCondAttention(nn.Module):
             cumsum = jnp.cumsum(merged, axis=1)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
-        # Normalisation
-        inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
-        
         # State: (B, L, K, H, M)
+        inv_den = 1.0 / jnp.maximum(den[..., None], 1e-4)
         state_re = (num_re.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
         state_im = (num_im.reshape(b, l, self.K, H, self.M) * inv_den[..., None])
 
@@ -525,10 +526,9 @@ class SeqCondAttention(nn.Module):
         # 3. Produit Hermitien (Broadcasting automatique sur n_rep)
         match_re = state_re_g * q_re_g + state_im_g * q_im_g
         match_im = state_im_g * q_re_g - state_re_g * q_im_g
-        
+
         # 4. Intégrale pondérée par w_int
         # w_int est (1, 1, 1, 1, M). Le broadcast fonctionne car il aligne la droite (M).
-        
         # Somme sur M (Dernier axe)
         # Résultat : (B, L, K', n_rep, H)
         out_re_g = jnp.sum(match_re * w_int_g, axis=-1) 
@@ -540,20 +540,14 @@ class SeqCondAttention(nn.Module):
         out_im = out_im_g.reshape(b, l, self.K, H)
 
         # =================================================================
-        # 5. READOUT + SKIP CONNECTION (HIGHWAY)
-        # =================================================================
-        
-        # Expansion du cerveau logique
-        dim_expand = H * self.out_expand_factor
-        dim_swiglu = dim_expand * 2
-        
+        # 5. READOUT/SWIGLU + SKIP CONNECTION (HIGHWAY)
+        # =================================================================        
         # --- A. Chemin Spectral (Scan) ---
         # Readout indépendant par tête (Einsum)
-        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
-        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu))
+        W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu_per_head))
+        W_im = self.param("W_im", nn.initializers.glorot_uniform(), (self.K, H, dim_swiglu_per_head))
         scale = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, H))
-
-        # --- DYNAMIC GATING (Le changement est ici) ---
+        # --- DYNAMIC GATING ---
         # Au lieu d'un paramètre scalaire, on apprend une projection depuis x
         # On projette vers K (une gate par tête) pour être économe.
         # On initialise le bias à -3.0 pour fermer la porte au début.
@@ -563,71 +557,36 @@ class SeqCondAttention(nn.Module):
         spectral_gate = jax.nn.sigmoid(gate_proj(x)).astype(self.compute_dtype)
         # On reshape pour broadcaster sur la dimension SwiGLU: (B, L, K, 1)
         spectral_gate = spectral_gate[..., None]
-
-        out_re_scaled = out_re * scale
-        out_im_scaled = out_im * scale
-        
-        y_re = jnp.einsum('blkh,khn->blkn', out_re_scaled, W_re)
-        y_im = jnp.einsum('blkh,khn->blkn', out_im_scaled, W_im)
-        
-        # (B, L, K, dim_swiglu)
+        y_re = jnp.einsum('blkh,khn->blkn', out_re * scale, W_re)
+        y_im = jnp.einsum('blkh,khn->blkn', out_im * scale, W_im)
+        # (B, L, K, dim_swiglu_per_head)
         y_spectral = (y_re + y_im) * spectral_gate
 
         # --- B. Chemin Direct (Skip Connection) - NOUVEAU ---
-        # On projette x directement vers la dimension du SwiGLU.
-        # Cela donne au MLP un accès direct au token courant, comme un Transformer.
-        # Dimension totale = K * dim_swiglu
-        
-        total_swiglu_dim = self.K * dim_swiglu
-        # y_direct = nn.Dense(total_swiglu_dim, use_bias=False, name="skip_proj")(x)
-        # y_direct = y_direct.reshape(b, l, self.K, dim_swiglu)
-        # =================================================================
-        # B. CHEMIN DIRECT (ALIGNED BROADCAST SKIP)
-        # =================================================================
-        # On garde expand_factor=3 (Puissance) mais on optimise le Skip.
-        
-        # 1. ALIGNEMENT (Le "Low Rank" intelligent)
-        # On projette x dans un espace de même taille (ou légèrement différent)
-        # pour l'orienter correctement avant duplication.
-        # Coût : 1 D^2 (négligeable comparé aux 6 D^2 du full skip)
-        
-        align_dim = d_model 
-        x_aligned = nn.Dense(align_dim, use_bias=False, name="skip_align")(x)
-        
-        # 2. TILING (Expansion gratuite)
-        # On cible la VALUE du SwiGLU (dim_expand) pour l'injection
-        # Rappel : dim_swiglu = 2 * dim_expand (Gate + Value)
-        dim_val = dim_expand 
-        total_val_dim = self.K * dim_val
-        
-        # Combien de fois faut-il répéter x_aligned ?
-        n_repeats = (total_val_dim + align_dim - 1) // align_dim
-        
-        # Tile & Slice
-        y_direct_flat = jnp.tile(x_aligned, (1, 1, n_repeats))
-        y_direct_flat = y_direct_flat[..., :total_val_dim]
-        
-        # Reshape (B, L, K, dim_val)
-        y_direct = y_direct_flat.reshape(b, l, self.K, dim_val)
+        # Down-Project (Compression)
+        c_skip = nn.Dense(latent_dim, use_bias=False, name="skip_down")(x)
+        # Up-Project (Expansion)
+        y_direct_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
+        y_direct_raw = y_direct_raw.reshape(b, l, self.K, dim_swiglu_per_head)
 
-        # --- FUSION ---
-        # 1. Split Spectral (Gate / Value)
-        # y_spectral est (B, L, K, dim_swiglu) -> 2 * (B, L, K, dim_val)
-        y_val, y_gate = jnp.split(y_spectral, 2, axis=-1)
-        
-        # 2. Injection dans la VALUE
-        # On ajoute un scale pour que l'init soit douce
+        # =================================================================
+        # 3. FUSION (ADDITION PURE)
+        # =================================================================
+        # On splitte les deux branches en Gate/Value
+        y_val_spec, y_gate_spec = jnp.split(y_spectral, 2, axis=-1)
+        y_val_direct, y_gate_direct = jnp.split(y_direct_raw, 2, axis=-1)
+        # On peut scaler le skip pour un démarrage doux (optionnel)
         highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
-        
-        y_val_mixed = y_val + (y_direct * highway_scale)
-        y_activated = y_val_mixed * jax.nn.silu(y_gate)
-        
+        # Value = Contenu mémoriel + Contenu actuel
+        y_val_fused = y_val_spec + (y_val_direct * highway_scale)
+        # Gate = Commande mémorielle + Commande actuelle
+        y_gate_fused = y_gate_spec + (y_gate_direct * highway_scale)        
+        # SwiGLU Activation
+        y_activated = y_val_fused * jax.nn.silu(y_gate_fused)
         # Flatten
         y_flat = y_activated.reshape(b, l, -1) 
-
         # Projection Finale
         out = nn.Dense(d_model, use_bias=False, name="out_proj")(y_flat)
-
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
         
@@ -740,7 +699,7 @@ class SeqCondAttention(nn.Module):
 #         # =================================================================
         
 #         dim_expand = H * self.out_expand_factor
-#         dim_swiglu = dim_expand * 2
+#         dim_swiglu_per_head = dim_expand * 2
 #         input_dim = H * self.M 
         
 #         W_re = self.param("W_re", nn.initializers.glorot_uniform(), (self.K, input_dim, dim_swiglu))
