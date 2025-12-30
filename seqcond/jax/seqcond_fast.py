@@ -425,10 +425,6 @@ class SeqCondAttention(nn.Module):
         theta_min, theta_max = 0.001, 3.0
 
         if self.M == 1:
-            # --- CAS OPTIMISÉ M=1 (Single Frequency per Head) ---
-            # Ici, on veut que chaque tête (K) capture une fréquence différente.
-            # Pas d'intégrale, pas de cumsum. Juste un paramètre par tête.
-            
             def init_theta_m1(key, shape):
                 # shape: (1, 1, K, H, 1)
                 # 1. On crée une gamme géométrique étalée sur les K têtes
@@ -521,7 +517,7 @@ class SeqCondAttention(nn.Module):
             cumsum = cumsum_chunked(merged, axis=1, chunk=self.chunk_size)
         else:
             cumsum = jnp.cumsum(merged, axis=1)
-        cumsum = cumsum.astype(self.compute_dtype)
+        # cumsum = cumsum.astype(self.compute_dtype)
         den, num_re, num_im = jnp.split(cumsum, [self.K, self.K + flat_dim], axis=-1)
         
         # State: (B, L, K, H, M)
