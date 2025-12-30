@@ -58,7 +58,7 @@ def parse_args():
     grp_train.add_argument("--generate-every-n_steps", type=int, default=None, help="Generation sample interval")
     grp_train.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     grp_train.add_argument("--prefetch-batches", type=int, default=None, help="Number of batches to prefetch")
-    grp_train.add_argument("--lr", type=float, default=None, dest="base_lr", help="Override learning rate")
+    grp_train.add_argument("--lr", type=float, default=1e-3, dest="base_lr", help="Learning rate (supports scientific notation like 1e-3, 6e-4)")
     grp_train.add_argument("--no-remat", action="store_true", help="Disable gradient checkpointing (rematerialization)")
 
     return parser.parse_args()
