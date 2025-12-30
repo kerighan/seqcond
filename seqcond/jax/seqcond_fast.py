@@ -340,6 +340,8 @@ class SeqCondAttention(nn.Module):
     maxlen: Optional[int] = None
     chunk_size: int = 0
 
+    use_square_matrix: bool = False
+
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
@@ -497,8 +499,7 @@ class SeqCondAttention(nn.Module):
 
         # --- DYNAMIC SWITCH ---
         # use_square_matrix = L <= self.matrix_threshold
-        use_square_matrix = True
-        if use_square_matrix:
+        if self.use_square_matrix:
             # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
             
             # Causal Mask (L, L)
@@ -858,6 +859,7 @@ class SeqCondBlock(nn.Module):
     maxlen: Optional[int] = None
     derivative_order: Optional[int] = 0
     chunk_size: int = 32
+    use_square_matrix: bool = False
 
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
@@ -875,6 +877,7 @@ class SeqCondBlock(nn.Module):
             dropout=self.dropout,
             maxlen=self.maxlen,
             chunk_size=self.chunk_size,
+            use_square_matrix=self.use_square_matrix,
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(h, mask=mask, deterministic=deterministic)

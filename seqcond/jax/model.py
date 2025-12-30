@@ -190,6 +190,7 @@ class SeqCondModel(nn.Module):
     expand_factor: float = 2.0
     remat: bool = True
     chunk_size: int = 0
+    use_square_matrix: bool = False
 
     def setup(self):
         _seqcond_heads = (
@@ -253,6 +254,7 @@ class SeqCondModel(nn.Module):
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
                     chunk_size=self.chunk_size,
+                    use_square_matrix=self.use_square_matrix,
                 )
                 blocks.append(("seqcond", block))
                 seqcond_idx += 1
@@ -516,6 +518,7 @@ def create_seqcond_model(
     expand_factor: float = 2.0,
     remat: bool = True,
     chunk_size: int = 0,
+    use_square_matrix: bool = False,
 ) -> SeqCondModel:
     """Create a SeqCond model."""
     return SeqCondModel(
@@ -542,6 +545,7 @@ def create_seqcond_model(
         expand_factor=expand_factor,
         remat=remat,
         chunk_size=chunk_size,
+        use_square_matrix=use_square_matrix,
     )
 
 

@@ -41,6 +41,7 @@ class ModelConfig:
     use_positional_embedding: bool = False
     seqcond_ratio: int = 5  # Interleaving ratio
     chunk_size: int = 128
+    use_square_matrix: bool = False
 
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
