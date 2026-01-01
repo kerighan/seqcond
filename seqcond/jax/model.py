@@ -462,6 +462,7 @@ class MambaModel(nn.Module):
             num_embeddings=self.vocab_size,
             features=self.d_model,
             name="token_embedding",
+            embedding_init=nn.initializers.normal(stddev=0.02),
         )
 
         # Mamba generally handles position via SSM, but if we mix Transformer,

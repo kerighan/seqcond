@@ -18,31 +18,26 @@ def _pad_seq_dim(x: jnp.ndarray, pad_size: int) -> jnp.ndarray:
 
 def segsum(x: jnp.ndarray) -> jnp.ndarray:
     """
-    More stable segment sum calculation.
-
-    Input:
-        x: (..., T)
-    Output:
-        x_segsum: (..., T, T)
+    Stable segment sum calculation using broadcasting.
+    Computes sum_{k=j+1}^i x_k.
     """
     T = x.shape[-1]
-
-    # Repeat over a new trailing axis
-    x_rep = repeat(x, "... d -> ... d e", e=T)  # (..., T, T)
-
-    # Mask lower-triangular (strict) for the partial sums
-    mask_lower = jnp.tril(jnp.ones((T, T), dtype=bool), k=-1)
-    x_rep = jnp.where(mask_lower, x_rep, 0.0)
-
-    # Cumulative sum over the 'd' axis (second-to-last)
-    x_segsum = jnp.cumsum(x_rep, axis=-2)
-
-    # Keep only lower triangle (including diagonal), -inf elsewhere
-    mask_diag = jnp.tril(jnp.ones((T, T), dtype=bool), k=0)
-    neg_inf = jnp.array(-jnp.inf, dtype=x_segsum.dtype)
-    x_segsum = jnp.where(mask_diag, x_segsum, neg_inf)
-
-    return x_segsum
+    
+    # Cumulative sum
+    cs = jnp.cumsum(x, axis=-1)
+    
+    # Difference: cs[i] - cs[j] = sum_{k=j+1}^i x_k
+    # Shape (..., T, 1) - (..., 1, T) -> (..., T, T)
+    # Using float32 for stability
+    cs = cs.astype(jnp.float32)
+    
+    diff = cs[..., :, None] - cs[..., None, :]
+    
+    # Mask: keep lower triangle (including diagonal)
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool), k=0)
+    neg_inf = jnp.array(-jnp.inf, dtype=diff.dtype)
+    
+    return jnp.where(mask, diff, neg_inf)
 
 
 def ssd_naive(
