@@ -70,6 +70,16 @@ def ssd_naive(
         y:          (batch_size, seq_len, num_heads, head_dim)
         final_state (optional): (batch_size, num_heads, head_dim, ssm_state_size)
     """
+    # Force float32 for SSM stability
+    dtype_in = x.dtype
+    x = x.astype(jnp.float32)
+    dt = dt.astype(jnp.float32)
+    A = A.astype(jnp.float32)
+    B_mat = B_mat.astype(jnp.float32)
+    C_mat = C_mat.astype(jnp.float32)
+    if initial_states is not None:
+        initial_states = initial_states.astype(jnp.float32)
+
     B_size, seq_len, num_heads, head_dim = x.shape
 
     # Padding size for equal-sized chunks
@@ -88,7 +98,7 @@ def ssd_naive(
     L_pad = x_padded.shape[1]
 
     # D residual
-    D_residual = D.reshape(1, 1, num_heads, 1) * x_padded  # (B, L_pad, H, P)
+    D_residual = D.reshape(1, 1, num_heads, 1).astype(jnp.float32) * x_padded  # (B, L_pad, H, P)
 
     # Discretize x and A
     x_disc = x_padded * dt_padded[..., None]               # (B, L_pad, H, P)
@@ -171,6 +181,6 @@ def ssd_naive(
         y = y[:, :seq_len, :, :]
 
     if return_final_states:
-        return y, final_state
+        return y.astype(dtype_in), final_state.astype(dtype_in)
     else:
-        return y, None
+        return y.astype(dtype_in), None
