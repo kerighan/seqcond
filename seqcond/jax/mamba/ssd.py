@@ -108,7 +108,7 @@ def ssd_naive(
     A_cumsum = jnp.cumsum(A_blk2, axis=-1)              # (B, H, Ck, Lc)
 
     # 1. Intra-chunk (diagonal blocks)
-    L_mat = jnp.exp(segsum(A_cumsum))                   # (B, H, Ck, Lc, Lc)
+    L_mat = jnp.exp(segsum(A_blk2))                   # (B, H, Ck, Lc, Lc)
 
     # C_blk: (B, Ck, Lc, H, N) -> b c l h n
     # B_blk: (B, Ck, Lc, H, N) -> b c s h n
