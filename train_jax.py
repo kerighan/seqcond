@@ -71,6 +71,10 @@ args = parse_args()
 
 import jax
 
+if args.model_type == "mamba":
+    print("Enabling float32 matmul precision for Mamba stability")
+    jax.config.update("jax_default_matmul_precision", "float32")
+
 jax.distributed.initialize()
 
 # Now import application modules
