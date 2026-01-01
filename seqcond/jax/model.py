@@ -10,7 +10,7 @@ import numpy as np
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 from .seqcond_fast import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
-from .mamba.mamba import Mamba2Block
+from .mamba.mamba import Mamba2Block, Mamba2RMSNorm
 from .mamba.config import Mamba2Config
 from .weight_tied_dense import WeightTiedDense
 from .bivector import TransformerDecoderBlock as BivectorBlock
@@ -519,6 +519,8 @@ class MambaModel(nn.Module):
 
         self.blocks = blocks
 
+        self.norm_f = Mamba2RMSNorm(hidden_size=self.d_model, eps=self.qk_norm_eps)
+
         if self.tie_weights:
             self.output_projection = WeightTiedDense(
                 vocab_size=self.vocab_size,
@@ -552,6 +554,8 @@ class MambaModel(nn.Module):
                 # Mamba block: returns (hidden_states, last_state)
                 # We discard last_state during training/simple forward
                 x, _ = block(x)
+
+        x = self.norm_f(x)
 
         if self.tie_weights:
             logits = self.output_projection(x, self.embedding.embedding)
