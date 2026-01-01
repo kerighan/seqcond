@@ -10,6 +10,8 @@ import numpy as np
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 from .seqcond_fast import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
+from .mamba.mamba import Mamba2Block
+from .mamba.config import Mamba2Config
 from .weight_tied_dense import WeightTiedDense
 from .bivector import TransformerDecoderBlock as BivectorBlock
 
@@ -432,6 +434,132 @@ class SeqCondModelV2(nn.Module):
         return logits
 
 
+class MambaModel(nn.Module):
+    """Mamba model mixed with Transformer layers."""
+    d_model: int = 768
+    d_ff: int = 2304
+    num_layers: int = 12
+    vocab_size: int = 100300
+    maxlen: int = 1024
+    use_positional_embedding: bool = False
+    seqcond_ratio: int = 5
+    num_heads: int = 8
+    num_kv_heads: Optional[int] = None
+
+    # Mamba specific
+    state_size: int = 128
+    expand_factor: float = 2.0
+    conv_kernel_size: int = 4
+
+    dropout: float = 0.0
+    tie_weights: bool = True
+    qk_norm: bool = False
+    qk_norm_eps: float = 1e-6
+    remat: bool = True
+
+    def setup(self):
+        self.embedding = nn.Embed(
+            num_embeddings=self.vocab_size,
+            features=self.d_model,
+            name="token_embedding",
+        )
+
+        # Mamba generally handles position via SSM, but if we mix Transformer,
+        # the Transformer layers need position info (RoPE).
+        # We precompute RoPE frequencies for the Transformer layers.
+        self.cos_emb, self.sin_emb = precompute_freqs(
+            self.maxlen, self.d_model // self.num_heads
+        )
+
+        TransformerBlock = TransformerDecoderBlock
+        MBlock = Mamba2Block
+
+        if self.remat:
+            TransformerBlock = nn.remat(TransformerBlock)
+            MBlock = nn.remat(MBlock)
+
+        # Mamba configuration
+        mamba_config = Mamba2Config(
+            hidden_size=self.d_model,
+            state_size=self.state_size,
+            expand=int(self.expand_factor),
+            conv_kernel=self.conv_kernel_size,
+            vocab_size=self.vocab_size,
+            num_hidden_layers=self.num_layers,
+            # Use defaults for other Mamba params or expose them if needed
+        )
+
+        blocks = []
+        transformer_idx = 0
+        mamba_idx = 0
+
+        for i in range(self.num_layers):
+            if (i + 1) % (self.seqcond_ratio + 1) == 0:
+                block = TransformerBlock(
+                    d_model=self.d_model,
+                    num_heads=self.num_heads,
+                    d_ff=self.d_ff,
+                    num_kv_heads=self.num_kv_heads,
+                    dropout=self.dropout,
+                    qk_norm=self.qk_norm,
+                    qk_norm_eps=self.qk_norm_eps,
+                    name=f"transformer_block_{transformer_idx}",
+                )
+                blocks.append(("transformer", block))
+                transformer_idx += 1
+            else:
+                block = MBlock(
+                    config=mamba_config,
+                    layer_idx=i,
+                    name=f"mamba_block_{mamba_idx}",
+                )
+                blocks.append(("mamba", block))
+                mamba_idx += 1
+
+        self.blocks = blocks
+
+        if self.tie_weights:
+            self.output_projection = WeightTiedDense(
+                vocab_size=self.vocab_size,
+                use_bias=False,
+                name="output_projection",
+            )
+        else:
+            self.output_projection = nn.Dense(
+                self.vocab_size,
+                use_bias=False,
+                name="output_projection",
+            )
+
+    def __call__(
+        self,
+        inputs: jnp.ndarray,
+        deterministic: bool = True,
+    ) -> jnp.ndarray:
+        b, l = inputs.shape
+        mask = inputs != 0
+
+        x = self.embedding(inputs)
+
+        # RoPE embeddings for Transformer layers
+        cos, sin = get_rope_embeddings(l, self.cos_emb, self.sin_emb, b, self.num_heads)
+
+        for block_type, block in self.blocks:
+            if block_type == "transformer":
+                x = block(x, cos=cos, sin=sin, mask=mask, deterministic=deterministic)
+            else:
+                # Mamba block: returns (hidden_states, last_state)
+                # We discard last_state during training/simple forward
+                x, _ = block(x)
+
+        if self.tie_weights:
+            logits = self.output_projection(x, self.embedding.embedding)
+        else:
+            logits = self.output_projection(x)
+
+        return logits
+
+
 def create_transformer_model(
     d_model: int = 256,
     d_ff: int = 768,
@@ -590,6 +718,45 @@ def create_seqcond_model_v2(
         qk_norm_eps=qk_norm_eps,
         conv_kernel_size=conv_kernel_size,
         expand_factor=expand_factor,
+        remat=remat,
+    )
+
+
+def create_mamba_model(
+    d_model: int = 768,
+    d_ff: int = 2304,
+    num_layers: int = 12,
+    vocab_size: int = 100300,
+    maxlen: int = 1024,
+    seqcond_ratio: int = 5,
+    num_heads: int = 8,
+    num_kv_heads: Optional[int] = None,
+    state_size: int = 128,
+    expand_factor: float = 2.0,
+    conv_kernel_size: int = 4,
+    dropout: float = 0.0,
+    tie_weights: bool = True,
+    qk_norm: bool = False,
+    qk_norm_eps: float = 1e-6,
+    remat: bool = True,
+) -> MambaModel:
+    """Create a Mamba model."""
+    return MambaModel(
+        d_model=d_model,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        vocab_size=vocab_size,
+        maxlen=maxlen,
+        seqcond_ratio=seqcond_ratio,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        state_size=state_size,
+        expand_factor=expand_factor,
+        conv_kernel_size=conv_kernel_size,
+        dropout=dropout,
+        tie_weights=tie_weights,
+        qk_norm=qk_norm,
+        qk_norm_eps=qk_norm_eps,
         remat=remat,
     )
 

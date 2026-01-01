@@ -20,6 +20,7 @@ from jax.experimental.pjit import pjit
 from .model import (
     create_seqcond_model,
     create_seqcond_model_v2,
+    create_mamba_model,
     create_transformer_model,
     create_bivector_model,
     create_optimizer,
@@ -157,6 +158,25 @@ def create_model_from_config(config: ModelConfig):
             qk_norm=config.qk_norm,
             qk_norm_eps=config.qk_norm_eps,
             conv_kernel_size=config.conv_kernel_size,
+            remat=config.remat,
+        )
+    elif config.model_type == "mamba":
+        return create_mamba_model(
+            d_model=config.d_model,
+            d_ff=config.d_ff,
+            num_layers=config.num_layers,
+            vocab_size=config.vocab_size,
+            maxlen=config.maxlen,
+            seqcond_ratio=config.seqcond_ratio,
+            num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            state_size=config.state_size,
+            expand_factor=config.expand_factor,
+            conv_kernel_size=config.conv_kernel_size,
+            dropout=config.dropout,
+            tie_weights=config.tie_weights,
+            qk_norm=config.qk_norm,
+            qk_norm_eps=config.qk_norm_eps,
             remat=config.remat,
         )
     else:
@@ -929,36 +949,36 @@ class Trainer:
             if metrics_batch is not None:
                 metrics.update_with_precomputed(metrics_batch)
 
-            # Logging, Generation, Checkpointing
-            if macro_step > 0 and macro_step % tc.log_every_n_steps == 0:
-                if using_tf_data:
-                    tokens_delta = tokens_seen - last_tokens_seen
-                    last_tokens_seen = tokens_seen
-                    current_tokens_seen = tokens_seen
-                else:
-                    tokens_delta = self.data_loader.tokens_since_last_check()
-                    current_tokens_seen = self.data_loader.tokens_seen
+                # Logging, Generation, Checkpointing
+                if macro_step > 0 and macro_step % tc.log_every_n_steps == 0:
+                    if using_tf_data:
+                        tokens_delta = tokens_seen - last_tokens_seen
+                        last_tokens_seen = tokens_seen
+                        current_tokens_seen = tokens_seen
+                    else:
+                        tokens_delta = self.data_loader.tokens_since_last_check()
+                        current_tokens_seen = self.data_loader.tokens_seen
 
-                last_log_time = self._log_progress(
-                    macro_step,
-                    tc.total_steps,
-                    metrics,
-                    start_time,
-                    last_log_time,
-                    tokens_delta,
-                    current_tokens_seen,
-                )
-                metrics.reset()
+                    last_log_time = self._log_progress(
+                        macro_step,
+                        tc.total_steps,
+                        metrics,
+                        start_time,
+                        last_log_time,
+                        tokens_delta,
+                        current_tokens_seen,
+                    )
+                    metrics.reset()
 
-            if macro_step > 0 and macro_step % tc.generate_every_n_steps == 0:
-                self._generate_sample(macro_step)
+                if macro_step > 0 and macro_step % tc.generate_every_n_steps == 0:
+                    self._generate_sample(macro_step)
 
-            if (
-                macro_step > 0
-                and tc.save_every_n_steps > 0
-                and macro_step % tc.save_every_n_steps == 0
-            ):
-                self._save_checkpoint(macro_step)
+                if (
+                    macro_step > 0
+                    and tc.save_every_n_steps > 0
+                    and macro_step % tc.save_every_n_steps == 0
+                ):
+                    self._save_checkpoint(macro_step)
 
         print("\nTraining complete!")
         self._save_checkpoint(macro_step, final=True)

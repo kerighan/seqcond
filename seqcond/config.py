@@ -12,7 +12,7 @@ class ModelConfig:
     """Configuration for model architecture."""
 
     # Model type
-    model_type: Literal["transformer", "seqcond", "bivector"] = "seqcond"
+    model_type: Literal["transformer", "seqcond", "bivector", "mamba"] = "seqcond"
 
     # Core architecture
     d_model: int = 768
@@ -43,6 +43,9 @@ class ModelConfig:
     chunk_size: int = 128
     use_square_matrix: bool = False
 
+    # Mamba params
+    state_size: int = 128
+
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
         return asdict(self)
@@ -59,6 +62,9 @@ class ModelConfig:
             base += f"-th{self.num_heads}-sh{self.seqcond_heads}"
             base += f"-m{self.num_thetas}-r{self.seqcond_ratio}"
             base += f"-o{self.derivative_order}-a{self.num_anchor_heads}"
+        elif self.model_type == "mamba":
+            base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
+            base += f"-s{self.state_size}-r{self.seqcond_ratio}"
         else:
             base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
         return base
