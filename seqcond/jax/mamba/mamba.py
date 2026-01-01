@@ -120,14 +120,20 @@ class Mamba2Mixer(nn.Module):
         # dt bias parameter (num_heads,)
         def init_dt_bias(key, shape):
             low, high = cfg.time_step_min, cfg.time_step_max
+            # Safety against NaN/Inf
+            low = max(low, 1e-4)
+            
             floor = cfg.time_step_floor
             u = jax.random.uniform(key, shape)
             log_min = jnp.log(low)
             log_max = jnp.log(high)
             dt = jnp.exp(u * (log_max - log_min) + log_min)
             dt = jnp.maximum(dt, floor)
-            # inverse softplus: x = y + log(-expm1(-y))
-            inv_dt = dt + jnp.log(-jnp.expm1(-dt))
+            
+            # Inverse softplus safety
+            # Clip dt to reasonable range for inverse softplus stability
+            dt_safe = jnp.clip(dt, 1e-4, 1e2)
+            inv_dt = dt_safe + jnp.log(-jnp.expm1(-dt_safe))
             return inv_dt.astype(jnp.float32)
 
         self.dt_bias = self.param("dt_bias", init_dt_bias, (cfg.num_heads,))

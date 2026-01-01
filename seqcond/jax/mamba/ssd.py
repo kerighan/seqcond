@@ -35,7 +35,8 @@ def segsum(x: jnp.ndarray) -> jnp.ndarray:
     
     # Mask: keep lower triangle (including diagonal)
     mask = jnp.tril(jnp.ones((T, T), dtype=bool), k=0)
-    neg_inf = jnp.array(-jnp.inf, dtype=diff.dtype)
+    # Use -1e9 instead of -inf to avoid NaNs in XLA
+    neg_inf = jnp.array(-1e9, dtype=diff.dtype)
     
     return jnp.where(mask, diff, neg_inf)
 
