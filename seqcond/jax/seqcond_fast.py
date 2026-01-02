@@ -584,7 +584,7 @@ class SeqCondAttention(nn.Module):
         y_val = y_spec_val + (y_skip_val * highway_scale)
         y_gate = y_spec_gate + (y_skip_gate * highway_scale)
         
-        y_act = y_val * jax.nn.silu(y_gate)
+        y_act = y_val * jax.nn.sigmoid(y_gate)
         
         y_flat = y_act.reshape(B, L, -1)
         out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
