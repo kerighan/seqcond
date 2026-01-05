@@ -42,8 +42,23 @@ def get_rope_embeddings(
 
 
 def apply_rope(tensor: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
-    """Apply rotary positional embedding to tensor."""
+    """Apply rotary positional embedding to tensor.
+
+    Automatically crops cos/sin to the size required by `tensor` to support
+    caller subspace projections (e.g. bivector attention halves)."""
+    if tensor.shape[-1] % 2 != 0:
+        raise ValueError("RoPE tensor last dimension must be even.")
+
     dim = tensor.shape[-1] // 2
+    if cos.shape[-1] < dim or sin.shape[-1] < dim:
+        raise ValueError(
+            f"RoPE embeddings too small for tensor. "
+            f"Need {dim}, got cos={cos.shape[-1]}, sin={sin.shape[-1]}"
+        )
+
+    cos = cos[..., :dim]
+    sin = sin[..., :dim]
+
     x1, x2 = tensor[..., :dim], tensor[..., dim:]
     rot = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
     return rot.reshape(tensor.shape)
