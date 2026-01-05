@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import jax
@@ -33,11 +34,15 @@ def get_rope_embeddings(
     """Get rotary embeddings for a given sequence length."""
     cos, sin = cos_emb[:seq_len], sin_emb[:seq_len]
     if n_heads is None:
-        cos = jnp.tile(cos[None, ...], [batch_size, 1, 1])
-        sin = jnp.tile(sin[None, ...], [batch_size, 1, 1])
+        cos = jnp.broadcast_to(cos[None, ...], (batch_size, *cos.shape))
+        sin = jnp.broadcast_to(sin[None, ...], (batch_size, *sin.shape))
     else:
-        cos = jnp.tile(cos[None, :, None, :], [batch_size, 1, n_heads, 1])
-        sin = jnp.tile(sin[None, :, None, :], [batch_size, 1, n_heads, 1])
+        cos = jnp.broadcast_to(
+            cos[None, :, None, :], (batch_size, seq_len, n_heads, cos.shape[-1])
+        )
+        sin = jnp.broadcast_to(
+            sin[None, :, None, :], (batch_size, seq_len, n_heads, sin.shape[-1])
+        )
     return cos, sin
 
 
@@ -93,10 +98,18 @@ class RotarySelfAttention(nn.Module):
         """Repeat KV heads to match Q heads for GQA."""
         if self.num_groups == 1:
             return x
-        b, l = x.shape[0], x.shape[1]
-        x = x.reshape(b, l, self._num_kv_heads, 1, self.head_dim)
-        x = jnp.tile(x, [1, 1, 1, self.num_groups, 1])
-        return x.reshape(b, l, self.num_heads, self.head_dim)
+        b, l = x.shape[:2]
+        extra_shape = x.shape[2:]
+        x = x.reshape(b, l, self._num_kv_heads, 1, *extra_shape[1:])
+        x = jnp.broadcast_to(
+            x, (b, l, self._num_kv_heads, self.num_groups, *extra_shape[1:])
+        )
+        return x.reshape(b, l, self.num_heads, *extra_shape[1:])
+
+
+@lru_cache(maxsize=32)
+def _cached_causal_mask(length: int) -> jnp.ndarray:
+    return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
 
     @nn.compact
     def __call__(
@@ -135,8 +148,7 @@ class RotarySelfAttention(nn.Module):
         scale = jax.lax.rsqrt(jnp.float32(self.head_dim))
         scores = jnp.einsum("blhd,bmhd->bhlm", q, k) * scale
 
-        causal = jnp.tril(jnp.ones((l, l)))
-        causal_mask = causal.astype(jnp.bool_)[None, None, :, :]
+        causal_mask = _cached_causal_mask(l)[None, None, :, :]
 
         large_neg = jnp.float32(-1e4)  # -1e9 overflows float16/bfloat16
         if mask is not None:
