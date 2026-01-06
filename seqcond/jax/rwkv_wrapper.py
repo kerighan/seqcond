@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Optional
+from functools import partial
 
 from .rwkv import AssociativeScanRWKV, ScanRWKV
 
@@ -42,6 +43,7 @@ class RWKVModel(nn.Module):
     n_embd: int = 768
     n_layer: int = 12
     use_scan: bool = True
+    remat: bool = True
     dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self):
@@ -102,7 +104,7 @@ class RWKVModel(nn.Module):
         # Expand state for batch
         state = jnp.tile(state[None], (batch_size, 1, 1, 1))
 
-        # Process each sequence in the batch
+        # Process each sequence in the batch with remat if enabled
         def process_sequence(tokens):
             seq_state = self.rwkv_impl.default_state(rwkv_params, self.rwkv_config)
             logits, _ = self.rwkv_impl.forward(
@@ -115,6 +117,12 @@ class RWKVModel(nn.Module):
             )
             return logits
 
+        # Apply remat to reduce memory usage
+        if self.remat:
+            process_sequence = jax.checkpoint(
+                process_sequence, policy=jax.checkpoint_policies.nothing_saveable
+            )
+
         # Vectorize over batch dimension
         logits = jax.vmap(process_sequence)(inputs)
 
@@ -126,6 +134,7 @@ def create_rwkv_model(
     n_embd: int = 768,
     n_layer: int = 12,
     use_scan: bool = True,
+    remat: bool = True,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> RWKVModel:
     """
@@ -136,6 +145,7 @@ def create_rwkv_model(
         n_embd: Embedding dimension
         n_layer: Number of layers
         use_scan: Use AssociativeScanRWKV (True) or ScanRWKV (False)
+        remat: Use gradient checkpointing to reduce memory usage
         dtype: Data type for parameters
 
     Returns:
@@ -146,5 +156,6 @@ def create_rwkv_model(
         n_embd=n_embd,
         n_layer=n_layer,
         use_scan=use_scan,
+        remat=remat,
         dtype=dtype,
     )

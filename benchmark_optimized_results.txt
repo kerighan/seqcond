@@ -1,0 +1,38 @@
+2026-01-06 15:05:14.847389: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+2026-01-06 15:05:18.358216: E external/xla/xla/stream_executor/cuda/cuda_timer.cc:86] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+2026-01-06 15:05:18.486326: E external/xla/xla/stream_executor/cuda/cuda_timer.cc:86] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+2026-01-06 15:05:18.613519: E external/xla/xla/stream_executor/cuda/cuda_timer.cc:86] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+2026-01-06 15:05:23.032004: E external/xla/xla/stream_executor/cuda/cuda_timer.cc:86] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+2026-01-06 15:05:23.192104: E external/xla/xla/stream_executor/cuda/cuda_timer.cc:86] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+2026-01-06 15:26:14.586982: W external/xla/xla/stream_executor/cuda/cuda_command_buffer.cc:725] Retry CUDA graph instantiation after OOM error
+E0106 15:26:14.587093  864540 pjrt_stream_executor_client.cc:2916] Execution of replica 0 failed: RESOURCE_EXHAUSTED: Underlying backend ran out of memory trying to instantiate command buffer with 17 (total of 627 alive graphs in the process). You can try to (a) Give more memory to the driver by reducing XLA_CLIENT_MEM_FRACTION (b) Disable command buffers with 'XLA_FLAGS=--xla_gpu_enable_command_buffer=' (empty set). Original error: Failed to instantiate CUDA graph: CUDA_ERROR_OUT_OF_MEMORY: out of memory
+======================================================================
+Optimized Speed Benchmarks (with JIT compilation)
+======================================================================
+
+======================================================================
+SeqCond O(1) Benchmark (Optimized with JIT)
+======================================================================
+Seq Len    Full (ms)    Step (ms)    Speedup   
+------------------------------------------------------------
+64         0.11         2.21         0.05      x
+128        0.11         3.34         0.03      x
+256        0.16         8.86         0.02      x
+512        0.32         12.81        0.03      x
+1024       0.49         25.20        0.02      x
+
+======================================================================
+Transformer O(L) Benchmark (Optimized with JIT)
+======================================================================
+Seq Len    Full (ms)    Step (ms)    Speedup   
+------------------------------------------------------------
+64         0.13         3217.97      0.00      x
+128        0.13         7079.19      0.00      x
+256        0.20         14950.37     0.00      x
+512        0.32         31657.68     0.00      x
+Traceback (most recent call last):
+  File "/home/maixent/Documents/perso/seqcond/benchmark_speed_optimized.py", line 224, in <module>
+    benchmark_transformer_optimized()
+  File "/home/maixent/Documents/perso/seqcond/benchmark_speed_optimized.py", line 210, in benchmark_transformer_optimized
+    _, kv_tmp = step_fn(x_t, kv_tmp, t, cos_t, sin_t)
+ValueError: RESOURCE_EXHAUSTED: Underlying backend ran out of memory trying to instantiate command buffer with 17 (total of 627 alive graphs in the process). You can try to (a) Give more memory to the driver by reducing XLA_CLIENT_MEM_FRACTION (b) Disable command buffers with 'XLA_FLAGS=--xla_gpu_enable_command_buffer=' (empty set). Original error: Failed to instantiate CUDA graph: CUDA_ERROR_OUT_OF_MEMORY: out of memory

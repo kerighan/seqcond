@@ -208,6 +208,7 @@ def create_model_from_config(config: ModelConfig):
                 n_embd=config.d_model,
                 n_layer=config.num_layers,
                 use_scan=True,
+                remat=config.remat,
                 dtype=jnp.bfloat16,
             )
     else:
