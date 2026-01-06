@@ -23,16 +23,20 @@ ACT2FN_JAX: Dict[str, callable] = {
 
 # ---- RMSNorm with optional residual gating ----
 
+
 class Mamba2RMSNorm(nn.Module):
     """
     JAX/Flax version of Mamba2RMSNorm (RMSNorm + optional residual gating).
     """
+
     hidden_size: int
     eps: float = 1e-6
     normalize: bool = False  # gate on residual if True
 
     @nn.compact
-    def __call__(self, hidden_states: jnp.ndarray, residual: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    def __call__(
+        self, hidden_states: jnp.ndarray, residual: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
         weight = self.param(
             "weight",
             nn.initializers.ones,
@@ -45,7 +49,7 @@ class Mamba2RMSNorm(nn.Module):
             res = residual.astype(jnp.float32)
             x = x * nn.silu(res)
 
-        variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
+        variance = jnp.mean(x**2, axis=-1, keepdims=True)
         x = x * jax.lax.rsqrt(variance + self.eps)
         x = x * weight  # broadcast over last dim
 
@@ -54,12 +58,14 @@ class Mamba2RMSNorm(nn.Module):
 
 # ---- Depthwise Conv1d (causal-ish) ----
 
+
 class DepthwiseConv1d(nn.Module):
     """
     Depthwise 1D conv over sequence, causal (left-padding only).
     Expects input shape (batch, seq_len, channels).
     """
-    features: int          # == in_channels == out_channels
+
+    features: int  # == in_channels == out_channels
     kernel_size: int
     use_bias: bool = True
 
@@ -68,8 +74,8 @@ class DepthwiseConv1d(nn.Module):
         conv = nn.Conv(
             features=self.features,
             kernel_size=(self.kernel_size,),
-            padding=((self.kernel_size - 1, 0),),   # causal: pad on the left only
-            feature_group_count=self.features,      # depthwise
+            padding=((self.kernel_size - 1, 0),),  # causal: pad on the left only
+            feature_group_count=self.features,  # depthwise
             use_bias=self.use_bias,
         )
         y = conv(x)  # (batch, seq_len, channels), same length as input
@@ -78,11 +84,13 @@ class DepthwiseConv1d(nn.Module):
 
 # ---- Mamba2 Mixer ----
 
+
 class Mamba2Mixer(nn.Module):
     """
     JAX/Flax implementation of the Mamba2 mixer, using the naive SSD path.
     No Triton, no caching in this first port.
     """
+
     config: Mamba2Config
     layer_idx: int
 
@@ -122,18 +130,30 @@ class Mamba2Mixer(nn.Module):
             low, high = cfg.time_step_min, cfg.time_step_max
             # Safety against NaN/Inf
             low = max(low, 1e-4)
-            
+            high = min(high, 1e2)
+
             floor = cfg.time_step_floor
             u = jax.random.uniform(key, shape)
             log_min = jnp.log(low)
             log_max = jnp.log(high)
             dt = jnp.exp(u * (log_max - log_min) + log_min)
             dt = jnp.maximum(dt, floor)
-            
-            # Inverse softplus safety
-            # Clip dt to reasonable range for inverse softplus stability
-            dt_safe = jnp.clip(dt, 1e-4, 1e2)
-            inv_dt = dt_safe + jnp.log(-jnp.expm1(-dt_safe))
+
+            # Inverse softplus: x = softplus^{-1}(dt)
+            # softplus(x) = log(1 + exp(x)), so x = log(exp(dt) - 1)
+            # For numerical stability, use: x = dt + log(1 - exp(-dt)) for dt > 0
+            # When dt is small: log(1 - exp(-dt)) ≈ log(dt) - dt/2
+            # When dt is large: log(1 - exp(-dt)) ≈ 0
+            dt_safe = jnp.clip(dt, 1e-3, 20.0)  # Avoid extreme values
+
+            # Stable inverse softplus
+            # For dt > 1: x ≈ dt (since softplus(x) ≈ x for large x)
+            # For dt < 1: use log(exp(dt) - 1) = dt + log(1 - exp(-dt))
+            inv_dt = jnp.where(
+                dt_safe > 1.0,
+                dt_safe - 0.693,  # softplus^{-1}(x) ≈ x - log(2) for x > 1
+                jnp.log(jnp.expm1(dt_safe)),  # log(exp(dt) - 1) for dt < 1
+            )
             return inv_dt.astype(jnp.float32)
 
         self.dt_bias = self.param("dt_bias", init_dt_bias, (cfg.num_heads,))
@@ -159,13 +179,13 @@ class Mamba2Mixer(nn.Module):
 
     def _conv1d(self, xBC: jnp.ndarray) -> jnp.ndarray:
         # xBC: (B, L, conv1d_dim)
-        x = self.conv1d(xBC)   # (B, L, conv1d_dim)
+        x = self.conv1d(xBC)  # (B, L, conv1d_dim)
         x = self.act(x)
         return x
 
     def __call__(
         self,
-        hidden_states: jnp.ndarray,         # (B, L, hidden_size)
+        hidden_states: jnp.ndarray,  # (B, L, hidden_size)
         initial_state: Optional[jnp.ndarray] = None,  # (B, H, P, N)
         return_final_state: bool = False,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
@@ -191,7 +211,10 @@ class Mamba2Mixer(nn.Module):
                 d_mlp,
                 2 * d_mlp,
                 2 * d_mlp + self.intermediate_size,
-                2 * d_mlp + self.intermediate_size + self.intermediate_size + 2 * self.ssm_state_size,
+                2 * d_mlp
+                + self.intermediate_size
+                + self.intermediate_size
+                + 2 * self.ssm_state_size,
             ],
             axis=-1,
         )
@@ -228,8 +251,12 @@ class Mamba2Mixer(nn.Module):
         # Broadcast B and C across heads: (B, L, 1, N) -> (B, L, H, N)
         B_exp = jnp.expand_dims(B_t, axis=2)  # (B, L, 1, N)
         C_exp = jnp.expand_dims(C_t, axis=2)  # (B, L, 1, N)
-        B_mat = jnp.broadcast_to(B_exp, (B_size, L, self.num_heads, self.ssm_state_size))
-        C_mat = jnp.broadcast_to(C_exp, (B_size, L, self.num_heads, self.ssm_state_size))
+        B_mat = jnp.broadcast_to(
+            B_exp, (B_size, L, self.num_heads, self.ssm_state_size)
+        )
+        C_mat = jnp.broadcast_to(
+            C_exp, (B_size, L, self.num_heads, self.ssm_state_size)
+        )
 
         y, final_state = ssd_naive(
             x=rearrange(x, "b l (h p) -> b l h p", p=self.head_dim),
@@ -260,6 +287,7 @@ class Mamba2Mixer(nn.Module):
 
 
 # ---- Block ----
+
 
 class Mamba2Block(nn.Module):
     config: Mamba2Config
@@ -297,10 +325,12 @@ class Mamba2Block(nn.Module):
 
 # ---- Top-level Model ----
 
+
 class Mamba2Model(nn.Module):
     """
     JAX/Flax Mamba2 backbone (no LM head yet).
     """
+
     config: Mamba2Config
 
     def setup(self):
@@ -310,14 +340,13 @@ class Mamba2Model(nn.Module):
             features=cfg.hidden_size,
         )
         self.layers = [
-            Mamba2Block(cfg, layer_idx=i)
-            for i in range(cfg.num_hidden_layers)
+            Mamba2Block(cfg, layer_idx=i) for i in range(cfg.num_hidden_layers)
         ]
         self.norm_f = Mamba2RMSNorm(cfg.hidden_size, eps=cfg.layer_norm_epsilon)
 
     def __call__(
         self,
-        input_ids: Optional[jnp.ndarray] = None,      # (B, L)
+        input_ids: Optional[jnp.ndarray] = None,  # (B, L)
         inputs_embeds: Optional[jnp.ndarray] = None,  # (B, L, H)
         initial_states: Optional[List[jnp.ndarray]] = None,  # list of (B, H, P, N)
         output_hidden_states: bool = False,
@@ -362,4 +391,3 @@ class Mamba2Model(nn.Module):
             "hidden_states": all_hidden_states,
             "last_ssm_states": all_last_states,
         }
-

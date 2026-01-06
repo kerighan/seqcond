@@ -17,9 +17,9 @@ from typing import Optional
 #     conv_kernel_size: int = 4
 #     expand_factor: float = 1.0       # Input Slim
 #     out_expand_factor: int = 3       # Output Moderate
-    
+
 #     chunk_size: int = 128             # Chunk Size
-    
+
 #     dropout: float = 0.0
 #     maxlen: Optional[int] = None
 #     compute_dtype: jnp.dtype = jnp.bfloat16
@@ -28,7 +28,7 @@ from typing import Optional
 #     def setup(self):
 #         assert self.num_heads % self.num_query_heads == 0
 #         assert self.num_thetas == 1
-        
+
 #         self.K = self.num_heads
 #         self.K_q = self.num_query_heads
 #         self.n_rep = self.K // self.K_q
@@ -47,7 +47,7 @@ from typing import Optional
 #         dim_expand = H * self.out_expand_factor
 #         dim_swiglu_per_head = dim_expand * 2
 #         dim_swiglu_total = self.K * dim_swiglu_per_head
-        
+
 #         # DeepSeek Latent Dim (Petit goulot d'étranglement)
 #         latent_dim = d_model // 4
 
@@ -55,18 +55,18 @@ from typing import Optional
 #         # 1. PRE-CALCULS LÉGERS (Outside Scan)
 #         # ------------------------------------------------------------
 #         # On ne calcule ICI que ce qui est "Cheap" en mémoire ou difficile à fusionner.
-        
+
 #         # A. Memory Encoding (Conv nécessite le contexte global)
 #         z_mem = nn.Dense(memory_dim + self.K, use_bias=False, name="in_proj_mem")(x)
 #         z_mem = z_mem.astype(self.compute_dtype)
 #         z_mem = nn.Conv(
-#             features=z_mem.shape[-1], kernel_size=(self.conv_kernel_size,), 
-#             padding=((self.conv_kernel_size - 1, 0),), feature_group_count=z_mem.shape[-1], 
+#             features=z_mem.shape[-1], kernel_size=(self.conv_kernel_size,),
+#             padding=((self.conv_kernel_size - 1, 0),), feature_group_count=z_mem.shape[-1],
 #             use_bias=False, name="conv_mem"
 #         )(z_mem)
 
-#         k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)       
-#         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)          
+#         k_val = z_mem[..., :memory_dim].reshape(b, l, self.K, H)
+#         s_raw = z_mem[..., -self.K:].reshape(b, l, self.K, 1)
 
 #         if mask is not None:
 #             m = mask.astype(x.dtype)[:, :, None, None]
@@ -78,7 +78,7 @@ from typing import Optional
 #         q_raw = nn.Dense(self.K_q * H * 2, use_bias=False, name="in_proj_query")(x)
 #         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
 #         q_raw = q_raw.reshape(b, l, self.K_q, 1, H, 2)
-#         q_re_seq, q_im_seq = q_raw[..., 0], q_raw[..., 1] 
+#         q_re_seq, q_im_seq = q_raw[..., 0], q_raw[..., 1]
 
 #         # C. Params (Theta, Decay, Tanh Scale)
 #         theta_min, theta_max = 0.001, 3.0
@@ -104,15 +104,15 @@ from typing import Optional
 #             a_slopes = self.param("anchor_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1), (self.num_anchor_heads,))
 #             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1, 1)
 #             log_w_list.append(-slopes_a * pos[None, :, None, None])
-            
+
 #         log_time_weight = (jnp.concatenate(log_w_list, axis=2) if log_w_list else jnp.zeros((1, l, self.K, 1), jnp.float32))
 #         score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
 #         log_p = jnp.clip(score_scale[None, None, :, None] * s_raw.astype(jnp.float32), -20., 20.)
-#         p_w = jnp.exp(log_p + log_time_weight) 
+#         p_w = jnp.exp(log_p + log_time_weight)
 
 #         # D. Pre-Scan Projections (OPTIMISATION MÉMOIRE CRITIQUE)
 #         # On ne calcule QUE les petits tenseurs ici. Les gros GEMMs se feront dans le scan.
-        
+
 #         # 1. Gate Logits (B, L, K) -> Petit
 #         gate_proj_w = self.param("gate_proj_w", nn.initializers.zeros, (d_model, self.K))
 #         gate_proj_b = self.param("gate_proj_b", nn.initializers.constant(-3.0), (self.K,))
@@ -130,14 +130,14 @@ from typing import Optional
 #         # 2. DÉFINITION DES POIDS POUR LE SCAN
 #         # ------------------------------------------------------------
 #         # Ces poids seront utilisés DANS la boucle pour générer les gros tenseurs à la volée.
-        
+
 #         W_readout = self.param("W_readout", nn.initializers.glorot_uniform(), (self.K, 2 * H, dim_swiglu_per_head))
 #         scale_readout = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H))
 #         highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
-        
+
 #         # Poids "Lourds" utilisés uniquement en local
 #         W_skip_up = self.param("skip_up_w", nn.initializers.glorot_uniform(), (latent_dim, dim_swiglu_total))
-#         W_out = self.param("out_proj_w", nn.initializers.glorot_uniform(), (self.K * dim_expand, d_model)) 
+#         W_out = self.param("out_proj_w", nn.initializers.glorot_uniform(), (self.K * dim_expand, d_model))
 
 #         # ------------------------------------------------------------
 #         # 3. CHUNKING
@@ -145,32 +145,32 @@ from typing import Optional
 #         C = self.chunk_size
 #         pad = (-l) % C
 #         if pad:
-#             def p(t, val=0.): 
+#             def p(t, val=0.):
 #                 pad_width = ((0,0),(0,pad)) + ((0,0),)*(t.ndim-2)
 #                 return jnp.pad(t, pad_width, constant_values=val)
-            
+
 #             k_val = p(k_val)
-#             p_w   = p(p_w, 0.) 
+#             p_w   = p(p_w, 0.)
 #             q_re_seq = p(q_re_seq)
 #             q_im_seq = p(q_im_seq)
 #             c_skip_seq = p(c_skip_seq) # Pad du latent
-#             spec_gate_logits = p(spec_gate_logits, -1e9) 
+#             spec_gate_logits = p(spec_gate_logits, -1e9)
 #             Lp = l + pad
 #         else:
 #             Lp = l
-        
+
 #         n_chunks = Lp // C
 
 #         def to_chunks(t):
 #             sh = t.shape
 #             return t.reshape(b, n_chunks, C, *sh[2:]).swapaxes(0, 1)
 
-#         k_chunks = to_chunks(k_val)         
-#         p_chunks = to_chunks(p_w)           
-#         qre_chunks = to_chunks(q_re_seq)     
+#         k_chunks = to_chunks(k_val)
+#         p_chunks = to_chunks(p_w)
+#         qre_chunks = to_chunks(q_re_seq)
 #         qim_chunks = to_chunks(q_im_seq)
 #         c_skip_chunks = to_chunks(c_skip_seq) # On passe le latent chunké
-#         gate_chunks = to_chunks(spec_gate_logits) 
+#         gate_chunks = to_chunks(spec_gate_logits)
 
 #         # ------------------------------------------------------------
 #         # 4. KERNEL HYBRIDE (Pre-Computed Inputs + Fused GEMMs)
@@ -178,12 +178,12 @@ from typing import Optional
 #         def step(carry, xs):
 #             den_c, re_c, im_c = carry
 #             k_x, p_x, qre_x, qim_x, c_skip_x, gate_logits_x = xs
-            
+
 #             # --- A. ON-THE-FLY MODULATION ---
-#             k_x_f32 = k_x.astype(jnp.float32)[..., None] 
-#             phi = jnp.tanh(k_x_f32 * tanh_scale_broad) * theta 
-#             kvw = k_x_f32 * p_x[..., None] 
-            
+#             k_x_f32 = k_x.astype(jnp.float32)[..., None]
+#             phi = jnp.tanh(k_x_f32 * tanh_scale_broad) * theta
+#             kvw = k_x_f32 * p_x[..., None]
+
 #             re_x = (kvw * jnp.cos(phi))[..., 0]
 #             im_x = (kvw * jnp.sin(phi))[..., 0]
 #             den_x = p_x[..., 0].astype(jnp.float32)
@@ -201,15 +201,15 @@ from typing import Optional
 #             # GQA View
 #             state_re_g = state_re.reshape(b, C, self.K_q, self.n_rep, H)
 #             state_im_g = state_im.reshape(b, C, self.K_q, self.n_rep, H)
-            
+
 #             # Query (B, C, Kq, 1, H) - Déjà chunké proprement
 #             qre_g = qre_x
-#             qim_g = qim_x 
-            
+#             qim_g = qim_x
+
 #             # Hermitien
 #             out_re_g = state_re_g * qre_g + state_im_g * qim_g
 #             out_im_g = state_im_g * qre_g - state_re_g * qim_g
-            
+
 #             # Flatten & Concat
 #             out_re = out_re_g.reshape(b, C, self.K, H)
 #             out_im = out_im_g.reshape(b, C, self.K, H)
@@ -217,9 +217,9 @@ from typing import Optional
 
 #             # Proj Readout (Manuel)
 #             y_spectral_raw = jnp.einsum('bckf,kfn->bckn', out_complex * scale_readout, W_readout)
-            
+
 #             # --- D. FUSION & SWIGLU (HEAVY GEMMS INSIDE SCAN) ---
-            
+
 #             # 1. Gate
 #             spec_gate = jax.nn.sigmoid(gate_logits_x).astype(self.compute_dtype)[..., None]
 #             y_spectral = y_spectral_raw * spec_gate
@@ -238,7 +238,7 @@ from typing import Optional
 #             y_gate = y_gate_spec + y_gate_dir * highway_scale
 
 #             y_act = y_val * jax.nn.silu(y_gate)
-            
+
 #             # 4. Out Projection (LOURD mais LOCAL)
 #             y_flat = y_act.reshape(b, C, -1)
 #             out_chunk = jnp.dot(y_flat, W_out) # (B, C, D)
@@ -253,16 +253,16 @@ from typing import Optional
 #         )
 
 #         _, out_chunks = jax.lax.scan(
-#             step, init, 
-#             (k_chunks, p_chunks, qre_chunks, qim_chunks, c_skip_chunks, gate_chunks), 
+#             step, init,
+#             (k_chunks, p_chunks, qre_chunks, qim_chunks, c_skip_chunks, gate_chunks),
 #             length=n_chunks
 #         )
 
 #         out = out_chunks.swapaxes(0, 1).reshape(b, Lp, d_model)[:, :l, :]
-        
+
 #         if self.dropout > 0:
 #             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
-            
+
 #         return out
 
 
@@ -310,8 +310,7 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
     # offsets[c] = sum_{i < c} chunk_sums[i]
     offsets = jnp.cumsum(chunk_sums, axis=1)
     offsets = jnp.concatenate(
-        [jnp.zeros_like(offsets[:, :1, ...]), offsets[:, :-1, ...]],
-        axis=1
+        [jnp.zeros_like(offsets[:, :1, ...]), offsets[:, :-1, ...]], axis=1
     )  # (B, n_chunks, ...)
 
     # 4) add offsets to every element in chunk
@@ -326,15 +325,15 @@ def cumsum_chunked(x: jnp.ndarray, axis: int = 1, chunk: int = 128) -> jnp.ndarr
 
 class SeqCondAttention(nn.Module):
     # Dimensions Architecture
-    num_heads: int = 12          # K
-    num_query_heads: int = 6    # K'
+    num_heads: int = 12  # K
+    num_query_heads: int = 6  # K'
     num_anchor_heads: int = 0
-    num_thetas: int = 1          # M
-    
+    num_thetas: int = 1  # M
+
     # Paramètres Locaux
     conv_kernel_size: int = 4
-    expand_factor: int = 1       # Input Slim (Scan Rapide)
-    out_expand_factor: int = 3   # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
+    expand_factor: int = 1  # Input Slim (Scan Rapide)
+    out_expand_factor: int = 3  # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
 
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -348,12 +347,12 @@ class SeqCondAttention(nn.Module):
     def setup(self):
         assert self.num_heads % self.num_query_heads == 0
         self.n_rep = self.num_heads // self.num_query_heads
-        
+
         self.K = self.num_heads
         self.K_q = self.num_query_heads
         self.M = self.num_thetas
         self.num_decay_heads = self.K - self.num_anchor_heads
-    
+
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
         # ======================================================================
@@ -361,19 +360,19 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         B, L, D = x.shape
         d_inner = int(D * self.expand_factor)
-        
+
         # Iso-Param H scaling
-        H = max(1, d_inner // (self.K * self.M)) 
-        
+        H = max(1, d_inner // (self.K * self.M))
+
         dim_memory = self.K * H
-        dim_scan_flat = self.K * H * self.M 
-        
-        dim_query_head = H * self.M * 2 
+        dim_scan_flat = self.K * H * self.M
+
+        dim_query_head = H * self.M * 2
         dim_query_total = self.K_q * dim_query_head
-        
+
         dim_latent = D // 4
         dim_gate = self.K
-        
+
         dim_expand = H * self.out_expand_factor
         dim_swiglu_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_head
@@ -381,23 +380,23 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         # 1. FUSED INPUT PROJECTIONS
         # ======================================================================
-        
+
         # A. Branche Memory (Dense + Conv)
         z_mem = nn.Dense(dim_memory + self.K, use_bias=False, name="in_proj_mem")(x)
         z_mem = z_mem.astype(self.compute_dtype)
-        
+
         z_mem = nn.Conv(
-            features=z_mem.shape[-1], 
-            kernel_size=(self.conv_kernel_size,), 
+            features=z_mem.shape[-1],
+            kernel_size=(self.conv_kernel_size,),
             padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=z_mem.shape[-1], 
-            use_bias=False, name="conv_mem"
+            feature_group_count=z_mem.shape[-1],
+            use_bias=False,
+            name="conv_mem",
         )(z_mem)
         z_mem = jax.nn.silu(z_mem)  # Activation après conv (DeltaNet style)
 
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
         k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
-        k_val = k_val / jnp.sqrt(jnp.float32(H))  # L2 scaling
         s_raw = z_mem[..., dim_memory:]
 
         if mask is not None:
@@ -408,36 +407,39 @@ class SeqCondAttention(nn.Module):
         # B. Branche Auxiliaire (Query + LatentSkip + Gate)
         dim_aux_total = dim_query_total + dim_latent + dim_gate
         z_aux = nn.Dense(dim_aux_total, use_bias=False, name="in_proj_aux")(x)
-        
+
         idx1 = dim_query_total
         idx2 = dim_query_total + dim_latent
-        
+
         q_raw = z_aux[..., :idx1]
         c_skip = z_aux[..., idx1:idx2]
         gate_logits = z_aux[..., idx2:]
 
         # Traitement Query
         q_raw = nn.Conv(
-            features=q_raw.shape[-1], 
-            kernel_size=(self.conv_kernel_size,), 
+            features=q_raw.shape[-1],
+            kernel_size=(self.conv_kernel_size,),
             padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=q_raw.shape[-1], 
-            use_bias=False, name="conv_q"
+            feature_group_count=q_raw.shape[-1],
+            use_bias=False,
+            name="conv_q",
         )(q_raw)
         q_raw = jax.nn.silu(q_raw)  # Activation après conv (DeltaNet style)
         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
-        q_raw = q_raw / jnp.sqrt(jnp.float32(H))  # L2 scaling
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
-        
+
         # ======================================================================
         # 2. GRILLE SPECTRALE (THETA & W_INT)
         # ======================================================================
         theta_min, theta_max = 0.001, 3.0
 
         if self.M == 1:
+
             def init_theta_m1(key, shape):
-                grid = np.geomspace(theta_min, theta_max, self.K).reshape(1, 1, self.K, 1, 1)
+                grid = np.geomspace(theta_min, theta_max, self.K).reshape(
+                    1, 1, self.K, 1, 1
+                )
                 base = np.tile(grid, (1, 1, 1, H, 1))
                 # Inverse Softplus (Mamba2 style robust)
                 u = (base - theta_min) / max(theta_max - theta_min, 1e-6)
@@ -446,33 +448,41 @@ class SeqCondAttention(nn.Module):
                 return jnp.array(raw, dtype=jnp.float32)
 
             theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
-            theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
-            
+            theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(
+                theta_raw
+            ).astype(jnp.float32)
+
             # Poids d'intégration appris (initialisés à 1)
-            w_int_raw = self.param("w_int_raw", nn.initializers.zeros, (1, 1, self.K_q, self.n_rep, H, 1))
-            w_int = jnp.exp(w_int_raw).astype(jnp.float32)  # Toujours positif
+            w_int_raw = self.param(
+                "w_int_raw", nn.initializers.zeros, (1, 1, self.K_q, self.n_rep, H, 1)
+            )
+            w_int_raw_clipped = jnp.clip(w_int_raw, -5.0, 5.0)  # Prevent exp overflow
+            w_int = jnp.exp(w_int_raw_clipped).astype(jnp.float32)  # Toujours positif
         else:
+
             def init_theta_deltas(key, shape):
                 grid_m = np.geomspace(theta_min, theta_max, self.M)
                 base = np.tile(grid_m.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
                 return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
 
-            theta_d_raw = self.param("theta_d_raw", init_theta_deltas, (1, 1, self.K, H, self.M))
-            
+            theta_d_raw = self.param(
+                "theta_d_raw", init_theta_deltas, (1, 1, self.K, H, self.M)
+            )
+
             theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
             theta_accum = jnp.cumsum(theta_d, axis=-1)
-            
+
             scale_range = theta_max - theta_min
-            total_sum = theta_accum[..., -1:] 
+            total_sum = theta_accum[..., -1:]
             theta = theta_min + (theta_accum / total_sum) * scale_range
-            
+
             dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
             dtheta = dtheta_raw * (scale_range / total_sum)
-            
+
             w0 = dtheta[..., :1] * 0.5
             w_mid = 0.5 * (dtheta[..., :-1] + dtheta[..., 1:])
             wL = dtheta[..., -1:] * 0.5
-            
+
             w_int = jnp.concatenate([w0, w_mid, wL], axis=-1)
             w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
 
@@ -483,27 +493,43 @@ class SeqCondAttention(nn.Module):
         pos = jnp.arange(L, dtype=jnp.float32)
         log_w_list = []
         if self.num_decay_heads > 0:
-            d_slopes = self.param("decay_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1), (self.num_decay_heads,))
+            d_slopes = self.param(
+                "decay_slopes",
+                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1),
+                (self.num_decay_heads,),
+            )
             slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1)
-            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.)
+            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.0)
             log_w_list.append(-slopes * dist[None, :, None])
         if self.num_anchor_heads > 0:
-            a_slopes = self.param("anchor_slopes", lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1), (self.num_anchor_heads,))
+            a_slopes = self.param(
+                "anchor_slopes",
+                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
+                (self.num_anchor_heads,),
+            )
             slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1)
             log_w_list.append(-slopes_a * pos[None, :, None])
-            
-        log_time_weight = jnp.concatenate(log_w_list, axis=2) if log_w_list else jnp.zeros((1, L, self.K), dtype=jnp.float32)
-        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        log_p = jnp.clip(score_scale[None, None, :] * s_raw.astype(jnp.float32), -20., 20.)
-        p_w = jnp.exp(log_p + log_time_weight) # (B, L, K)
 
-        # Modulation
+        log_time_weight = (
+            jnp.concatenate(log_w_list, axis=2)
+            if log_w_list
+            else jnp.zeros((1, L, self.K), dtype=jnp.float32)
+        )
+        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
+        log_p = jnp.clip(
+            score_scale[None, None, :] * s_raw.astype(jnp.float32), -10.0, 10.0
+        )  # Tighter clipping
+        p_w = jnp.exp(log_p + log_time_weight)  # (B, L, K)
+
+        # Modulation (with tanh to bound phase)
         k_f32 = k_val.astype(jnp.float32)[..., None]
         p_w_b = p_w[..., None, None]
-        
-        phi = k_f32 * theta
+
+        tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
+        tanh_scale_b = tanh_scale[None, None, :, None, None]
+        phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # Bounded modulation
         kvw = k_f32 * p_w_b
-        
+
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
         # re, im: (B, L, K, H, M)
@@ -512,76 +538,88 @@ class SeqCondAttention(nn.Module):
         # use_square_matrix = L <= self.matrix_threshold
         if self.use_square_matrix:
             # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
-            
+
             # Causal Mask (L, L)
             # trues below diagonal
             mask_idx = jnp.arange(L)[:, None] >= jnp.arange(L)[None, :]
             causal_mask = mask_idx.astype(self.compute_dtype)
-            
+
             # Einsum Accumulation
             # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            den_acc = jnp.einsum('ts,bsk->btk', causal_mask, p_w.astype(self.compute_dtype))
-            
+            den_acc = jnp.einsum(
+                "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
+            )
+
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
             stack_ri = jnp.stack([re, im], axis=-1).astype(self.compute_dtype)
             # acc_ri: (B, L, K, H, M, 2)
-            acc_ri = jnp.einsum('ts,bskhmc->btkhmc', causal_mask, stack_ri)
-            
+            acc_ri = jnp.einsum("ts,bskhmc->btkhmc", causal_mask, stack_ri)
+
             re_acc = acc_ri[..., 0]
             im_acc = acc_ri[..., 1]
-            
+
         else:
             # PATH 2: O(L) Linear Scan (Memory Optimized)
-            
+
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-            den_flat = p_w # (B, L, K)
-            
+            den_flat = p_w  # (B, L, K)
+
             # Stack & Scan
             stack = jnp.concatenate([den_flat, re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
-            
+
             # Unpack
-            den_acc, re_acc_flat, im_acc_flat = jnp.split(cumsum, [self.K, self.K + flat_size], axis=-1)
-            
+            den_acc, re_acc_flat, im_acc_flat = jnp.split(
+                cumsum, [self.K, self.K + flat_size], axis=-1
+            )
+
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
         # Normalisation
         inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
-        inv_den = inv_den[..., None, None] # (B, L, K, 1, 1)
-        
+        inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
+
         state_re = re_acc * inv_den
         state_im = im_acc * inv_den
 
         # ======================================================================
         # 4. READOUT & GQA & INTEGRATION
         # ======================================================================
-        
+
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
-        
+
         match_re = state_re_g * q_re + state_im_g * q_im
         match_im = state_im_g * q_re - state_re_g * q_im
 
         out_re_g = jnp.sum(match_re * w_int, axis=-1)
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
-        
+
         out_re = out_re_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
-        
+
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
         # 5. FUSION FINALE
         # ======================================================================
-        W_readout = self.param("W_readout", nn.initializers.glorot_uniform(), (self.K, 2 * H, dim_swiglu_head))
-        scale_spec = self.param("norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H))
-        
-        y_spec_raw = jnp.einsum('blkf,kfn->blkn', out_complex * scale_spec, W_readout)
-        spec_gate = jax.nn.silu(gate_logits).astype(self.compute_dtype)[..., None]  # SiLU au lieu de sigmoid
+        W_readout = self.param(
+            "W_readout",
+            nn.initializers.glorot_uniform(),
+            (self.K, 2 * H, dim_swiglu_head),
+        )
+        scale_spec = self.param(
+            "norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H)
+        )
+
+        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex * scale_spec, W_readout)
+        spec_gate = jax.nn.sigmoid(gate_logits).astype(self.compute_dtype)[
+            ..., None
+        ]  # Sigmoid for bounded gating
         y_spec = y_spec_raw * spec_gate
 
         y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
@@ -589,20 +627,24 @@ class SeqCondAttention(nn.Module):
 
         y_spec_val, y_spec_gate = jnp.split(y_spec, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-        
-        highway_scale = self.param("highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1))
-        
+
+        highway_scale = self.param(
+            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
+        )
+
         y_val = y_spec_val + (y_skip_val * highway_scale)
         y_gate = y_spec_gate + (y_skip_gate * highway_scale)
-        
-        y_act = y_val * jax.nn.silu(y_gate)  # SiLU au lieu de sigmoid (DeltaNet style)
-        
+
+        y_act = y_val * jax.nn.sigmoid(
+            y_gate
+        )  # Sigmoid for bounded gating (SwiGLU style)
+
         y_flat = y_act.reshape(B, L, -1)
         out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
-        
+
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
-            
+
         return out
 
 
@@ -625,7 +667,11 @@ class SeqCondBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, mask=None, deterministic=True):
-        h = nn.RMSNorm(epsilon=self.norm_eps, dtype=self.compute_dtype, param_dtype=self.param_dtype)(x)
+        h = nn.RMSNorm(
+            epsilon=self.norm_eps,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(x)
         h = SeqCondAttention(
             num_heads=self.num_heads,
             num_query_heads=self.num_query_heads,

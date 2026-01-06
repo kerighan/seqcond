@@ -39,7 +39,7 @@ class TransformerModel(nn.Module):
         self.cos_emb, self.sin_emb = precompute_freqs(
             self.maxlen, self.d_model // self.num_heads
         )
-        
+
         Block = TransformerDecoderBlock
         if self.remat:
             Block = nn.remat(Block)
@@ -115,7 +115,7 @@ class BivectorModel(nn.Module):
         self.cos_emb, self.sin_emb = precompute_freqs(
             self.maxlen, self.d_model // self.num_heads
         )
-        
+
         Block = BivectorBlock
         if self.remat:
             Block = nn.remat(Block)
@@ -436,6 +436,7 @@ class SeqCondModelV2(nn.Module):
 
 class MambaModel(nn.Module):
     """Mamba model mixed with Transformer layers."""
+
     d_model: int = 768
     d_ff: int = 2304
     num_layers: int = 12
@@ -519,8 +520,6 @@ class MambaModel(nn.Module):
 
         self.blocks = blocks
 
-        self.norm_f = Mamba2RMSNorm(hidden_size=self.d_model, eps=self.qk_norm_eps)
-
         if self.tie_weights:
             self.output_projection = WeightTiedDense(
                 vocab_size=self.vocab_size,
@@ -554,8 +553,6 @@ class MambaModel(nn.Module):
                 # Mamba block: returns (hidden_states, last_state)
                 # We discard last_state during training/simple forward
                 x, _ = block(x)
-
-        x = self.norm_f(x)
 
         if self.tie_weights:
             logits = self.output_projection(x, self.embedding.embedding)
