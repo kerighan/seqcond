@@ -49,7 +49,7 @@ def parse_args():
     grp_model = parser.add_argument_group("Model Overrides")
     grp_model.add_argument(
         "--model-type",
-        choices=["seqcond", "transformer", "bivector", "mamba"],
+        choices=["seqcond", "transformer", "bivector", "mamba", "rwkv"],
         default=None,
         help="Override model architecture type",
     )
@@ -105,7 +105,7 @@ def parse_args():
     grp_model.add_argument(
         "--expand",
         type=float,
-        default=1.0,
+        default=2.0,
         dest="expand_factor",
         help="Override expand factor",
     )

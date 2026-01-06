@@ -23,6 +23,8 @@ from .model import (
     create_mamba_model,
     create_transformer_model,
     create_bivector_model,
+    create_rwkv_model,
+    create_rwkv_hybrid_model,
     create_optimizer,
     warmup_cosine_decay_schedule,
     init_model,
@@ -179,6 +181,35 @@ def create_model_from_config(config: ModelConfig):
             qk_norm_eps=config.qk_norm_eps,
             remat=config.remat,
         )
+    elif config.model_type == "rwkv":
+        # Check if we should create a hybrid model (ratio > 0 means interleave Transformer layers)
+        if config.seqcond_ratio > 0:
+            return create_rwkv_hybrid_model(
+                vocab_size=config.vocab_size,
+                d_model=config.d_model,
+                d_ff=config.d_ff,
+                num_layers=config.num_layers,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                rwkv_ratio=config.seqcond_ratio,
+                maxlen=config.maxlen,
+                dropout=config.dropout,
+                tie_weights=config.tie_weights,
+                qk_norm=config.qk_norm,
+                qk_norm_eps=config.qk_norm_eps,
+                remat=config.remat,
+                use_scan=True,
+                dtype=jnp.bfloat16,
+            )
+        else:
+            # Pure RWKV model
+            return create_rwkv_model(
+                vocab_size=config.vocab_size,
+                n_embd=config.d_model,
+                n_layer=config.num_layers,
+                use_scan=True,
+                dtype=jnp.bfloat16,
+            )
     else:
         raise ValueError(f"Unknown model type: {config.model_type}")
 
@@ -215,7 +246,7 @@ def make_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None)
         grads = _apply_grad_mask(grads, grad_mask)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        
+
         metrics = compute_batch_metrics(logits, y, ignore_class=0)
         return new_params, new_opt_state, metrics
 
@@ -261,9 +292,7 @@ def make_train_step_with_debug(
     return train_step
 
 
-def make_fsdp_train_step(
-    model, optimizer, compute_dtype=jnp.float32, grad_mask=None
-):
+def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None):
     """Create a PJIT-compiled FSDP train step."""
 
     compute_dtype = jnp.dtype(compute_dtype)
@@ -271,9 +300,7 @@ def make_fsdp_train_step(
 
     def train_step(params, opt_state, x, y):
         def loss_fn(p):
-            p_apply = (
-                cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
-            )
+            p_apply = cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
             logits = model.apply({"params": p_apply}, x, deterministic=True)
             loss = sparse_categorical_crossentropy_loss(logits, y, ignore_class=0)
             return loss, logits
@@ -307,7 +334,7 @@ def make_pmap_train_step(
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x, y)
         loss = jax.lax.pmean(loss, axis_name=axis_name)
         grads = jax.lax.pmean(grads, axis_name=axis_name)
-        
+
         # Compute metrics locally
         metrics_local = compute_batch_metrics(logits, y, ignore_class=0)
         # Aggregate across devices
@@ -533,13 +560,13 @@ class Trainer:
                 f"(per-device batch size = {self.per_device_batch})."
             )
             self.mesh = Mesh(jax.devices(), axis_names=("dp",))
-            
+
             # Determine sharding strategy based on parameter shapes
             # We use eval_shape to get the structure and shapes without allocating memory
             rng_init = jax.random.PRNGKey(0)
             abstract_variables = jax.eval_shape(
                 lambda r: self.model.init(r, jnp.ones((1, 1), dtype=jnp.int32)),
-                rng_init
+                rng_init,
             )
             abstract_params = abstract_variables["params"]
 
@@ -553,16 +580,16 @@ class Trainer:
             self.params_sharding = jax.tree_util.tree_map(get_sharding, abstract_params)
 
             # Compute sharding for optimizer state
-            abstract_opt_state = jax.eval_shape(
-                self.optimizer.init, abstract_params
+            abstract_opt_state = jax.eval_shape(self.optimizer.init, abstract_params)
+            self.opt_state_sharding = jax.tree_util.tree_map(
+                get_sharding, abstract_opt_state
             )
-            self.opt_state_sharding = jax.tree_util.tree_map(get_sharding, abstract_opt_state)
-            
+
             # Data is sharded on batch dimension
             self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dp"))
             # Scalar metrics must be replicated
             replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
-            
+
             metrics_sharding = {
                 "correct": replicated_sharding,
                 "count": replicated_sharding,
@@ -579,9 +606,7 @@ class Trainer:
             pjit_init_fn = pjit(
                 init_fn,
                 static_argnums=(1, 2, 3),
-                in_shardings=(
-                    None,
-                ),
+                in_shardings=(None,),
                 out_shardings=(self.params_sharding, self.opt_state_sharding),
             )
 
@@ -593,7 +618,6 @@ class Trainer:
                     self._base_optimizer,
                     (self.train_config.batch_size, self.model_config.maxlen),
                 )
-
 
         else:  # Single device or PMAP
             rng = jax.random.PRNGKey(seed)
@@ -661,16 +685,21 @@ class Trainer:
                     f"Resumed from checkpoint {self.resume_checkpoint} "
                     f"(step {self.start_step})"
                 )
-                
+
                 # Validate parameter shapes
                 try:
                     emb_shape = self.params["token_embedding"]["embedding"].shape
-                    expected_shape = (self.model_config.vocab_size, self.model_config.d_model)
+                    expected_shape = (
+                        self.model_config.vocab_size,
+                        self.model_config.d_model,
+                    )
                     if emb_shape != expected_shape:
                         print(f"WARNING: Parameter shape mismatch in token_embedding!")
                         print(f"  Checkpoint: {emb_shape}")
                         print(f"  Config:     {expected_shape}")
-                        print(f"  This may cause errors. Consider updating config.vocab_size to {emb_shape[0]}.")
+                        print(
+                            f"  This may cause errors. Consider updating config.vocab_size to {emb_shape[0]}."
+                        )
                 except KeyError:
                     pass
             else:
@@ -689,33 +718,59 @@ class Trainer:
                 # 1. Grad step for FSDP
                 def fsdp_grad_step_fn(params, x, y):
                     def loss_fn(p):
-                        p_apply = cast_params_to_dtype(p, self.compute_dtype) if (self.compute_dtype != jnp.float32 and self.train_config.keep_weights_fp32) else p
-                        logits = self.model.apply({"params": p_apply}, x, deterministic=True)
-                        loss = sparse_categorical_crossentropy_loss(logits, y, ignore_class=0)
+                        p_apply = (
+                            cast_params_to_dtype(p, self.compute_dtype)
+                            if (
+                                self.compute_dtype != jnp.float32
+                                and self.train_config.keep_weights_fp32
+                            )
+                            else p
+                        )
+                        logits = self.model.apply(
+                            {"params": p_apply}, x, deterministic=True
+                        )
+                        loss = sparse_categorical_crossentropy_loss(
+                            logits, y, ignore_class=0
+                        )
                         return loss, logits
-                    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+
+                    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                        params
+                    )
                     grads = _apply_grad_mask(grads, self._grad_mask)
                     metrics = compute_batch_metrics(logits, y, ignore_class=0)
                     return grads, metrics
 
                 self._fsdp_grad_step = pjit(
                     fsdp_grad_step_fn,
-                    in_shardings=(self.params_sharding, self.data_sharding, self.data_sharding),
+                    in_shardings=(
+                        self.params_sharding,
+                        self.data_sharding,
+                        self.data_sharding,
+                    ),
                     out_shardings=(self.params_sharding, metrics_sharding),
                 )
-                
+
                 # 2. Update step for FSDP
                 def fsdp_update_step_fn(params, opt_state, grads):
-                    updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
+                    updates, new_opt_state = self.optimizer.update(
+                        grads, opt_state, params
+                    )
                     new_params = optax.apply_updates(params, updates)
                     return new_params, new_opt_state
 
                 self._fsdp_update_step = pjit(
                     fsdp_update_step_fn,
-                    in_shardings=(self.params_sharding, self.opt_state_sharding, self.params_sharding),
+                    in_shardings=(
+                        self.params_sharding,
+                        self.opt_state_sharding,
+                        self.params_sharding,
+                    ),
                     out_shardings=(self.params_sharding, self.opt_state_sharding),
                 )
-                print(f"Using FSDP with gradient accumulation: {grad_accum_steps} steps")
+                print(
+                    f"Using FSDP with gradient accumulation: {grad_accum_steps} steps"
+                )
             else:
                 step_fn = make_fsdp_train_step(
                     self.model, self.optimizer, self.compute_dtype, self._grad_mask
@@ -804,9 +859,9 @@ class Trainer:
                 batch_size=tc.batch_size,
                 max_steps=micro_steps,
                 maxlen=tc.maxlen,
-                prefetch_buffer=tc.prefetch_batches
-                if tc.prefetch_batches > 0
-                else None,
+                prefetch_buffer=(
+                    tc.prefetch_batches if tc.prefetch_batches > 0 else None
+                ),
             )
             data_iterator = dataset.as_numpy_iterator()
             # We need to track tokens manually since we are not using the python DataLoader class
@@ -857,20 +912,22 @@ class Trainer:
                 y = jax.device_put(
                     jnp.array(y_batch, dtype=jnp.int32), self.data_sharding
                 )
-                
+
                 if grad_accum_steps > 1:
                     with self.mesh:
                         grads, metrics_step = self._fsdp_grad_step(self.params, x, y)
-                    
+
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
-                    
+
                     if metrics_accum is None:
                         metrics_accum = metrics_step
                     else:
-                        metrics_accum = jax.tree_util.tree_map(jnp.add, metrics_accum, metrics_step)
+                        metrics_accum = jax.tree_util.tree_map(
+                            jnp.add, metrics_accum, metrics_step
+                        )
 
                     accum_count += 1
-                    
+
                     if accum_count >= grad_accum_steps:
                         with self.mesh:
                             self.params, self.opt_state = self._fsdp_update_step(
@@ -912,11 +969,13 @@ class Trainer:
                 if grad_accum_steps > 1:
                     metrics_step, grads = self._grad_step(self.params, x, y)
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
-                    
+
                     if metrics_accum is None:
                         metrics_accum = metrics_step
                     else:
-                        metrics_accum = jax.tree_util.tree_map(jnp.add, metrics_accum, metrics_step)
+                        metrics_accum = jax.tree_util.tree_map(
+                            jnp.add, metrics_accum, metrics_step
+                        )
 
                     accum_count += 1
                     if accum_count >= grad_accum_steps:
@@ -998,7 +1057,7 @@ class Trainer:
         # This is now the only place we should be calling device_get for metrics
         # We sync FIRST to ensure accurate timing (Sync-to-Sync)
         results = jax.device_get(metrics.result())
-        
+
         current_time = time.time()
         elapsed = current_time - last_log_time
         log_interval = self.train_config.log_every_n_steps
@@ -1032,7 +1091,7 @@ class Trainer:
                 "tokens_seen": tokens_seen,
             }
             self._wandb.log(log_data, step=macro_step)
-            
+
         return current_time
 
     def _generate_sample(self, step: int):

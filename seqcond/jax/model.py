@@ -14,6 +14,8 @@ from .mamba.mamba import Mamba2Block, Mamba2RMSNorm
 from .mamba.config import Mamba2Config
 from .weight_tied_dense import WeightTiedDense
 from .bivector import TransformerDecoderBlock as BivectorBlock
+from .rwkv_wrapper import RWKVModel, create_rwkv_model
+from .rwkv_hybrid import RWKVHybridModel, create_rwkv_hybrid_model
 
 
 class TransformerModel(nn.Module):

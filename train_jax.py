@@ -15,56 +15,194 @@ os.environ["JAX_PLATFORMS"] = "tpu"
 
 logging.getLogger("jax").setLevel(logging.ERROR)
 
+
 # Pre-define parse_args so we can use it before full imports
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train SeqCond model", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description="Train SeqCond model",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
     # # Distributed / Debugging
     # parser.add_argument("--jax-distributed", action="store_true", help="Initialize JAX distributed system (for multi-host TPU)")
     # parser.add_argument("--jax-smi", action="store_true", help="Enable JAX SMI tracking (memory profiler)")
 
     # Base Configuration
-    parser.add_argument("--size", choices=["small", "medium", "large", "xlarge"], default="small", help="Base model size configuration")
-    parser.add_argument("--resume-step", type=int, default=None, help="Step to resume training from")
-    parser.add_argument("--resume-checkpoint", type=str, default=None, help="Specific checkpoint file path")
+    parser.add_argument(
+        "--size",
+        choices=["small", "medium", "large", "xlarge"],
+        default="small",
+        help="Base model size configuration",
+    )
+    parser.add_argument(
+        "--resume-step", type=int, default=None, help="Step to resume training from"
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Specific checkpoint file path",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     # Model Configuration Overrides
     grp_model = parser.add_argument_group("Model Overrides")
-    grp_model.add_argument("--model-type", choices=["seqcond", "transformer", "bivector", "mamba"], default=None, help="Override model architecture type")
-    grp_model.add_argument("--num-layers", type=int, default=None, help="Override number of layers")
-    grp_model.add_argument("--d-model", type=int, default=None, help="Override model dimension")
-    grp_model.add_argument("--d-ff", type=int, default=None, help="Override feed-forward dimension")
-    grp_model.add_argument("--num-thetas", type=int, default=None, help="Override number of theta parameters")
-    grp_model.add_argument("--ratio", type=int, default=None, dest="seqcond_ratio", help="Override seqcond to transformer ratio")
-    grp_model.add_argument("--derivative", type=int, default=None, dest="derivative_order", help="Override derivative order (0, 1, 2)")
-    grp_model.add_argument("--anchor", type=int, default=None, dest="num_anchor_heads", help="Override number of anchor heads")
-    grp_model.add_argument("--seqcond-heads", type=int, default=None, help="Override number of seqcond heads")
-    grp_model.add_argument("--seqcond-query-heads", type=int, default=6, dest="num_query_heads", help="Override number of seqcond query heads")
-    grp_model.add_argument("--expand", type=float, default=1.0, dest="expand_factor", help="Override expand factor")
-    grp_model.add_argument("--maxlen", type=int, default=1024, help="Context length (affects model and training)")
-    grp_model.add_argument("--chunk", type=int, default=0, dest="chunk_size", help="Chunk size for cumsum (0 = normal)")
-    grp_model.add_argument("--square-matrix", action="store_true", dest="use_square_matrix", help="Use square matrix for seqcond")
-    grp_model.add_argument("--state-size", type=int, default=None, help="Mamba state size")
-    grp_model.add_argument("--conv-kernel", type=int, default=None, dest="conv_kernel_size", help="Conv kernel size")
+    grp_model.add_argument(
+        "--model-type",
+        choices=["seqcond", "transformer", "bivector", "mamba", "rwkv"],
+        default=None,
+        help="Override model architecture type",
+    )
+    grp_model.add_argument(
+        "--num-layers", type=int, default=None, help="Override number of layers"
+    )
+    grp_model.add_argument(
+        "--d-model", type=int, default=None, help="Override model dimension"
+    )
+    grp_model.add_argument(
+        "--d-ff", type=int, default=None, help="Override feed-forward dimension"
+    )
+    grp_model.add_argument(
+        "--num-thetas",
+        type=int,
+        default=None,
+        help="Override number of theta parameters",
+    )
+    grp_model.add_argument(
+        "--ratio",
+        type=int,
+        default=None,
+        dest="seqcond_ratio",
+        help="Override seqcond to transformer ratio",
+    )
+    grp_model.add_argument(
+        "--derivative",
+        type=int,
+        default=None,
+        dest="derivative_order",
+        help="Override derivative order (0, 1, 2)",
+    )
+    grp_model.add_argument(
+        "--anchor",
+        type=int,
+        default=None,
+        dest="num_anchor_heads",
+        help="Override number of anchor heads",
+    )
+    grp_model.add_argument(
+        "--seqcond-heads",
+        type=int,
+        default=None,
+        help="Override number of seqcond heads",
+    )
+    grp_model.add_argument(
+        "--seqcond-query-heads",
+        type=int,
+        default=6,
+        dest="num_query_heads",
+        help="Override number of seqcond query heads",
+    )
+    grp_model.add_argument(
+        "--expand",
+        type=float,
+        default=2.0,
+        dest="expand_factor",
+        help="Override expand factor",
+    )
+    grp_model.add_argument(
+        "--maxlen",
+        type=int,
+        default=1024,
+        help="Context length (affects model and training)",
+    )
+    grp_model.add_argument(
+        "--chunk",
+        type=int,
+        default=0,
+        dest="chunk_size",
+        help="Chunk size for cumsum (0 = normal)",
+    )
+    grp_model.add_argument(
+        "--square-matrix",
+        action="store_true",
+        dest="use_square_matrix",
+        help="Use square matrix for seqcond",
+    )
+    grp_model.add_argument(
+        "--state-size", type=int, default=None, help="Mamba state size"
+    )
+    grp_model.add_argument(
+        "--conv-kernel",
+        type=int,
+        default=None,
+        dest="conv_kernel_size",
+        help="Conv kernel size",
+    )
 
     # Training Configuration Overrides
     grp_train = parser.add_argument_group("Training Overrides")
-    grp_train.add_argument("--use-multiple-tpus", action="store_true", help="Enable pmap/multi-device training")
-    grp_train.add_argument("--fsdp", action="store_true", dest="full_shard_data_parallel", help="Enable FSDP")
-    grp_train.add_argument("--freeze-thetas", action="store_true", help="Freeze theta parameters")
-    grp_train.add_argument("--batch-size", type=int, default=None, help="Override batch size")
-    grp_train.add_argument("--grad-accum-steps", type=int, default=None, help="Number of gradient accumulation steps")
-    grp_train.add_argument("--total-steps", type=int, default=None, help="Override total training steps")
-    grp_train.add_argument("--save-every-n-steps", type=int, default=None, help="Checkpoint interval")
-    grp_train.add_argument("--log-every-n-steps", type=int, default=None, help="Logging interval")
-    grp_train.add_argument("--generate-every-n_steps", type=int, default=None, help="Generation sample interval")
-    grp_train.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
-    grp_train.add_argument("--prefetch-batches", type=int, default=None, help="Number of batches to prefetch")
-    grp_train.add_argument("--lr", type=float, default=1e-3, dest="base_lr", help="Learning rate (supports scientific notation like 1e-3, 6e-4)")
-    grp_train.add_argument("--no-remat", action="store_true", help="Disable gradient checkpointing (rematerialization)")
+    grp_train.add_argument(
+        "--use-multiple-tpus",
+        action="store_true",
+        help="Enable pmap/multi-device training",
+    )
+    grp_train.add_argument(
+        "--fsdp",
+        action="store_true",
+        dest="full_shard_data_parallel",
+        help="Enable FSDP",
+    )
+    grp_train.add_argument(
+        "--freeze-thetas", action="store_true", help="Freeze theta parameters"
+    )
+    grp_train.add_argument(
+        "--batch-size", type=int, default=None, help="Override batch size"
+    )
+    grp_train.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Number of gradient accumulation steps",
+    )
+    grp_train.add_argument(
+        "--total-steps", type=int, default=None, help="Override total training steps"
+    )
+    grp_train.add_argument(
+        "--save-every-n-steps", type=int, default=None, help="Checkpoint interval"
+    )
+    grp_train.add_argument(
+        "--log-every-n-steps", type=int, default=None, help="Logging interval"
+    )
+    grp_train.add_argument(
+        "--generate-every-n_steps",
+        type=int,
+        default=None,
+        help="Generation sample interval",
+    )
+    grp_train.add_argument(
+        "--wandb-project", type=str, default=None, help="WandB project name"
+    )
+    grp_train.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=None,
+        help="Number of batches to prefetch",
+    )
+    grp_train.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        dest="base_lr",
+        help="Learning rate (supports scientific notation like 1e-3, 6e-4)",
+    )
+    grp_train.add_argument(
+        "--no-remat",
+        action="store_true",
+        help="Disable gradient checkpointing (rematerialization)",
+    )
 
     return parser.parse_args()
+
 
 # Parse args immediately to configure environment
 args = parse_args()
@@ -86,27 +224,44 @@ from jax_smi import initialise_tracking
 
 def get_config(args) -> Config:
     """Builds the configuration object from arguments."""
-    
+
     # 1. Base Model Config
     model_factory = getattr(ModelConfig, args.size)
-    
+
     # Collect overrides for ModelConfig
     model_overrides = {}
-    
+
     # Direct mappings (name matches)
-    for field in ["num_layers", "d_model", "d_ff", "num_thetas", "seqcond_heads", "num_query_heads", "model_type", "seqcond_ratio", "expand_factor", "chunk_size", "use_square_matrix", "state_size", "conv_kernel_size"]:
+    for field in [
+        "num_layers",
+        "d_model",
+        "d_ff",
+        "num_thetas",
+        "seqcond_heads",
+        "num_query_heads",
+        "model_type",
+        "seqcond_ratio",
+        "expand_factor",
+        "chunk_size",
+        "use_square_matrix",
+        "state_size",
+        "conv_kernel_size",
+    ]:
         val = getattr(args, field)
         if val is not None:
             model_overrides[field] = val
 
     # Renamed/Special mappings
-    if args.derivative_order is not None: model_overrides["derivative_order"] = args.derivative_order
-    if args.num_anchor_heads is not None: model_overrides["num_anchor_heads"] = args.num_anchor_heads
-    if args.maxlen is not None: model_overrides["maxlen"] = args.maxlen
+    if args.derivative_order is not None:
+        model_overrides["derivative_order"] = args.derivative_order
+    if args.num_anchor_heads is not None:
+        model_overrides["num_anchor_heads"] = args.num_anchor_heads
+    if args.maxlen is not None:
+        model_overrides["maxlen"] = args.maxlen
 
     # Create model config
     model_config = model_factory(**model_overrides)
-    
+
     # Remat logic
     if args.no_remat:
         model_config.remat = False
@@ -115,7 +270,7 @@ def get_config(args) -> Config:
     # Default values suitable for this script (preserved from original file)
     training_defaults = dict(
         batch_size=1,
-        maxlen=args.maxlen, # Sync with model maxlen
+        maxlen=args.maxlen,  # Sync with model maxlen
         base_lr=1e-3,
         warmup_steps=2000,
         total_steps=500000,
@@ -137,15 +292,24 @@ def get_config(args) -> Config:
     training_config = TrainingConfig(**training_defaults)
 
     # Apply Overrides
-    if args.use_multiple_tpus: training_config.use_multiple_tpus = True
-    if args.full_shard_data_parallel: training_config.full_shard_data_parallel = True
-    if args.freeze_thetas: training_config.train_thetas = False
-    
+    if args.use_multiple_tpus:
+        training_config.use_multiple_tpus = True
+    if args.full_shard_data_parallel:
+        training_config.full_shard_data_parallel = True
+    if args.freeze_thetas:
+        training_config.train_thetas = False
+
     # Map other training args if they are not None
     train_fields = [
-        "batch_size", "total_steps", "save_every_n_steps", "log_every_n_steps", 
-        "wandb_project", "prefetch_batches", "base_lr", "generate_every_n_steps",
-        "grad_accum_steps"
+        "batch_size",
+        "total_steps",
+        "save_every_n_steps",
+        "log_every_n_steps",
+        "wandb_project",
+        "prefetch_batches",
+        "base_lr",
+        "generate_every_n_steps",
+        "grad_accum_steps",
     ]
     for field in train_fields:
         val = getattr(args, field)
@@ -158,7 +322,7 @@ def get_config(args) -> Config:
 def main():
     initialise_tracking()
     print("JAX SMI tracking enabled")
-    
+
     config = get_config(args)
 
     # Resume Logic

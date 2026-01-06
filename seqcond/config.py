@@ -12,7 +12,9 @@ class ModelConfig:
     """Configuration for model architecture."""
 
     # Model type
-    model_type: Literal["transformer", "seqcond", "bivector", "mamba"] = "seqcond"
+    model_type: Literal["transformer", "seqcond", "bivector", "mamba", "rwkv"] = (
+        "seqcond"
+    )
 
     # Core architecture
     d_model: int = 768
@@ -65,6 +67,8 @@ class ModelConfig:
         elif self.model_type == "mamba":
             base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
             base += f"-s{self.state_size}-r{self.seqcond_ratio}"
+        elif self.model_type == "rwkv":
+            base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
         else:
             base = f"{self.model_type}-l{self.num_layers}-d{self.d_model}"
         return base

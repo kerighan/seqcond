@@ -163,6 +163,84 @@ class RotarySelfAttention(nn.Module):
         out = out.reshape(b, l, self.d_model)
         return self.out_proj(out)
 
+    @nn.compact
+    def step(self, x_t, kv_cache, pos, cos_t, sin_t, deterministic=True):
+        """
+        O(L) autoregressive decoding step with KV cache.
+
+        Args:
+            x_t: Input token embedding (B, D)
+            kv_cache: Tuple of (k_cache, v_cache) where each is (B, L_cache, num_kv_heads, head_dim)
+            pos: Current position (scalar or (B,))
+            cos_t: RoPE cos for current position (B, 1, num_heads, head_dim//2)
+            sin_t: RoPE sin for current position (B, 1, num_heads, head_dim//2)
+            deterministic: Whether to use dropout
+
+        Returns:
+            out: (B, D) - output for this step
+            new_kv_cache: Updated KV cache tuple
+        """
+        b = x_t.shape[0]
+
+        # Project query for current token
+        q = self.q_proj(x_t).reshape(b, 1, self.num_heads, self.head_dim)
+        k_new = self.k_proj(x_t).reshape(b, 1, self._num_kv_heads, self.head_dim)
+        v_new = self.v_proj(x_t).reshape(b, 1, self._num_kv_heads, self.head_dim)
+
+        # Apply RoPE to query and new key
+        q = apply_rope(q, cos_t, sin_t)
+        if self._num_kv_heads < self.num_heads:
+            cos_kv = cos_t[:, :, : self._num_kv_heads, :]
+            sin_kv = sin_t[:, :, : self._num_kv_heads, :]
+            k_new = apply_rope(k_new, cos_kv, sin_kv)
+        else:
+            k_new = apply_rope(k_new, cos_t, sin_t)
+
+        # Update KV cache
+        k_cache, v_cache = kv_cache
+        k_cache = jnp.concatenate(
+            [k_cache, k_new], axis=1
+        )  # (B, L+1, num_kv_heads, head_dim)
+        v_cache = jnp.concatenate([v_cache, v_new], axis=1)
+
+        # QK normalization
+        if self.qk_norm:
+            q_f32 = q.astype(jnp.float32)
+            k_f32 = k_cache.astype(jnp.float32)
+            q_ms = jnp.mean(jnp.square(q_f32), axis=-1, keepdims=True)
+            k_ms = jnp.mean(jnp.square(k_f32), axis=-1, keepdims=True)
+            q = (q_f32 * jax.lax.rsqrt(q_ms + self.qk_norm_eps)).astype(q.dtype)
+            k_cache_norm = (k_f32 * jax.lax.rsqrt(k_ms + self.qk_norm_eps)).astype(
+                k_cache.dtype
+            )
+        else:
+            k_cache_norm = k_cache
+
+        # Repeat KV for GQA
+        k_repeated = self._repeat_kv(k_cache_norm)
+        v_repeated = self._repeat_kv(v_cache)
+
+        # Compute attention (only for current query position)
+        scale = jax.lax.rsqrt(jnp.float32(self.head_dim))
+        scores = (
+            jnp.einsum("bqhd,bkhd->bhqk", q, k_repeated) * scale
+        )  # (B, num_heads, 1, L+1)
+
+        # Causal mask: current position can attend to all previous positions
+        # No masking needed since we're only computing for the last position
+
+        attn = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
+        attn = attn.astype(v_repeated.dtype)
+        attn = self.attn_dropout(attn, deterministic=deterministic)
+
+        # Compute output
+        out = jnp.einsum(
+            "bhqk,bkhd->bqhd", attn, v_repeated
+        )  # (B, 1, num_heads, head_dim)
+        out = out.reshape(b, self.d_model)
+
+        return self.out_proj(out), (k_cache, v_cache)
+
 
 class TransformerDecoderBlock(nn.Module):
     d_model: int
@@ -209,3 +287,34 @@ class TransformerDecoderBlock(nn.Module):
         y = jax.nn.swish(v) * u
         y = self.ff_out(y)
         return x + self.drop2(y, deterministic=deterministic)
+
+    def step(self, x_t, kv_cache, pos, cos_t, sin_t, deterministic=True):
+        """
+        O(L) autoregressive decoding step for transformer block.
+
+        Args:
+            x_t: Input token embedding (B, D)
+            kv_cache: KV cache from attention layer
+            pos: Current position
+            cos_t: RoPE cos for current position
+            sin_t: RoPE sin for current position
+            deterministic: Whether to use dropout
+
+        Returns:
+            out: (B, D) - output for this step
+            new_kv_cache: Updated KV cache
+        """
+        # Attention with KV cache
+        y = self.norm1(x_t)
+        y, new_kv_cache = self.attn.step(
+            y, kv_cache, pos, cos_t, sin_t, deterministic=deterministic
+        )
+        x_t = x_t + self.drop1(y, deterministic=deterministic)
+
+        # FFN
+        y = self.norm2(x_t)
+        u, v = jnp.split(self.ff_in(y), 2, axis=-1)
+        y = jax.nn.swish(v) * u
+        y = self.ff_out(y)
+
+        return x_t + self.drop2(y, deterministic=deterministic), new_kv_cache
