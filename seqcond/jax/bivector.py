@@ -121,15 +121,22 @@ class BivectorRotarySelfAttention(nn.Module):
         q_rope = q_rope.astype(jnp.float32)
         k_rope = k_rope.astype(jnp.float32)
 
-        # Matrice d'interaction [B, H, L, M, 2, 2]
-        # Note: einsum change l'ordre L (query len) et M (key len)
-        interaction = jnp.einsum("blhid,bmhjd->bhlmij", q_rope, k_rope)
+        # Extraire les composantes du bivecteur après GQA
+        # q0, q1 shape: [B, L, H, D/2]
+        # k0, k1 shape: [B, L, H, D/2]
+        q0, q1 = q_rope[..., 0, :], q_rope[..., 1, :]
+        k0, k1 = k_rope[..., 0, :], k_rope[..., 1, :]
+
+        # Calculer les 4 produits scalaires matriciels directement
+        # Chaque résultat a la forme [B, H, L, M]
+        q0k0 = jnp.einsum("blhd,bmhd->bhlm", q0, k0)
+        q1k1 = jnp.einsum("blhd,bmhd->bhlm", q1, k1)
+        q0k1 = jnp.einsum("blhd,bmhd->bhlm", q0, k1)
+        q1k0 = jnp.einsum("blhd,bmhd->bhlm", q1, k0)
 
         # Calcul du "Déterminant" généralisé
-        # Terme principal: (q0.k0 * q1.k1)
-        diag = interaction[..., 0, 0] * interaction[..., 1, 1]
-        # Terme croisé: (q0.k1 * q1.k0)
-        cross = interaction[..., 0, 1] * interaction[..., 1, 0]
+        diag = q0k0 * q1k1
+        cross = q0k1 * q1k0
 
         # Scores bruts
         raw_scores = diag - 2 * jnp.tanh(self.q_param) * cross

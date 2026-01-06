@@ -106,10 +106,9 @@ class RotarySelfAttention(nn.Module):
         )
         return x.reshape(b, l, self.num_heads, *extra_shape[1:])
 
-
-@lru_cache(maxsize=32)
-def _cached_causal_mask(length: int) -> jnp.ndarray:
-    return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
+    @lru_cache(maxsize=32)
+    def _cached_causal_mask(length: int) -> jnp.ndarray:
+        return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
 
     @nn.compact
     def __call__(
