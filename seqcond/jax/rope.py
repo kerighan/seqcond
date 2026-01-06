@@ -69,6 +69,11 @@ def apply_rope(tensor: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.n
     return rot.reshape(tensor.shape)
 
 
+@lru_cache(maxsize=32)
+def _cached_causal_mask(length: int) -> jnp.ndarray:
+    return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
+
+
 class RotarySelfAttention(nn.Module):
     d_model: int
     num_heads: int
@@ -105,10 +110,6 @@ class RotarySelfAttention(nn.Module):
             x, (b, l, self._num_kv_heads, self.num_groups, *extra_shape[1:])
         )
         return x.reshape(b, l, self.num_heads, *extra_shape[1:])
-
-    @lru_cache(maxsize=32)
-    def _cached_causal_mask(length: int) -> jnp.ndarray:
-        return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
 
     @nn.compact
     def __call__(
