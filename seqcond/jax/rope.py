@@ -1,5 +1,4 @@
 import math
-from functools import lru_cache
 from typing import Optional, Tuple
 
 import jax
@@ -69,8 +68,8 @@ def apply_rope(tensor: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.n
     return rot.reshape(tensor.shape)
 
 
-@lru_cache(maxsize=32)
-def _cached_causal_mask(length: int) -> jnp.ndarray:
+def _make_causal_mask(length: int) -> jnp.ndarray:
+    """Create causal mask. JAX will cache/optimize this during compilation."""
     return jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))
 
 
@@ -148,7 +147,7 @@ class RotarySelfAttention(nn.Module):
         scale = jax.lax.rsqrt(jnp.float32(self.head_dim))
         scores = jnp.einsum("blhd,bmhd->bhlm", q, k) * scale
 
-        causal_mask = _cached_causal_mask(l)[None, None, :, :]
+        causal_mask = _make_causal_mask(l)[None, None, :, :]
 
         large_neg = jnp.float32(-1e4)  # -1e9 overflows float16/bfloat16
         if mask is not None:
