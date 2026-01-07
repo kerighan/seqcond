@@ -1066,13 +1066,13 @@ class Trainer:
         tokens_seen: int = 0,
     ) -> float:
         """Log training progress (only from process 0 to avoid duplicate logs)."""
+        # All processes must participate in metrics.result() for multi-host coordination
+        # This ensures collective operations are synchronized across all processes
+        results = jax.device_get(metrics.result())
+
         # Only process 0 should log in multi-host setup
         if jax.process_index() != 0:
             return last_log_time
-
-        # This is now the only place we should be calling device_get for metrics
-        # We sync FIRST to ensure accurate timing (Sync-to-Sync)
-        results = jax.device_get(metrics.result())
 
         current_time = time.time()
         elapsed = current_time - last_log_time
