@@ -717,7 +717,7 @@ class Trainer:
         if self.use_fsdp:
             if grad_accum_steps > 1:
                 # 1. Grad step for FSDP
-                def fsdp_grad_step_fn(params, x, y):
+                def fsdp_grad_step_fn(params, x, y, grad_mask):
                     def loss_fn(p):
                         p_apply = (
                             cast_params_to_dtype(p, self.compute_dtype)
@@ -738,9 +738,14 @@ class Trainer:
                     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                         params
                     )
-                    grads = _apply_grad_mask(grads, self._grad_mask)
+                    grads = _apply_grad_mask(grads, grad_mask)
                     metrics = compute_batch_metrics(logits, y, ignore_class=0)
                     return grads, metrics
+
+                # grad_mask has same sharding as params
+                grad_mask_sharding = (
+                    self.params_sharding if self._grad_mask is not None else None
+                )
 
                 self._fsdp_grad_step = pjit(
                     fsdp_grad_step_fn,
@@ -748,6 +753,7 @@ class Trainer:
                         self.params_sharding,
                         self.data_sharding,
                         self.data_sharding,
+                        grad_mask_sharding,
                     ),
                     out_shardings=(self.params_sharding, metrics_sharding),
                 )
@@ -919,7 +925,9 @@ class Trainer:
 
                 if grad_accum_steps > 1:
                     with self.mesh:
-                        grads, metrics_step = self._fsdp_grad_step(self.params, x, y)
+                        grads, metrics_step = self._fsdp_grad_step(
+                            self.params, x, y, self._grad_mask
+                        )
 
                     grads_accum = accumulate_grads(grads_accum, grads, grad_accum_steps)
 
