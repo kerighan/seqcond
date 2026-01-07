@@ -6,7 +6,7 @@ from .rope import (
     get_rope_embeddings,
     apply_rope,
 )
-from .seqcond_summary import SeqCondAttention, SeqCondBlock
+from .seqcond_light import SeqCondAttention, SeqCondBlock
 from .weight_tied_dense import WeightTiedDense
 from .metrics import (
     sparse_categorical_accuracy_ignore_zero,

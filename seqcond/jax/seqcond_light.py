@@ -8,8 +8,9 @@ import numpy as np
 
 class SeqCondAttention(nn.Module):
     """
-    Simplified SeqCond: No queries.
-    Memory conv -> characteristic function summary -> flatten -> SwiGLU with skip.
+    Lightweight SeqCond: No queries, no SwiGLU.
+    Memory conv -> characteristic function summary -> flatten -> single Dense.
+    Minimal parameters like Mamba for deeper models.
     """
 
     num_heads: int = 12
@@ -40,16 +41,10 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // (self.K * self.M))
         dim_memory = self.K * H
 
-        dim_expand = H * self.out_expand_factor
-        dim_swiglu_head = dim_expand * 2
-        dim_swiglu_total = self.K * dim_swiglu_head
-
-        # Fused projection (optimization 1)
-        dim_fused = dim_memory + self.K + dim_swiglu_total
-        z_fused = nn.Dense(dim_fused, use_bias=False, name="in_proj_fused")(x)
-
-        z_mem = z_fused[..., : dim_memory + self.K].astype(self.compute_dtype)
-        skip_direct = z_fused[..., dim_memory + self.K :]
+        # Light version: no SwiGLU, just memory projection
+        dim_fused = dim_memory + self.K
+        z_mem = nn.Dense(dim_fused, use_bias=False, name="in_proj")(x)
+        z_mem = z_mem.astype(self.compute_dtype)
 
         # Memory conv
         z_mem = nn.Conv(
@@ -206,29 +201,11 @@ class SeqCondAttention(nn.Module):
 
         # Flatten summary (no queries)
         # Shape: (B, L, K, H, M) -> (B, L, K*H*M*2)
-        # Optimization 2: stack + reshape instead of concatenate
         summary_flat = jnp.stack([state_re, state_im], axis=-1).reshape(B, L, -1)
         summary_flat = summary_flat.astype(self.compute_dtype)
 
-        # SwiGLU with skip
-        y_spectral = nn.Dense(dim_swiglu_total, use_bias=False, name="swiglu_proj")(
-            summary_flat
-        )
-        y_spectral = y_spectral.reshape(B, L, self.K, dim_swiglu_head)
-        y_skip = skip_direct.reshape(B, L, self.K, dim_swiglu_head)
-
-        # Fusion
-        y_spec_val, y_spec_gate = jnp.split(y_spectral, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        y_val = y_spec_val + y_skip_val
-        y_gate = y_spec_gate + y_skip_gate
-
-        y_act = y_val * jax.nn.silu(y_gate)
-
-        # Output projection
-        y_flat = y_act.reshape(B, L, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Light: single Dense projection (like Mamba)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(summary_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
@@ -260,19 +237,13 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // (self.K * self.M))
         dim_memory = self.K * H
 
-        dim_expand = H * self.out_expand_factor
-        dim_swiglu_head = dim_expand * 2
-        dim_swiglu_total = self.K * dim_swiglu_head
-
         # Unpack state
         den_acc, re_acc, im_acc, pos, conv_buffer = state
 
-        # Fused projection
-        dim_fused = dim_memory + self.K + dim_swiglu_total
-        z_fused = nn.Dense(dim_fused, use_bias=False, name="in_proj_fused")(x_t)
-
-        z_mem = z_fused[..., : dim_memory + self.K].astype(self.compute_dtype)
-        skip_direct = z_fused[..., dim_memory + self.K :]
+        # Light version: no SwiGLU, just memory projection
+        dim_fused = dim_memory + self.K
+        z_mem = nn.Dense(dim_fused, use_bias=False, name="in_proj")(x_t)
+        z_mem = z_mem.astype(self.compute_dtype)
 
         # Memory conv with buffer
         # Concatenate buffer with current input
@@ -415,25 +386,8 @@ class SeqCondAttention(nn.Module):
         summary_flat = jnp.stack([state_re, state_im], axis=-1).reshape(B, -1)
         summary_flat = summary_flat.astype(self.compute_dtype)
 
-        # SwiGLU with skip
-        y_spectral = nn.Dense(dim_swiglu_total, use_bias=False, name="swiglu_proj")(
-            summary_flat
-        )
-        y_spectral = y_spectral.reshape(B, self.K, dim_swiglu_head)
-        y_skip = skip_direct.reshape(B, self.K, dim_swiglu_head)
-
-        # Fusion
-        y_spec_val, y_spec_gate = jnp.split(y_spectral, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        y_val = y_spec_val + y_skip_val
-        y_gate = y_spec_gate + y_skip_gate
-
-        y_act = y_val * jax.nn.silu(y_gate)
-
-        # Output projection
-        y_flat = y_act.reshape(B, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Light: single Dense projection (like Mamba)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(summary_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
@@ -449,9 +403,7 @@ class SeqCondBlock(nn.Module):
     expand_factor: float = 1.0
     num_thetas: int = 1
     num_anchor_heads: int = 0
-    conv_kernel_size: int = (
-        4  # For interface compatibility, not used in summary version
-    )
+    conv_kernel_size: int = 4
     dropout: float = 0.0
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None

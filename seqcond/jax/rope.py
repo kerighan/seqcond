@@ -170,7 +170,8 @@ class RotarySelfAttention(nn.Module):
 
         Args:
             x_t: Input token embedding (B, D)
-            kv_cache: Tuple of (k_cache, v_cache) where each is (B, L_cache, num_kv_heads, head_dim)
+            kv_cache: Tuple of (k_cache, v_cache) where each is (B, cache_size, num_kv_heads, head_dim)
+                     Cache should be pre-allocated to power-of-2 size for efficiency
             pos: Current position (scalar or (B,))
             cos_t: RoPE cos for current position (B, 1, num_heads, head_dim//2)
             sin_t: RoPE sin for current position (B, 1, num_heads, head_dim//2)
@@ -178,7 +179,7 @@ class RotarySelfAttention(nn.Module):
 
         Returns:
             out: (B, D) - output for this step
-            new_kv_cache: Updated KV cache tuple
+            new_kv_cache: Updated KV cache tuple (same shape, updated in-place at position)
         """
         b = x_t.shape[0]
 
@@ -196,12 +197,21 @@ class RotarySelfAttention(nn.Module):
         else:
             k_new = apply_rope(k_new, cos_t, sin_t)
 
-        # Update KV cache
+        # Update KV cache at current position (in-place update for fixed-size cache)
         k_cache, v_cache = kv_cache
-        k_cache = jnp.concatenate(
-            [k_cache, k_new], axis=1
-        )  # (B, L+1, num_kv_heads, head_dim)
-        v_cache = jnp.concatenate([v_cache, v_new], axis=1)
+        cache_len = k_cache.shape[1]
+
+        # Ensure pos is a scalar (squeeze if it's an array)
+        pos_scalar = jnp.squeeze(pos) if hasattr(pos, "shape") else pos
+
+        # Update cache at position using dynamic slice update
+        k_cache = jax.lax.dynamic_update_slice(k_cache, k_new, (0, pos_scalar, 0, 0))
+        v_cache = jax.lax.dynamic_update_slice(v_cache, v_new, (0, pos_scalar, 0, 0))
+
+        # Create attention mask for valid positions (0 to pos)
+        # Shape: (cache_len,)
+        positions = jnp.arange(cache_len)
+        valid_mask = positions <= pos_scalar  # (cache_len,)
 
         # QK normalization
         if self.qk_norm:
@@ -224,10 +234,13 @@ class RotarySelfAttention(nn.Module):
         scale = jax.lax.rsqrt(jnp.float32(self.head_dim))
         scores = (
             jnp.einsum("bqhd,bkhd->bhqk", q, k_repeated) * scale
-        )  # (B, num_heads, 1, L+1)
+        )  # (B, num_heads, 1, cache_len)
 
-        # Causal mask: current position can attend to all previous positions
-        # No masking needed since we're only computing for the last position
+        # Apply mask to ignore invalid positions
+        # Reshape mask for broadcasting: (1, 1, 1, cache_len)
+        mask_broadcast = valid_mask[None, None, None, :]
+        large_neg = jnp.float32(-1e9)
+        scores = jnp.where(mask_broadcast, scores, large_neg)
 
         attn = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
         attn = attn.astype(v_repeated.dtype)
@@ -239,6 +252,7 @@ class RotarySelfAttention(nn.Module):
         )  # (B, 1, num_heads, head_dim)
         out = out.reshape(b, self.d_model)
 
+        # Return updated cache (same shape, updated at position)
         return self.out_proj(out), (k_cache, v_cache)
 
 

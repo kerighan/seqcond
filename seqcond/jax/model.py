@@ -8,7 +8,10 @@ import optax
 import numpy as np
 
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
-from .seqcond_fast import SeqCondBlock
+
+from .seqcond_light import SeqCondBlock
+
+# from .seqcond_summary import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
 from .mamba.mamba import Mamba2Block, Mamba2RMSNorm
 from .mamba.config import Mamba2Config
@@ -248,16 +251,13 @@ class SeqCondModel(nn.Module):
             else:
                 block = SeqBlock(
                     num_heads=_seqcond_heads,
-                    num_query_heads=self.num_query_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
-                    derivative_order=self.derivative_order,
+                    conv_kernel_size=self.conv_kernel_size,
                     expand_factor=self.expand_factor,
                     dropout=self.dropout,
-                    conv_kernel_size=self.conv_kernel_size,
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
-                    chunk_size=self.chunk_size,
                     use_square_matrix=self.use_square_matrix,
                 )
                 blocks.append(("seqcond", block))
