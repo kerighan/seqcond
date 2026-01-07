@@ -32,12 +32,12 @@ d_model = 256
 num_heads = 8
 num_kv_heads = 4
 d_ff = 512
-maxlen = 2048
-max_tokens = 2048
+maxlen = 2048 * 2
+max_tokens = 2048 * 2
 key = jax.random.PRNGKey(42)
 
 # Sample points for measurement
-sample_points = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+sample_points = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
 # ============================================================
 # Initialize SeqCond

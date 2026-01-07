@@ -9,7 +9,7 @@ import numpy as np
 
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 
-from .seqcond_light import SeqCondBlock
+from .seqcond_fast_light import SeqCondBlock
 
 # from .seqcond_summary import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
@@ -251,6 +251,7 @@ class SeqCondModel(nn.Module):
             else:
                 block = SeqBlock(
                     num_heads=_seqcond_heads,
+                    num_query_heads=self.num_query_heads,
                     num_thetas=self.num_thetas,
                     num_anchor_heads=self.num_anchor_heads,
                     conv_kernel_size=self.conv_kernel_size,

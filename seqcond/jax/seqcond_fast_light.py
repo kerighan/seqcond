@@ -370,12 +370,12 @@ class SeqCondAttention(nn.Module):
         dim_query_head = H * self.M * 2
         dim_query_total = self.K_q * dim_query_head
 
-        dim_latent = D // 4
-        dim_gate = self.K
-
-        dim_expand = H * self.out_expand_factor
-        dim_swiglu_head = dim_expand * 2
-        dim_swiglu_total = self.K * dim_swiglu_head
+        # Light version: no skip, no gate, no SwiGLU
+        # dim_latent = D // 4
+        # dim_gate = self.K
+        # dim_expand = H * self.out_expand_factor
+        # dim_swiglu_head = dim_expand * 2
+        # dim_swiglu_total = self.K * dim_swiglu_head
 
         # ======================================================================
         # 1. FUSED INPUT PROJECTIONS
@@ -404,16 +404,9 @@ class SeqCondAttention(nn.Module):
             s_raw = s_raw * mask.astype(x.dtype)[..., None]
             k_val = k_val * m
 
-        # B. Branche Auxiliaire (Query + LatentSkip + Gate)
-        dim_aux_total = dim_query_total + dim_latent + dim_gate
-        z_aux = nn.Dense(dim_aux_total, use_bias=False, name="in_proj_aux")(x)
-
-        idx1 = dim_query_total
-        idx2 = dim_query_total + dim_latent
-
-        q_raw = z_aux[..., :idx1]
-        c_skip = z_aux[..., idx1:idx2]
-        gate_logits = z_aux[..., idx2:]
+        # B. Query branch only (light version)
+        z_query = nn.Dense(dim_query_total, use_bias=False, name="in_proj_query")(x)
+        q_raw = z_query
 
         # Traitement Query
         q_raw = nn.Conv(
@@ -617,42 +610,13 @@ class SeqCondAttention(nn.Module):
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
-        # 5. FUSION FINALE
+        # 5. LIGHT OUTPUT (no SwiGLU, direct projection)
         # ======================================================================
-        W_readout = self.param(
-            "W_readout",
-            nn.initializers.glorot_uniform(),
-            (self.K, 2 * H, dim_swiglu_head),
-        )
-        scale_spec = self.param(
-            "norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H)
-        )
+        # Flatten complex output: (B, L, K, 2*H) -> (B, L, K*2*H)
+        out_flat = out_complex.reshape(B, L, -1)
 
-        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex * scale_spec, W_readout)
-        spec_gate = jax.nn.sigmoid(gate_logits).astype(self.compute_dtype)[
-            ..., None
-        ]  # Sigmoid for bounded gating
-        y_spec = y_spec_raw * spec_gate
-
-        y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
-        y_skip = y_skip_raw.reshape(B, L, self.K, dim_swiglu_head)
-
-        y_spec_val, y_spec_gate = jnp.split(y_spec, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        highway_scale = self.param(
-            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
-        )
-
-        y_val = y_spec_val + (y_skip_val * highway_scale)
-        y_gate = y_spec_gate + (y_skip_gate * highway_scale)
-
-        y_act = y_val * jax.nn.sigmoid(
-            y_gate
-        )  # Sigmoid for bounded gating (SwiGLU style)
-
-        y_flat = y_act.reshape(B, L, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Direct projection to output dimension (like Mamba)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(out_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
@@ -688,9 +652,7 @@ class SeqCondAttention(nn.Module):
         dim_query_head = H * self.M * 2
         dim_query_total = self.K_q * dim_query_head
 
-        dim_expand = H * self.out_expand_factor
-        dim_swiglu_head = dim_expand * 2
-        dim_swiglu_total = self.K * dim_swiglu_head
+        # Light version: no SwiGLU dimensions needed
 
         # Unpack state
         den_acc, re_acc, im_acc, pos, conv_buffer_mem, conv_buffer_query = state
@@ -737,7 +699,7 @@ class SeqCondAttention(nn.Module):
             padding="VALID",
             feature_group_count=conv_input_query.shape[-1],
             use_bias=False,
-            name="conv_query",
+            name="conv_q",
         )(conv_input_query)
 
         z_query = jax.nn.silu(z_query_conv[:, 0, :])
@@ -748,8 +710,7 @@ class SeqCondAttention(nn.Module):
         q_val = z_query.reshape(B, self.K_q, dim_query_head)
         q_val = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_val)
 
-        # Skip branch
-        z_skip = nn.Dense(dim_swiglu_total, use_bias=False, name="in_proj_skip")(x_t)
+        # Light version: no skip branch
 
         # Theta grid
         theta_min, theta_max = 0.001, 3.0
@@ -878,28 +839,12 @@ class SeqCondAttention(nn.Module):
         out_re = q_re_b * state_re_grouped - q_im_b * state_im_grouped
         out_im = q_re_b * state_im_grouped + q_im_b * state_re_grouped
 
-        # Flatten
-        summary_flat = jnp.stack([out_re, out_im], axis=-1).reshape(B, -1)
-        summary_flat = summary_flat.astype(self.compute_dtype)
+        # Flatten complex output
+        out_flat = jnp.stack([out_re, out_im], axis=-1).reshape(B, -1)
+        out_flat = out_flat.astype(self.compute_dtype)
 
-        # SwiGLU
-        y_spectral = nn.Dense(dim_swiglu_total, use_bias=False, name="swiglu_proj")(
-            summary_flat
-        )
-        y_spectral = y_spectral.reshape(B, self.K, dim_swiglu_head)
-        y_skip = z_skip.reshape(B, self.K, dim_swiglu_head)
-
-        y_spec_val, y_spec_gate = jnp.split(y_spectral, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        y_val = y_spec_val + y_skip_val
-        y_gate = y_spec_gate + y_skip_gate
-
-        y_act = y_val * jax.nn.sigmoid(y_gate)
-
-        # Output
-        y_flat = y_act.reshape(B, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Light: direct projection (no SwiGLU)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(out_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
