@@ -3,6 +3,9 @@
 # Usage: ./setup_workers.sh [TPU_NAME] [ZONE]
 # Example: ./setup_workers.sh seqcond-tpu us-central2-b
 
+# Set correct GCloud project
+gcloud config set project seqcond --quiet
+
 # Configuration
 TPU_NAME="${1:-seqcond-tpu}"
 ZONE="${2:-us-central2-b}"

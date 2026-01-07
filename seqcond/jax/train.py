@@ -912,12 +912,10 @@ class Trainer:
             metrics_batch = None
 
             if self.use_fsdp:
-                x = jax.device_put(
-                    jnp.array(x_batch, dtype=jnp.int32), self.data_sharding
-                )
-                y = jax.device_put(
-                    jnp.array(y_batch, dtype=jnp.int32), self.data_sharding
-                )
+                # In multi-host setup, each process has its own data shard
+                # Convert to jax arrays on local devices
+                x = jnp.array(x_batch, dtype=jnp.int32)
+                y = jnp.array(y_batch, dtype=jnp.int32)
 
                 if grad_accum_steps > 1:
                     with self.mesh:
