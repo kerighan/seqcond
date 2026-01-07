@@ -1,30 +1,38 @@
 #!/bin/bash
 
-# --- CONFIGURATION ---
-# Remplacez par le nom de votre TPU et sa zone
-TPU_NAME="seqcond-tpu" 
-ZONE="us-central2-b"
-# Le dossier où se trouve le projet SUR le TPU (doit être identique sur tous les workers)
-REMOTE_DIR="/home/maixent/Documents/seqcond"
-# ---------------------
+# Usage: ./run_tpu.sh "python command" [TPU_NAME] [ZONE]
+# Example: ./run_tpu.sh "python train_jax.py --size small" seqcond-tpu us-central2-b
 
+# Configuration
 CMD=$1
+TPU_NAME="${2:-seqcond-tpu}"
+ZONE="${3:-us-central2-b}"
+REMOTE_DIR="$HOME/seqcond"
 
 if [ -z "$CMD" ]; then
-    echo "Usage: ./run_tpu.sh \"<python command>\""
-    echo "Exemple: ./run_tpu.sh \"python3 train_jax.py --size small --jax-distributed\""
+    echo "Usage: ./run_tpu.sh \"<python command>\" [TPU_NAME] [ZONE]"
+    echo "Example: ./run_tpu.sh \"python train_jax.py --size small --fsdp\" seqcond-tpu us-central2-b"
     exit 1
 fi
 
-echo "--- 1. Mise à jour du code (Git Pull) sur tous les workers ---"
-gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all --command "cd $REMOTE_DIR && git pull"
+echo "=== Running on TPU ==="
+echo "TPU Name: $TPU_NAME"
+echo "Zone: $ZONE"
+echo "Command: $CMD"
+echo ""
 
-echo "--- 2. Nettoyage des processus Python existants ---"
-gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all --command "pkill -9 python3 || true"
+echo "--- 1. Update code (git pull) on all workers ---"
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
+    --command "cd $REMOTE_DIR && git pull"
 
-echo "--- 3. Lancement de l'entraînement ---"
+echo ""
+echo "--- 2. Kill existing Python processes ---"
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
+    --command "pkill -9 python3 || true"
+
+echo ""
+echo "--- 3. Launch training ---"
 gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \
     --worker=all \
     --command "cd $REMOTE_DIR && source ~/.bashrc && $CMD"
-

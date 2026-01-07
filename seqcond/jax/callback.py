@@ -52,11 +52,18 @@ class StepwiseGenerationCallback:
                 f.write(f"(dual pad modes: fixed, power2)\n\n")
 
     def on_train_batch_end(self, params: Any, batch: int):
-        """Called at the end of a training batch."""
+        """Called at the end of a training batch (only runs on process 0 in multi-host)."""
+        # Only process 0 should generate in multi-host setup to avoid race conditions
+        if jax.process_count() > 1 and jax.process_index() != 0:
+            return
+
         self.step_counter += 1
 
-        if self.trigger_every_n_steps > 0 and self.step_counter % self.trigger_every_n_steps == 0:
-            print(f"\n--- Generation at step {self.step_counter} ---")
+        if (
+            self.trigger_every_n_steps > 0
+            and self.step_counter % self.trigger_every_n_steps == 0
+        ):
+            print(f"\n[Process 0] --- Generation at step {self.step_counter} ---")
             # Generate with fixed padding
             txt_fixed = generate_text(
                 model=self.model,

@@ -64,6 +64,7 @@ def iterate_synth(
     max_samples: int = None,
     tokenize: bool = True,
     tok: Tokenizer = None,
+    shard_data: bool = True,
 ) -> Iterator:
     """
     Iterate over PleIAs/SYNTH dataset in streaming mode.
@@ -72,6 +73,7 @@ def iterate_synth(
         max_samples: Maximum number of samples to yield (None = infinite)
         tokenize: If True, yield token IDs; if False, yield formatted text
         tok: Tokenizer to use (default: global tokenizer)
+        shard_data: If True, shard data across JAX processes for multi-host training
 
     Yields:
         Token IDs (list[int]) or formatted text (str)
@@ -79,10 +81,31 @@ def iterate_synth(
     if tok is None:
         tok = tokenizer
 
+    # Check if we should shard data across processes
+    process_index = 0
+    process_count = 1
+
+    if shard_data:
+        try:
+            import jax
+
+            if jax.process_count() > 1:
+                process_index = jax.process_index()
+                process_count = jax.process_count()
+                print(
+                    f"[Process {process_index}/{process_count}] Loading dataset shard..."
+                )
+        except:
+            pass  # JAX not initialized or single process
+
     dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
 
     for i, item in enumerate(dataset):
-        if max_samples is not None and i >= max_samples:
+        # Shard data: each process takes every Nth sample
+        if i % process_count != process_index:
+            continue
+
+        if max_samples is not None and i >= max_samples * process_count:
             break
 
         text = format_synth_item(item)
@@ -94,7 +117,10 @@ def iterate_synth(
             except ValueError as e:
                 if "disallowed special token" in str(e):
                     # Skip this sample entirely and continue to next one
-                    print(f"[WARNING] Skipping sample with disallowed special token: {e}")
+                    if process_index == 0:  # Only log from process 0
+                        print(
+                            f"[WARNING] Skipping sample with disallowed special token: {e}"
+                        )
                     continue
                 else:
                     raise

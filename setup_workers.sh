@@ -1,17 +1,44 @@
 #!/bin/bash
 
+# Usage: ./setup_workers.sh [TPU_NAME] [ZONE]
+# Example: ./setup_workers.sh seqcond-tpu us-central2-b
+
 # Configuration
-TPU_NAME="seqcond-tpu"
-ZONE="us-central2-b"
-REMOTE_DIR="/home/maixent/Documents/seqcond"
+TPU_NAME="${1:-seqcond-tpu}"
+ZONE="${2:-us-central2-b}"
+REPO_URL="https://github.com/kerighan/seqcond"
+REMOTE_DIR="$HOME/seqcond"
 
-echo "--- Installation des dépendances sur TOUS les workers ---"
+echo "=== Setup TPU Workers ==="
+echo "TPU Name: $TPU_NAME"
+echo "Zone: $ZONE"
+echo "Remote Dir: $REMOTE_DIR"
+echo ""
 
-# 1. On s'assure que pip est à jour
+echo "--- 1. Upgrade pip on all workers ---"
 gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
     --command "pip install --upgrade pip"
 
-# 2. On installe les requirements (assurez-vous d'avoir un requirements.txt)
-# Si vous n'avez pas de requirements.txt, listez les libs ici : "pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && pip install flax optax jax-smi wandb tensorflow datasets"
+echo ""
+echo "--- 2. Clone repository (or update if exists) ---"
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
+    --command "if [ -d $REMOTE_DIR ]; then cd $REMOTE_DIR && git pull; else git clone $REPO_URL $REMOTE_DIR; fi"
+
+echo ""
+echo "--- 3. Install JAX for TPU ---"
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
+    --command "pip install 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+
+echo ""
+echo "--- 4. Install requirements.txt ---"
 gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
     --command "cd $REMOTE_DIR && pip install -r requirements.txt"
+
+echo ""
+echo "--- 5. Install jax-smi for monitoring ---"
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all \
+    --command "pip install jax-smi"
+
+echo ""
+echo "=== Setup complete! ==="
+echo "You can now run: ./run_tpu.sh \"python train_jax.py ...\""

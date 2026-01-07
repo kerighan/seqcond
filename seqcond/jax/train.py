@@ -826,7 +826,12 @@ class Trainer:
         return self
 
     def _init_wandb(self, num_params: int):
-        """Initialize wandb logging."""
+        """Initialize wandb logging (only from process 0)."""
+        # Only process 0 should initialize wandb in multi-host setup
+        if jax.process_index() != 0:
+            self._wandb = None
+            return
+
         try:
             import wandb
 
@@ -840,10 +845,10 @@ class Trainer:
                 },
             )
             print(
-                f"Wandb initialized: {self.train_config.wandb_project}/{self.model_name}"
+                f"[Process 0] Wandb initialized: {self.train_config.wandb_project}/{self.model_name}"
             )
         except ImportError:
-            print("Warning: wandb not installed, skipping wandb logging")
+            print("[Process 0] Warning: wandb not installed, skipping wandb logging")
             self._wandb = None
 
     def train(self):
@@ -1054,7 +1059,11 @@ class Trainer:
         tokens_delta: int = 0,
         tokens_seen: int = 0,
     ) -> float:
-        """Log training progress."""
+        """Log training progress (only from process 0 to avoid duplicate logs)."""
+        # Only process 0 should log in multi-host setup
+        if jax.process_index() != 0:
+            return last_log_time
+
         # This is now the only place we should be calling device_get for metrics
         # We sync FIRST to ensure accurate timing (Sync-to-Sync)
         results = jax.device_get(metrics.result())
@@ -1121,7 +1130,7 @@ class Trainer:
 
         print("\n-----\n")
 
-        print(f"--- Generation at step {step} (power2 padding) ---")
+        print(f"[Process 0] --- Generation at step {step} (power2 padding) ---")
         txt_power2 = generate_text(
             model=self.model,
             params=host_params,
@@ -1141,7 +1150,11 @@ class Trainer:
         _ = (txt_fixed, txt_power2)
 
     def _save_checkpoint(self, step: int, final: bool = False):
-        """Save a checkpoint."""
+        """Save a checkpoint (only from process 0 to avoid race conditions)."""
+        # Only process 0 should save checkpoints in multi-host setup
+        if jax.process_index() != 0:
+            return
+
         if final:
             path = f"{self.train_config.checkpoint_dir}/{self.model_name}.pkl"
         else:
@@ -1154,7 +1167,7 @@ class Trainer:
         opt_state_to_save = self._opt_state_for_host()
 
         save_checkpoint(params_to_save, opt_state_to_save, self.config, path, step)
-        print(f"Checkpoint saved: {path}")
+        print(f"[Process 0] Checkpoint saved: {path}")
 
 
 def train(
