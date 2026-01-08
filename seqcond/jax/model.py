@@ -9,7 +9,7 @@ import numpy as np
 
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 
-from .seqcond_fast_light import SeqCondBlock
+from .seqcond_fast import SeqCondBlock
 
 # from .seqcond_summary import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2
@@ -195,6 +195,7 @@ class SeqCondModel(nn.Module):
     qk_norm_eps: float = 1e-6
     conv_kernel_size: int = 4
     expand_factor: float = 2.0
+    out_expand_factor: int = 3
     remat: bool = True
     chunk_size: int = 0
     use_square_matrix: bool = False
@@ -256,6 +257,7 @@ class SeqCondModel(nn.Module):
                     num_anchor_heads=self.num_anchor_heads,
                     conv_kernel_size=self.conv_kernel_size,
                     expand_factor=self.expand_factor,
+                    out_expand_factor=self.out_expand_factor,
                     dropout=self.dropout,
                     maxlen=self.maxlen,
                     name=f"seqcond_block_{seqcond_idx}",
@@ -649,6 +651,7 @@ def create_seqcond_model(
     qk_norm_eps: float = 1e-6,
     conv_kernel_size: int = 4,
     expand_factor: float = 2.0,
+    out_expand_factor: int = 3,
     remat: bool = True,
     chunk_size: int = 0,
     use_square_matrix: bool = False,
@@ -676,6 +679,7 @@ def create_seqcond_model(
         qk_norm_eps=qk_norm_eps,
         conv_kernel_size=conv_kernel_size,
         expand_factor=expand_factor,
+        out_expand_factor=out_expand_factor,
         remat=remat,
         chunk_size=chunk_size,
         use_square_matrix=use_square_matrix,

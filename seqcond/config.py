@@ -40,6 +40,7 @@ class ModelConfig:
     num_anchor_heads: int = 0
     conv_kernel_size: int = 4
     expand_factor: float = 2.0
+    out_expand_factor: int = 3  # SwiGLU expansion factor
     use_positional_embedding: bool = False
     seqcond_ratio: int = 5  # Interleaving ratio
     chunk_size: int = 128

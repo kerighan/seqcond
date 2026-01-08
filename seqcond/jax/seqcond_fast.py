@@ -4,7 +4,39 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
-from typing import Optional
+
+
+class GatedRMSNorm(nn.Module):
+    """RMSNorm with gating on residual (Mamba2 style).
+
+    Applies: x = rmsnorm(x * sigmoid(residual))
+    This allows the residual to gate what information passes through.
+    """
+
+    epsilon: float = 1e-6
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, residual: jnp.ndarray) -> jnp.ndarray:
+        hidden_size = x.shape[-1]
+        weight = self.param(
+            "weight",
+            nn.initializers.ones,
+            (hidden_size,),
+        )
+
+        x = x.astype(jnp.float32)
+        res = residual.astype(jnp.float32)
+
+        # Gate with sigmoid (bounded, stable)
+        x = x * jax.nn.sigmoid(res)
+
+        # RMSNorm
+        variance = jnp.mean(x**2, axis=-1, keepdims=True)
+        x = x * jax.lax.rsqrt(variance + self.epsilon)
+        x = x * weight
+
+        return x.astype(self.dtype)
 
 
 # class SeqCondAttention(nn.Module):
@@ -334,6 +366,9 @@ class SeqCondAttention(nn.Module):
     conv_kernel_size: int = 4
     expand_factor: int = 1  # Input Slim (Scan Rapide)
     out_expand_factor: int = 3  # Output Fat (Cerveau SwiGLU) - Ajustable selon VRAM
+    skip_low_rank: bool = (
+        True  # If True, use D//4 latent skip; if False, use full dim_swiglu_total
+    )
 
     dropout: float = 0.0
     maxlen: Optional[int] = None
@@ -365,36 +400,52 @@ class SeqCondAttention(nn.Module):
         H = max(1, d_inner // (self.K * self.M))
 
         dim_memory = self.K * H
-        dim_scan_flat = self.K * H * self.M
 
         dim_query_head = H * self.M * 2
         dim_query_total = self.K_q * dim_query_head
-
-        dim_latent = D // 4
-        dim_gate = self.K
 
         dim_expand = H * self.out_expand_factor
         dim_swiglu_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_head
 
-        # ======================================================================
-        # 1. FUSED INPUT PROJECTIONS
-        # ======================================================================
+        # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
+        dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
+        dim_gate = self.K
 
-        # A. Branche Memory (Dense + Conv)
-        z_mem = nn.Dense(dim_memory + self.K, use_bias=False, name="in_proj_mem")(x)
-        z_mem = z_mem.astype(self.compute_dtype)
+        # ======================================================================
+        # 1. FUSED INPUT PROJECTION (Mamba-style single projection + conv)
+        # ======================================================================
+        # All inputs in one projection: conv_branch (mem + query) + skip + gate
+        dim_mem_total = dim_memory + self.K  # k_val + s_raw
+        dim_conv_total = (
+            dim_mem_total + dim_query_total
+        )  # Everything that goes through conv
+        dim_total = dim_conv_total + dim_skip + dim_gate
 
-        z_mem = nn.Conv(
-            features=z_mem.shape[-1],
+        z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x)
+        z_all = z_all.astype(self.compute_dtype)
+
+        # Split: conv_branch vs non-conv branches
+        z_conv = z_all[..., :dim_conv_total]
+        c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
+        gate_logits = z_all[..., dim_conv_total + dim_skip :]
+
+        # Single fused conv on mem+query (Mamba style)
+        z_conv = nn.Conv(
+            features=z_conv.shape[-1],
             kernel_size=(self.conv_kernel_size,),
             padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=z_mem.shape[-1],
+            feature_group_count=z_conv.shape[-1],
             use_bias=False,
-            name="conv_mem",
-        )(z_mem)
-        z_mem = jax.nn.silu(z_mem)  # Activation après conv (DeltaNet style)
+            name="conv",
+        )(z_conv)
+        z_conv = jax.nn.silu(z_conv)
 
+        # Split conv output into memory and query
+        z_mem = z_conv[..., :dim_mem_total]
+        q_raw = z_conv[..., dim_mem_total:]
+
+        # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
         k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
@@ -404,27 +455,7 @@ class SeqCondAttention(nn.Module):
             s_raw = s_raw * mask.astype(x.dtype)[..., None]
             k_val = k_val * m
 
-        # B. Branche Auxiliaire (Query + LatentSkip + Gate)
-        dim_aux_total = dim_query_total + dim_latent + dim_gate
-        z_aux = nn.Dense(dim_aux_total, use_bias=False, name="in_proj_aux")(x)
-
-        idx1 = dim_query_total
-        idx2 = dim_query_total + dim_latent
-
-        q_raw = z_aux[..., :idx1]
-        c_skip = z_aux[..., idx1:idx2]
-        gate_logits = z_aux[..., idx2:]
-
-        # Traitement Query
-        q_raw = nn.Conv(
-            features=q_raw.shape[-1],
-            kernel_size=(self.conv_kernel_size,),
-            padding=((self.conv_kernel_size - 1, 0),),
-            feature_group_count=q_raw.shape[-1],
-            use_bias=False,
-            name="conv_q",
-        )(q_raw)
-        q_raw = jax.nn.silu(q_raw)  # Activation après conv (DeltaNet style)
+        # Process query branch
         q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
@@ -433,7 +464,6 @@ class SeqCondAttention(nn.Module):
         # 2. GRILLE SPECTRALE (THETA & W_INT)
         # ======================================================================
         theta_min, theta_max = 0.001, 3.0
-
         if self.M == 1:
 
             def init_theta_m1(key, shape):
@@ -521,7 +551,6 @@ class SeqCondAttention(nn.Module):
             score_scale[None, None, :] * s_raw.astype(jnp.float32)
             + score_bias[None, None, :]
         )
-        score_raw = jnp.clip(score_raw, -20.0, 20.0)
 
         # Softplus instead of exp for stability (Mamba-like)
         p_w_content = jax.nn.softplus(score_raw)
@@ -531,7 +560,7 @@ class SeqCondAttention(nn.Module):
 
         # Combine and clip for safety
         p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 1e-6, 100.0)  # (B, L, K)
+        p_w = jnp.clip(p_w, 1e-6, 1000.0)  # (B, L, K)
 
         # Modulation (with tanh to bound phase)
         k_f32 = k_val.astype(jnp.float32)[..., None]
@@ -542,15 +571,14 @@ class SeqCondAttention(nn.Module):
         phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # Bounded modulation
         kvw = k_f32 * p_w_b
 
+        # re, im: (B, L, K, H, M)
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
-        # re, im: (B, L, K, H, M)
 
         # --- DYNAMIC SWITCH ---
         # use_square_matrix = L <= self.matrix_threshold
         if self.use_square_matrix:
             # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
-
             # Causal Mask (L, L)
             # trues below diagonal
             mask_idx = jnp.arange(L)[:, None] >= jnp.arange(L)[None, :]
@@ -573,7 +601,6 @@ class SeqCondAttention(nn.Module):
 
         else:
             # PATH 2: O(L) Linear Scan (Memory Optimized)
-
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
@@ -587,7 +614,6 @@ class SeqCondAttention(nn.Module):
             den_acc, re_acc_flat, im_acc_flat = jnp.split(
                 cumsum, [self.K, self.K + flat_size], axis=-1
             )
-
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
@@ -617,27 +643,37 @@ class SeqCondAttention(nn.Module):
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
-        # 5. FUSION FINALE
+        # 5. FUSION FINALE with GatedRMSNorm
         # ======================================================================
         W_readout = self.param(
             "W_readout",
             nn.initializers.glorot_uniform(),
             (self.K, 2 * H, dim_swiglu_head),
         )
-        scale_spec = self.param(
-            "norm_scale", nn.initializers.ones, (1, 1, self.K, 2 * H)
+
+        # Apply GatedRMSNorm to spectral output (Mamba2 style)
+        # gate_logits acts as the residual gate
+        out_complex_flat = out_complex.reshape(B, L, -1)
+        gate_for_norm = nn.Dense(
+            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
+        )(gate_logits)
+        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+            out_complex_flat, gate_for_norm
         )
+        out_complex = out_normed.reshape(B, L, self.K, 2 * H)
 
-        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex * scale_spec, W_readout)
-        spec_gate = jax.nn.sigmoid(gate_logits).astype(self.compute_dtype)[
-            ..., None
-        ]  # Sigmoid for bounded gating
-        y_spec = y_spec_raw * spec_gate
+        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
-        y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(c_skip)
+        # Skip connection: low-rank or full
+        if self.skip_low_rank:
+            y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(
+                c_skip
+            )
+        else:
+            y_skip_raw = c_skip  # Already dim_swiglu_total
         y_skip = y_skip_raw.reshape(B, L, self.K, dim_swiglu_head)
 
-        y_spec_val, y_spec_gate = jnp.split(y_spec, 2, axis=-1)
+        y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
 
         highway_scale = self.param(
@@ -647,9 +683,7 @@ class SeqCondAttention(nn.Module):
         y_val = y_spec_val + (y_skip_val * highway_scale)
         y_gate = y_spec_gate + (y_skip_gate * highway_scale)
 
-        y_act = y_val * jax.nn.sigmoid(
-            y_gate
-        )  # Sigmoid for bounded gating (SwiGLU style)
+        y_act = y_val * jax.nn.sigmoid(y_gate)
 
         y_flat = y_act.reshape(B, L, -1)
         out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
@@ -666,13 +700,12 @@ class SeqCondAttention(nn.Module):
 
         Args:
             x_t: Input token embedding (B, D)
-            state: Tuple of (den_acc, re_acc, im_acc, pos, conv_buffer_mem, conv_buffer_query) where:
+            state: Tuple of (den_acc, re_acc, im_acc, pos, conv_buffer) where:
                 - den_acc: (B, K) - accumulated denominator
                 - re_acc: (B, K, H, M) - accumulated real part
                 - im_acc: (B, K, H, M) - accumulated imaginary part
                 - pos: (B,) - current position
-                - conv_buffer_mem: (B, conv_kernel_size-1, dim_memory+K) - memory conv history
-                - conv_buffer_query: (B, conv_kernel_size-1, dim_query_total) - query conv history
+                - conv_buffer: (B, conv_kernel_size-1, dim_conv_total) - fused conv history
             deterministic: Whether to use dropout
 
         Returns:
@@ -692,64 +725,59 @@ class SeqCondAttention(nn.Module):
         dim_swiglu_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_head
 
-        # Unpack state
-        den_acc, re_acc, im_acc, pos, conv_buffer_mem, conv_buffer_query = state
+        # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
+        dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
+        dim_gate = self.K
 
-        # Memory branch
-        z_mem = nn.Dense(dim_memory + self.K, use_bias=False, name="in_proj_mem")(x_t)
-        z_mem = z_mem.astype(self.compute_dtype)
+        # Unpack state (now with single fused conv buffer)
+        den_acc, re_acc, im_acc, pos, conv_buffer = state
 
-        # Memory conv with buffer
-        z_mem_expanded = z_mem[:, None, :]
-        conv_input_mem = jnp.concatenate([conv_buffer_mem, z_mem_expanded], axis=1)
+        # ======================================================================
+        # FUSED INPUT PROJECTION + CONV (matches __call__)
+        # ======================================================================
+        dim_mem_total = dim_memory + self.K
+        dim_conv_total = dim_mem_total + dim_query_total
+        dim_total = dim_conv_total + dim_skip + dim_gate
 
-        z_mem_conv = nn.Conv(
-            features=conv_input_mem.shape[-1],
+        z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x_t)
+        z_all = z_all.astype(self.compute_dtype)
+
+        # Split: conv_branch vs non-conv branches
+        z_conv = z_all[..., :dim_conv_total]
+        c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
+        gate_logits = z_all[..., dim_conv_total + dim_skip :]
+
+        # Single fused conv with buffer
+        z_conv_expanded = z_conv[:, None, :]
+        conv_input = jnp.concatenate([conv_buffer, z_conv_expanded], axis=1)
+
+        z_conv_out = nn.Conv(
+            features=conv_input.shape[-1],
             kernel_size=(self.conv_kernel_size,),
             padding="VALID",
-            feature_group_count=conv_input_mem.shape[-1],
+            feature_group_count=conv_input.shape[-1],
             use_bias=False,
-            name="conv_mem",
-        )(conv_input_mem)
+            name="conv",
+        )(conv_input)
 
-        z_mem = jax.nn.silu(z_mem_conv[:, 0, :])
-        conv_buffer_mem_new = jnp.concatenate(
-            [conv_buffer_mem[:, 1:, :], z_mem_expanded], axis=1
+        z_conv = jax.nn.silu(z_conv_out[:, 0, :])
+        conv_buffer_new = jnp.concatenate(
+            [conv_buffer[:, 1:, :], z_conv_expanded], axis=1
         )
 
+        # Split conv output into memory and query
+        z_mem = z_conv[..., :dim_mem_total]
+        q_raw = z_conv[..., dim_mem_total:]
+
+        # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, self.K, H)
         k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
-        # Query branch
-        z_query = nn.Dense(dim_query_total, use_bias=False, name="in_proj_query")(x_t)
-        z_query = z_query.astype(self.compute_dtype)
-
-        # Query conv with buffer
-        z_query_expanded = z_query[:, None, :]
-        conv_input_query = jnp.concatenate(
-            [conv_buffer_query, z_query_expanded], axis=1
-        )
-
-        z_query_conv = nn.Conv(
-            features=conv_input_query.shape[-1],
-            kernel_size=(self.conv_kernel_size,),
-            padding="VALID",
-            feature_group_count=conv_input_query.shape[-1],
-            use_bias=False,
-            name="conv_query",
-        )(conv_input_query)
-
-        z_query = jax.nn.silu(z_query_conv[:, 0, :])
-        conv_buffer_query_new = jnp.concatenate(
-            [conv_buffer_query[:, 1:, :], z_query_expanded], axis=1
-        )
-
-        q_val = z_query.reshape(B, self.K_q, dim_query_head)
-        q_val = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_val)
-
-        # Skip branch
-        z_skip = nn.Dense(dim_swiglu_total, use_bias=False, name="in_proj_skip")(x_t)
+        # Process query branch (matches __call__)
+        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        q_raw = q_raw.reshape(B, self.K_q, 1, H, self.M, 2)
+        q_re, q_im = q_raw[..., 0], q_raw[..., 1]  # (B, K_q, 1, H, M)
 
         # Theta grid
         theta_min, theta_max = 0.001, 3.0
@@ -854,11 +882,6 @@ class SeqCondAttention(nn.Module):
         state_re = re_acc_new * inv_den
         state_im = im_acc_new * inv_den
 
-        # Query processing
-        q_re, q_im = jnp.split(q_val, 2, axis=-1)  # (B, K_q, H*M)
-        q_re = q_re.reshape(B, self.K_q, H, self.M)
-        q_im = q_im.reshape(B, self.K_q, H, self.M)
-
         # Repeat state for query heads
         state_re_rep = jnp.repeat(
             state_re[:, None, :, :, :], self.n_rep, axis=1
@@ -878,22 +901,46 @@ class SeqCondAttention(nn.Module):
         out_re = q_re_b * state_re_grouped - q_im_b * state_im_grouped
         out_im = q_re_b * state_im_grouped + q_im_b * state_re_grouped
 
-        # Flatten
-        summary_flat = jnp.stack([out_re, out_im], axis=-1).reshape(B, -1)
-        summary_flat = summary_flat.astype(self.compute_dtype)
+        # Flatten and apply GatedRMSNorm
+        out_complex = jnp.stack([out_re, out_im], axis=-1).reshape(B, -1)
+        out_complex = out_complex.astype(self.compute_dtype)
 
-        # SwiGLU
-        y_spectral = nn.Dense(dim_swiglu_total, use_bias=False, name="swiglu_proj")(
-            summary_flat
+        # GatedRMSNorm (matches __call__)
+        gate_for_norm = nn.Dense(
+            out_complex.shape[-1], use_bias=False, name="gate_proj"
+        )(gate_logits)
+        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+            out_complex, gate_for_norm
         )
-        y_spectral = y_spectral.reshape(B, self.K, dim_swiglu_head)
-        y_skip = z_skip.reshape(B, self.K, dim_swiglu_head)
+        out_complex = out_normed.reshape(B, self.K, 2 * H)
 
-        y_spec_val, y_spec_gate = jnp.split(y_spectral, 2, axis=-1)
+        # Readout
+        W_readout = self.param(
+            "W_readout",
+            nn.initializers.glorot_uniform(),
+            (self.K, 2 * H, dim_swiglu_head),
+        )
+        y_spec_raw = jnp.einsum("bkf,kfn->bkn", out_complex, W_readout)
+
+        # Skip connection
+        if self.skip_low_rank:
+            y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(
+                c_skip
+            )
+        else:
+            y_skip_raw = c_skip
+        y_skip = y_skip_raw.reshape(B, self.K, dim_swiglu_head)
+
+        y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
 
-        y_val = y_spec_val + y_skip_val
-        y_gate = y_spec_gate + y_skip_gate
+        highway_scale = self.param(
+            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
+        )
+        highway_scale_step = highway_scale[0, 0]  # (K, 1)
+
+        y_val = y_spec_val + (y_skip_val * highway_scale_step)
+        y_gate = y_spec_gate + (y_skip_gate * highway_scale_step)
 
         y_act = y_val * jax.nn.sigmoid(y_gate)
 
@@ -912,8 +959,7 @@ class SeqCondAttention(nn.Module):
             re_acc_new,
             im_acc_new,
             pos_new,
-            conv_buffer_mem_new,
-            conv_buffer_query_new,
+            conv_buffer_new,
         )
 
 
@@ -921,9 +967,11 @@ class SeqCondBlock(nn.Module):
     num_heads: int = 32
     num_query_heads: int = 6
     expand_factor: float = 1.0
+    out_expand_factor: int = 3  # SwiGLU expansion factor
     num_thetas: int = 1
     num_anchor_heads: int = 0
     conv_kernel_size: int = 4
+    skip_low_rank: bool = False  # If True, use D//4 latent skip; if False, use full dim
     dropout: float = 0.0
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None
@@ -945,9 +993,11 @@ class SeqCondBlock(nn.Module):
             num_heads=self.num_heads,
             num_query_heads=self.num_query_heads,
             expand_factor=self.expand_factor,
+            out_expand_factor=self.out_expand_factor,
             num_thetas=self.num_thetas,
             num_anchor_heads=self.num_anchor_heads,
             conv_kernel_size=self.conv_kernel_size,
+            skip_low_rank=self.skip_low_rank,
             dropout=self.dropout,
             maxlen=self.maxlen,
             chunk_size=self.chunk_size,

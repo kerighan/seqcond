@@ -110,6 +110,13 @@ def parse_args():
         help="Override expand factor",
     )
     grp_model.add_argument(
+        "--gate-expand",
+        type=int,
+        default=None,
+        dest="out_expand_factor",
+        help="Gate expansion factor (default: 3)",
+    )
+    grp_model.add_argument(
         "--maxlen",
         type=int,
         default=1024,
@@ -242,6 +249,7 @@ def get_config(args) -> Config:
         "model_type",
         "seqcond_ratio",
         "expand_factor",
+        "out_expand_factor",
         "chunk_size",
         "use_square_matrix",
         "state_size",

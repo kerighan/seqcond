@@ -131,6 +131,7 @@ def create_model_from_config(config: ModelConfig):
             num_thetas=config.num_thetas,
             derivative_order=config.derivative_order,
             expand_factor=config.expand_factor,
+            out_expand_factor=config.out_expand_factor,
             dropout=config.dropout,
             tie_weights=config.tie_weights,
             qk_norm=config.qk_norm,
