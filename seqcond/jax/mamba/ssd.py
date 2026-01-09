@@ -147,7 +147,7 @@ def ssd_naive(
     )  # (B, Ck, Lc, H, P)
 
     # 2. States within each chunk
-    decay_diff = A_cumsum[..., -1:, :] - A_cumsum
+    decay_diff = A_cumsum[..., :, -1:] - A_cumsum
     decay_diff = jnp.clip(decay_diff, -50.0, 10.0)  # Prevent extreme values
     decay_states = jnp.exp(decay_diff)  # (B, H, Ck, Lc)
 
