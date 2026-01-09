@@ -291,9 +291,13 @@ class SeqCondAttention(nn.Module):
             decay_rate_k = decay_rate[0, 0, :, 0, 0]  # (K,)
             # decay_mat[k, t, s] = decay_rate[k]^(t-s) * causal_mask[t, s]
             log_decay_rate = jnp.log(decay_rate_k + 1e-8)  # (K,)
+            # Clamp dist to >= 0 to avoid exp(positive) = inf for non-causal positions
+            dist_clamped = jnp.maximum(dist, 0)  # (L, L)
             # (K, L, L)
-            decay_mat = jnp.exp(log_decay_rate[:, None, None] * dist[None, :, :])
-            decay_mat = decay_mat * causal_mask[None, :, :]  # Apply causal mask
+            decay_mat = jnp.exp(
+                log_decay_rate[:, None, None] * dist_clamped[None, :, :]
+            )
+            decay_mat = decay_mat * causal_mask[None, :, :]  # Zero out non-causal
             decay_mat = decay_mat.astype(self.compute_dtype)
 
             # Stack RE/IM for single einsum
