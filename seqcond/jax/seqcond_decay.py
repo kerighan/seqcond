@@ -259,43 +259,80 @@ class SeqCondAttention(nn.Module):
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
 
+        # ======================================================================
+        # 3.5 STATE DECAY (Mamba-style forget gate)
+        # ======================================================================
+        # Decay rate per head (learned, like Mamba's A parameter)
+        # Initialized to small values for slow decay by default
+        log_decay = self.param(
+            "log_decay",
+            lambda k, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
+            (self.K,),
+        )
+        # decay_rate in (0, 1) - how much of previous state to keep
+        decay_rate = jax.nn.sigmoid(log_decay)  # (K,)
+        decay_rate = decay_rate[None, None, :, None, None]  # (1, 1, K, 1, 1)
+
         # --- DYNAMIC SWITCH ---
         # use_square_matrix = L <= self.matrix_threshold
         if self.use_square_matrix:
-            # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
-            # Causal Mask (L, L)
-            # trues below diagonal
-            mask_idx = jnp.arange(L)[:, None] >= jnp.arange(L)[None, :]
-            causal_mask = mask_idx.astype(self.compute_dtype)
+            # PATH 1: O(L^2) Matrix Multiply with Decay
+            # Build decay matrix: decay_mat[t, s] = decay^(t-s) for t >= s, else 0
+            # This replaces the simple causal mask
+            pos_t = jnp.arange(L)[:, None]  # (L, 1)
+            pos_s = jnp.arange(L)[None, :]  # (1, L)
+            dist = pos_t - pos_s  # (L, L) - distance from s to t
 
-            # Einsum Accumulation
-            # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            # den_acc = jnp.einsum(
-            #    "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
-            # )
+            # Causal mask: only t >= s
+            causal_mask = (dist >= 0).astype(jnp.float32)
+
+            # Decay matrix: decay^dist where dist >= 0
+            # decay_rate: (1, 1, K, 1, 1) -> need (K, L, L) for einsum
+            decay_rate_k = decay_rate[0, 0, :, 0, 0]  # (K,)
+            # decay_mat[k, t, s] = decay_rate[k]^(t-s) * causal_mask[t, s]
+            log_decay_rate = jnp.log(decay_rate_k + 1e-8)  # (K,)
+            # (K, L, L)
+            decay_mat = jnp.exp(log_decay_rate[:, None, None] * dist[None, :, :])
+            decay_mat = decay_mat * causal_mask[None, :, :]  # Apply causal mask
+            decay_mat = decay_mat.astype(self.compute_dtype)
 
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
             stack_ri = jnp.stack([re, im], axis=-1).astype(self.compute_dtype)
             # acc_ri: (B, L, K, H, M, 2)
-            acc_ri = jnp.einsum("ts,bskhmc->btkhmc", causal_mask, stack_ri)
+            # einsum: decay_mat[k, t, s] * stack_ri[b, s, k, h, m, c] -> [b, t, k, h, m, c]
+            acc_ri = jnp.einsum("kts,bskhmc->btkhmc", decay_mat, stack_ri)
 
             re_acc = acc_ri[..., 0]
             im_acc = acc_ri[..., 1]
 
         else:
-            # PATH 2: O(L) Linear Scan (Memory Optimized)
+            # PATH 2: O(L) Linear Scan with Decay (sequential)
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-            # den_flat = p_w  # (B, L, K)
 
-            # Stack & Scan
-            stack = jnp.concatenate([re_flat, im_flat], axis=-1)
-            cumsum = jnp.cumsum(stack, axis=1)
+            # Stack for scan
+            stack = jnp.concatenate([re_flat, im_flat], axis=-1)  # (B, L, 2*flat_size)
+
+            # Decay per position (broadcast to flat_size)
+            decay_flat = jnp.repeat(decay_rate[0, 0, :, 0, 0], H * self.M)  # (K*H*M,)
+            decay_flat = jnp.concatenate(
+                [decay_flat, decay_flat]
+            )  # (2*K*H*M,) for re+im
+
+            def scan_fn(carry, x):
+                # carry: (B, 2*flat_size) - accumulated state
+                # x: (B, 2*flat_size) - new input
+                new_state = decay_flat * carry + x
+                return new_state, new_state
+
+            init_state = jnp.zeros((B, 2 * flat_size), dtype=stack.dtype)
+            _, acc_stack = jax.lax.scan(scan_fn, init_state, stack.transpose(1, 0, 2))
+            acc_stack = acc_stack.transpose(1, 0, 2)  # (B, L, 2*flat_size)
 
             # Unpack
-            re_acc_flat, im_acc_flat = jnp.split(cumsum, [flat_size], axis=-1)
+            re_acc_flat, im_acc_flat = jnp.split(acc_stack, [flat_size], axis=-1)
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
@@ -561,14 +598,19 @@ class SeqCondAttention(nn.Module):
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
 
-        # Update accumulation
-        den_acc_new = den_acc + p_w
-        re_acc_new = re_acc + re
-        im_acc_new = im_acc + im
+        # Decay rate (must match __call__)
+        log_decay = self.param(
+            "log_decay",
+            lambda k, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
+            (self.K,),
+        )
+        decay_rate = jax.nn.sigmoid(log_decay)  # (K,)
+        decay_rate = decay_rate[None, :, None, None]  # (1, K, H, M) for step
 
-        # Normalize removed
-        # inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
-        # inv_den = inv_den[..., None, None]
+        # Update accumulation with decay
+        den_acc_new = den_acc + p_w
+        re_acc_new = decay_rate * re_acc + re
+        im_acc_new = decay_rate * im_acc + im
 
         state_re = re_acc_new
         state_im = im_acc_new
