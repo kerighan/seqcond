@@ -300,10 +300,13 @@ def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=
     compute_dtype = jnp.dtype(compute_dtype)
     keep_weights_fp32 = compute_dtype != jnp.float32
 
+    # Extract apply function to avoid capturing model in closure
+    apply_fn = model.apply
+
     def train_step(params, opt_state, x, y):
         def loss_fn(p):
             p_apply = cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
-            logits = model.apply({"params": p_apply}, x, deterministic=True)
+            logits = apply_fn({"params": p_apply}, x, deterministic=True)
             loss = sparse_categorical_crossentropy_loss(logits, y, ignore_class=0)
             return loss, logits
 
