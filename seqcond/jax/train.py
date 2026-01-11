@@ -294,8 +294,11 @@ def make_train_step_with_debug(
     return train_step
 
 
-def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None):
-    """Create a PJIT-compiled FSDP train step."""
+def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32):
+    """Create a PJIT-compiled FSDP train step.
+
+    Note: grad_mask is now passed as an argument to train_step, not captured in closure.
+    """
 
     compute_dtype = jnp.dtype(compute_dtype)
     keep_weights_fp32 = compute_dtype != jnp.float32
@@ -304,7 +307,7 @@ def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=
     apply_fn = model.apply
     optimizer_update = optimizer.update
 
-    def train_step(params, opt_state, x, y):
+    def train_step(params, opt_state, x, y, grad_mask):
         def loss_fn(p):
             p_apply = cast_params_to_dtype(p, compute_dtype) if keep_weights_fp32 else p
             logits = apply_fn({"params": p_apply}, x, deterministic=True)
@@ -785,7 +788,11 @@ class Trainer:
                 )
             else:
                 step_fn = make_fsdp_train_step(
-                    self.model, self.optimizer, self.compute_dtype, self._grad_mask
+                    self.model, self.optimizer, self.compute_dtype
+                )
+                # grad_mask has same sharding as params
+                grad_mask_sharding = (
+                    self.params_sharding if self._grad_mask is not None else None
                 )
                 self._fsdp_train_step = pjit(
                     step_fn,
@@ -794,6 +801,7 @@ class Trainer:
                         self.opt_state_sharding,
                         self.data_sharding,
                         self.data_sharding,
+                        grad_mask_sharding,
                     ),
                     out_shardings=(
                         self.params_sharding,
@@ -961,7 +969,9 @@ class Trainer:
                             self.params,
                             self.opt_state,
                             metrics_batch,
-                        ) = self._fsdp_train_step(self.params, self.opt_state, x, y)
+                        ) = self._fsdp_train_step(
+                            self.params, self.opt_state, x, y, self._grad_mask
+                        )
                     macro_step += 1
 
             elif self.use_pmap:
