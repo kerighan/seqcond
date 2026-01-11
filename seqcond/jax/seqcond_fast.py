@@ -246,13 +246,14 @@ class SeqCondAttention(nn.Module):
         p_w = p_w_content * temporal_weight
         p_w = jnp.clip(p_w, 1e-6, 1000.0)  # (B, L, K)
 
-        # Modulation (with tanh to bound phase)
+        # Modulation (with softsign to bound phase - smoother than tanh)
         k_f32 = k_val.astype(jnp.float32)[..., None]
         p_w_b = p_w[..., None, None]
 
-        tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
-        tanh_scale_b = tanh_scale[None, None, :, None, None]
-        phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # Bounded modulation
+        phase_scale = self.param("phase_scale", nn.initializers.ones, (self.K,))
+        phase_scale_b = phase_scale[None, None, :, None, None]
+        k_scaled = k_f32 * phase_scale_b
+        phi = (k_scaled / (1.0 + jnp.abs(k_scaled))) * theta  # softsign modulation
         kvw = k_f32 * p_w_b
 
         # re, im: (B, L, K, H, M)
@@ -553,9 +554,10 @@ class SeqCondAttention(nn.Module):
         k_f32 = k_val[..., None].astype(jnp.float32)  # (B, K, H, 1)
         p_w_b = p_w[..., None, None]  # (B, K, 1, 1)
 
-        tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
-        tanh_scale_b = tanh_scale.reshape(1, self.K, 1, 1)
-        phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # (B, K, H, M)
+        phase_scale = self.param("phase_scale", nn.initializers.ones, (self.K,))
+        phase_scale_b = phase_scale.reshape(1, self.K, 1, 1)
+        k_scaled = k_f32 * phase_scale_b
+        phi = (k_scaled / (1.0 + jnp.abs(k_scaled))) * theta  # softsign (B, K, H, M)
         kvw = k_f32 * p_w_b
 
         re = kvw * jnp.cos(phi)
