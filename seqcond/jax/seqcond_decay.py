@@ -203,115 +203,116 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         # 3. MODULATION & SCAN UNIFIÉ (MATRIX vs LINEAR)
         # ======================================================================
-        # Decay (Log-Space)
-        pos = jnp.arange(L, dtype=jnp.float32)
-        log_w_list = []
-        if self.num_decay_heads > 0:
-            d_slopes = self.param(
-                "decay_slopes",
-                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1),
-                (self.num_decay_heads,),
-            )
-            slopes = jax.nn.softplus(d_slopes).reshape(1, 1, -1)
-            dist = jnp.maximum(jnp.float32((self.maxlen or L) - 1) - pos, 0.0)
-            log_w_list.append(-slopes * dist[None, :, None])
-        if self.num_anchor_heads > 0:
-            a_slopes = self.param(
-                "anchor_slopes",
-                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
-                (self.num_anchor_heads,),
-            )
-            slopes_a = jax.nn.softplus(a_slopes).reshape(1, 1, -1)
-            log_w_list.append(-slopes_a * pos[None, :, None])
+        # dt: content-based "delta time" (like Mamba)
+        # Controls BOTH contribution weight AND decay rate
+        #
+        # Mamba initialization:
+        # - dt_bias initialized so softplus(dt_bias) gives dt in [dt_min, dt_max]
+        # - dt_min=0.001, dt_max=0.1 (from Mamba config)
+        # - Use inverse softplus: dt_bias = log(exp(dt) - 1)
+        dt_min, dt_max = 0.001, 0.1
 
-        log_time_weight = (
-            jnp.concatenate(log_w_list, axis=2)
-            if log_w_list
-            else jnp.zeros((1, L, self.K), dtype=jnp.float32)
+        def init_dt_bias(key, shape):
+            # Initialize dt_bias so that softplus(dt_bias) spans [dt_min, dt_max]
+            dt_init = jnp.array(np.geomspace(dt_min, dt_max, shape[0]))
+            # Inverse softplus: x = log(exp(dt) - 1)
+            dt_bias_init = jnp.log(jnp.expm1(dt_init))
+            return dt_bias_init.astype(jnp.float32)
+
+        dt_scale = self.param("dt_scale", nn.initializers.ones, (self.K,))
+        dt_bias = self.param("dt_bias", init_dt_bias, (self.K,))
+        dt_raw = (
+            dt_scale[None, None, :] * s_raw.astype(jnp.float32) + dt_bias[None, None, :]
         )
-        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        score_bias = self.param("score_bias", nn.initializers.zeros, (self.K,))
-        score_raw = (
-            score_scale[None, None, :] * s_raw.astype(jnp.float32)
-            + score_bias[None, None, :]
-        )
+        dt_raw = jnp.clip(dt_raw, -20.0, 20.0)
 
-        # Softplus instead of exp for stability (Mamba-like)
-        p_w_content = jax.nn.softplus(score_raw)
+        # Softplus for positive dt (like Mamba)
+        dt = jax.nn.softplus(dt_raw)
+        dt = jnp.clip(dt, dt_min, dt_max)  # (B, L, K) - clamp like Mamba
 
-        # Temporal weight with exp
-        temporal_weight = jnp.exp(log_time_weight)
+        # A: base decay rate per head (like Mamba)
+        # Mamba uses A in [1, 16], stored as log(A)
+        # decay = exp(-A * dt), so:
+        # - A=1, dt=0.001 -> decay=0.999 (very slow, ~1000 token memory)
+        # - A=16, dt=0.1 -> decay=0.2 (fast, ~3 token memory)
+        A_min, A_max = 1.0, 16.0
 
-        # Combine and clip for safety
-        p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 1e-6, 1000.0)  # (B, L, K)
+        def init_log_A(key, shape):
+            A_init = jnp.array(np.geomspace(A_min, A_max, shape[0]))
+            return jnp.log(A_init).astype(jnp.float32)
+
+        log_A = self.param("log_A", init_log_A, (self.K,))
+        A = -jnp.exp(log_A)  # (K,) - negative for decay
+
+        # A_disc = A * dt (discretized decay, like Mamba)
+        A_disc = A[None, None, :] * dt  # (B, L, K)
+        A_disc = jnp.clip(A_disc, -20.0, 0.0)  # Prevent extreme values
 
         # Modulation (with tanh to bound phase)
         k_f32 = k_val.astype(jnp.float32)[..., None]
-        p_w_b = p_w[..., None, None]
+        dt_b = dt[..., None, None]  # (B, L, K, 1, 1)
 
         tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
         tanh_scale_b = tanh_scale[None, None, :, None, None]
         phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # Bounded modulation
-        kvw = k_f32 * p_w_b
+
+        # x_disc = x * dt (discretized input, like Mamba)
+        kvw = k_f32 * dt_b
 
         # re, im: (B, L, K, H, M)
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
 
         # ======================================================================
-        # 3.5 STATE DECAY (Mamba-style forget gate)
+        # 3.5 STATE ACCUMULATION with Mamba-style decay
         # ======================================================================
-        # Decay rate per head (learned, like Mamba's A parameter)
-        # Initialized to small values for slow decay by default
-        log_decay = self.param(
-            "log_decay",
-            lambda k, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
-            (self.K,),
-        )
-        # decay_rate in (0, 1) - how much of previous state to keep
-        decay_rate = jax.nn.sigmoid(log_decay)  # (K,)
-        decay_rate = decay_rate[None, None, :, None, None]  # (1, 1, K, 1, 1)
+        # state_new = exp(A * dt) * state_old + x * dt
+        # For matrix form: need cumulative product of exp(A_disc)
 
         # --- DYNAMIC SWITCH ---
-        # use_square_matrix = L <= self.matrix_threshold
         if self.use_square_matrix:
-            # PATH 1: O(L^2) Matrix Multiply with Decay
-            # Build decay matrix: decay_mat[t, s] = decay^(t-s) for t >= s, else 0
-            # This replaces the simple causal mask
-            pos_t = jnp.arange(L)[:, None]  # (L, 1)
-            pos_s = jnp.arange(L)[None, :]  # (1, L)
-            dist = pos_t - pos_s  # (L, L) - distance from s to t
+            # PATH 1: O(L^2) Matrix Multiply with content-dependent decay
+            # Build decay matrix using cumulative sum of A_disc (like Mamba's segsum)
 
-            # Causal mask: only t >= s
-            causal_mask = (dist >= 0).astype(jnp.float32)
+            # A_disc: (B, L, K) -> cumsum over L
+            A_cumsum = jnp.cumsum(A_disc, axis=1)  # (B, L, K)
 
-            # Decay matrix: decay^dist where dist >= 0
-            # decay_rate: (1, 1, K, 1, 1) -> need (K, L, L) for einsum
-            decay_rate_k = decay_rate[0, 0, :, 0, 0]  # (K,)
-            # decay_mat[k, t, s] = decay_rate[k]^(t-s) * causal_mask[t, s]
-            log_decay_rate = jnp.log(decay_rate_k + 1e-8)  # (K,)
-            # Clamp dist to >= 0 to avoid exp(positive) = inf for non-causal positions
-            dist_clamped = jnp.maximum(dist, 0)  # (L, L)
-            # (K, L, L)
-            decay_mat = jnp.exp(
-                log_decay_rate[:, None, None] * dist_clamped[None, :, :]
+            # decay_mat[b, t, s, k] = exp(A_cumsum[b, t, k] - A_cumsum[b, s, k])
+            # = exp(sum_{i=s+1}^{t} A_disc[b, i, k])
+            # This is the decay from position s to position t
+
+            # (B, L, K) -> (B, L, 1, K) - (B, 1, L, K) = (B, L, L, K)
+            decay_diff = A_cumsum[:, :, None, :] - A_cumsum[:, None, :, :]
+
+            # Causal mask: only t >= s (upper triangle is future)
+            pos_t = jnp.arange(L)[:, None]
+            pos_s = jnp.arange(L)[None, :]
+            causal_mask = (pos_t >= pos_s).astype(jnp.float32)  # (L, L)
+
+            # Apply causal mask before exp (set future to -inf)
+            decay_diff = jnp.where(
+                causal_mask[None, :, :, None],
+                decay_diff,
+                jnp.array(-100.0, dtype=decay_diff.dtype),
             )
-            decay_mat = decay_mat * causal_mask[None, :, :]  # Zero out non-causal
-            decay_mat = decay_mat.astype(self.compute_dtype)
+            decay_diff = jnp.clip(decay_diff, -50.0, 10.0)
+
+            # decay_mat: (B, L, L, K)
+            decay_mat = jnp.exp(decay_diff).astype(self.compute_dtype)
 
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
             stack_ri = jnp.stack([re, im], axis=-1).astype(self.compute_dtype)
-            # acc_ri: (B, L, K, H, M, 2)
-            # einsum: decay_mat[k, t, s] * stack_ri[b, s, k, h, m, c] -> [b, t, k, h, m, c]
-            acc_ri = jnp.einsum("kts,bskhmc->btkhmc", decay_mat, stack_ri)
+
+            # einsum: decay_mat[b, t, s, k] * stack_ri[b, s, k, h, m, c] -> [b, t, k, h, m, c]
+            acc_ri = jnp.einsum("btsk,bskhmc->btkhmc", decay_mat, stack_ri)
 
             re_acc = acc_ri[..., 0]
             im_acc = acc_ri[..., 1]
 
         else:
-            # PATH 2: O(L) Linear Scan with Decay (sequential)
+            # PATH 2: O(L) Linear Scan with Mamba-style decay
+            # state_new = exp(A_disc) * state_old + x_disc
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
@@ -319,20 +320,27 @@ class SeqCondAttention(nn.Module):
             # Stack for scan
             stack = jnp.concatenate([re_flat, im_flat], axis=-1)  # (B, L, 2*flat_size)
 
-            # Decay per position (broadcast to flat_size)
-            decay_flat = jnp.repeat(decay_rate[0, 0, :, 0, 0], H * self.M)  # (K*H*M,)
-            decay_flat = jnp.concatenate(
-                [decay_flat, decay_flat]
-            )  # (2*K*H*M,) for re+im
+            # exp(A_disc) per position: (B, L, K) -> (B, L, K*H*M) by repeating
+            decay_per_pos = jnp.exp(A_disc)  # (B, L, K)
+            decay_per_pos = jnp.repeat(
+                decay_per_pos, H * self.M, axis=-1
+            )  # (B, L, K*H*M)
+            decay_per_pos = jnp.concatenate(
+                [decay_per_pos, decay_per_pos], axis=-1
+            )  # (B, L, 2*K*H*M) for re+im
 
-            def scan_fn(carry, x):
+            def scan_fn(carry, inputs):
                 # carry: (B, 2*flat_size) - accumulated state
-                # x: (B, 2*flat_size) - new input
-                new_state = decay_flat * carry + x
+                # inputs: (x, decay) where x: (B, 2*flat_size), decay: (B, 2*flat_size)
+                x, decay = inputs
+                new_state = decay * carry + x
                 return new_state, new_state
 
             init_state = jnp.zeros((B, 2 * flat_size), dtype=stack.dtype)
-            _, acc_stack = jax.lax.scan(scan_fn, init_state, stack.transpose(1, 0, 2))
+            # Transpose to (L, B, ...) for scan
+            stack_t = stack.transpose(1, 0, 2)
+            decay_t = decay_per_pos.transpose(1, 0, 2)
+            _, acc_stack = jax.lax.scan(scan_fn, init_state, (stack_t, decay_t))
             acc_stack = acc_stack.transpose(1, 0, 2)  # (B, L, 2*flat_size)
 
             # Unpack
@@ -549,70 +557,61 @@ class SeqCondAttention(nn.Module):
 
         theta = theta[0, 0]  # (K, H, M)
 
-        # Decay weights
-        log_w_list = []
-        if self.num_decay_heads > 0:
-            d_slopes = self.param(
-                "decay_slopes",
-                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.001, 0.1, s[0])) - 1),
-                (self.num_decay_heads,),
-            )
-            slopes = jax.nn.softplus(d_slopes).reshape(1, -1)
-            dist = jnp.maximum(
-                jnp.float32((self.maxlen or 2048) - 1) - pos[:, None], 0.0
-            )
-            log_w_list.append(-slopes * dist)
-        if self.num_anchor_heads > 0:
-            a_slopes = self.param(
-                "anchor_slopes",
-                lambda r, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
-                (self.num_anchor_heads,),
-            )
-            slopes_a = jax.nn.softplus(a_slopes).reshape(1, -1)
-            log_w_list.append(-slopes_a * pos[:, None])
+        # dt: content-based "delta time" (like Mamba)
+        # Controls BOTH contribution weight AND decay rate
+        # Must match __call__ initialization
+        dt_min, dt_max = 0.001, 0.1
 
-        log_time_weight = (
-            jnp.concatenate(log_w_list, axis=1)
-            if log_w_list
-            else jnp.zeros((B, self.K), dtype=jnp.float32)
-        )
+        def init_dt_bias(key, shape):
+            dt_init = jnp.array(np.geomspace(dt_min, dt_max, shape[0]))
+            dt_bias_init = jnp.log(jnp.expm1(dt_init))
+            return dt_bias_init.astype(jnp.float32)
 
-        score_scale = self.param("score_scale", nn.initializers.ones, (self.K,))
-        score_bias = self.param("score_bias", nn.initializers.zeros, (self.K,))
-        score_raw = (
-            score_scale[None, :] * s_raw.astype(jnp.float32) + score_bias[None, :]
-        )
-        # score_raw = jnp.clip(score_raw, -20.0, 20.0)
+        dt_scale = self.param("dt_scale", nn.initializers.ones, (self.K,))
+        dt_bias = self.param("dt_bias", init_dt_bias, (self.K,))
+        dt_raw = dt_scale[None, :] * s_raw.astype(jnp.float32) + dt_bias[None, :]
+        dt_raw = jnp.clip(dt_raw, -20.0, 20.0)
 
-        # Softplus instead of exp for stability
-        p_w_content = jax.nn.softplus(score_raw)
-        temporal_weight = jnp.exp(log_time_weight)
-        p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 1e-6, 1000.0)
+        # Softplus for positive dt (like Mamba)
+        dt = jax.nn.softplus(dt_raw)
+        dt = jnp.clip(dt, dt_min, dt_max)  # (B, K)
+
+        # A: base decay rate per head (like Mamba)
+        # Must match __call__ initialization
+        A_min, A_max = 1.0, 16.0
+
+        def init_log_A(key, shape):
+            A_init = jnp.array(np.geomspace(A_min, A_max, shape[0]))
+            return jnp.log(A_init).astype(jnp.float32)
+
+        log_A = self.param("log_A", init_log_A, (self.K,))
+        A = -jnp.exp(log_A)  # (K,) - negative for decay
+
+        # A_disc = A * dt (discretized decay, like Mamba)
+        A_disc = A[None, :] * dt  # (B, K)
+        A_disc = jnp.clip(A_disc, -20.0, 0.0)
 
         # Modulation
         k_f32 = k_val[..., None].astype(jnp.float32)  # (B, K, H, 1)
-        p_w_b = p_w[..., None, None]  # (B, K, 1, 1)
+        dt_b = dt[..., None, None]  # (B, K, 1, 1)
 
         tanh_scale = self.param("tanh_scale", nn.initializers.ones, (self.K,))
         tanh_scale_b = tanh_scale.reshape(1, self.K, 1, 1)
         phi = jnp.tanh(k_f32 * tanh_scale_b) * theta  # (B, K, H, M)
-        kvw = k_f32 * p_w_b
+
+        # x_disc = x * dt (discretized input, like Mamba)
+        kvw = k_f32 * dt_b
 
         re = kvw * jnp.cos(phi)
         im = kvw * jnp.sin(phi)
 
-        # Decay rate (must match __call__)
-        log_decay = self.param(
-            "log_decay",
-            lambda k, s: jnp.log(jnp.exp(np.geomspace(0.01, 0.1, s[0])) - 1),
-            (self.K,),
-        )
-        decay_rate = jax.nn.sigmoid(log_decay)  # (K,)
-        decay_rate = decay_rate[None, :, None, None]  # (1, K, H, M) for step
+        # Decay for this step: exp(A_disc)
+        decay_rate = jnp.exp(A_disc)  # (B, K)
+        decay_rate = decay_rate[..., None, None]  # (B, K, 1, 1) for broadcasting
 
-        # Update accumulation with decay
-        den_acc_new = den_acc + p_w
+        # Update accumulation with Mamba-style decay
+        # state_new = exp(A * dt) * state_old + x * dt
+        den_acc_new = den_acc + dt  # Keep track of cumulative dt (optional)
         re_acc_new = decay_rate * re_acc + re
         im_acc_new = decay_rate * im_acc + im
 
