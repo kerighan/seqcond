@@ -210,17 +210,14 @@ class SeqCondAttention(nn.Module):
         # - dt_bias initialized so softplus(dt_bias) gives dt in [dt_min, dt_max]
         # - dt_min=0.001, dt_max=0.1 (from Mamba config)
         # - Use inverse softplus: dt_bias = log(exp(dt) - 1)
-        dt_min, dt_max = 0.001, 0.1
-
-        def init_dt_bias(key, shape):
-            # Initialize dt_bias so that softplus(dt_bias) spans [dt_min, dt_max]
-            dt_init = jnp.array(np.geomspace(dt_min, dt_max, shape[0]))
-            # Inverse softplus: x = log(exp(dt) - 1)
-            dt_bias_init = jnp.log(jnp.expm1(dt_init))
-            return dt_bias_init.astype(jnp.float32)
-
         dt_scale = self.param("dt_scale", nn.initializers.ones, (self.K,))
-        dt_bias = self.param("dt_bias", init_dt_bias, (self.K,))
+        dt_bias = self.param(
+            "dt_bias",
+            lambda k, s: jnp.log(
+                jnp.expm1(jnp.array(np.geomspace(0.001, 0.1, s[0])))
+            ).astype(jnp.float32),
+            (self.K,),
+        )
         dt_raw = (
             dt_scale[None, None, :] * s_raw.astype(jnp.float32) + dt_bias[None, None, :]
         )
@@ -228,20 +225,20 @@ class SeqCondAttention(nn.Module):
 
         # Softplus for positive dt (like Mamba)
         dt = jax.nn.softplus(dt_raw)
-        dt = jnp.clip(dt, dt_min, dt_max)  # (B, L, K) - clamp like Mamba
+        dt = jnp.clip(dt, 0.001, 0.1)  # (B, L, K) - clamp like Mamba
 
         # A: base decay rate per head (like Mamba)
         # Mamba uses A in [1, 16], stored as log(A)
         # decay = exp(-A * dt), so:
         # - A=1, dt=0.001 -> decay=0.999 (very slow, ~1000 token memory)
         # - A=16, dt=0.1 -> decay=0.2 (fast, ~3 token memory)
-        A_min, A_max = 1.0, 16.0
-
-        def init_log_A(key, shape):
-            A_init = jnp.array(np.geomspace(A_min, A_max, shape[0]))
-            return jnp.log(A_init).astype(jnp.float32)
-
-        log_A = self.param("log_A", init_log_A, (self.K,))
+        log_A = self.param(
+            "log_A",
+            lambda k, s: jnp.log(jnp.array(np.geomspace(1.0, 16.0, s[0]))).astype(
+                jnp.float32
+            ),
+            (self.K,),
+        )
         A = -jnp.exp(log_A)  # (K,) - negative for decay
 
         # A_disc = A * dt (discretized decay, like Mamba)
@@ -561,31 +558,30 @@ class SeqCondAttention(nn.Module):
         # dt: content-based "delta time" (like Mamba)
         # Controls BOTH contribution weight AND decay rate
         # Must match __call__ initialization
-        dt_min, dt_max = 0.001, 0.1
-
-        def init_dt_bias(key, shape):
-            dt_init = jnp.array(np.geomspace(dt_min, dt_max, shape[0]))
-            dt_bias_init = jnp.log(jnp.expm1(dt_init))
-            return dt_bias_init.astype(jnp.float32)
-
         dt_scale = self.param("dt_scale", nn.initializers.ones, (self.K,))
-        dt_bias = self.param("dt_bias", init_dt_bias, (self.K,))
+        dt_bias = self.param(
+            "dt_bias",
+            lambda k, s: jnp.log(
+                jnp.expm1(jnp.array(np.geomspace(0.001, 0.1, s[0])))
+            ).astype(jnp.float32),
+            (self.K,),
+        )
         dt_raw = dt_scale[None, :] * s_raw.astype(jnp.float32) + dt_bias[None, :]
         dt_raw = jnp.clip(dt_raw, -20.0, 20.0)
 
         # Softplus for positive dt (like Mamba)
         dt = jax.nn.softplus(dt_raw)
-        dt = jnp.clip(dt, dt_min, dt_max)  # (B, K)
+        dt = jnp.clip(dt, 0.001, 0.1)  # (B, K)
 
         # A: base decay rate per head (like Mamba)
         # Must match __call__ initialization
-        A_min, A_max = 1.0, 16.0
-
-        def init_log_A(key, shape):
-            A_init = jnp.array(np.geomspace(A_min, A_max, shape[0]))
-            return jnp.log(A_init).astype(jnp.float32)
-
-        log_A = self.param("log_A", init_log_A, (self.K,))
+        log_A = self.param(
+            "log_A",
+            lambda k, s: jnp.log(jnp.array(np.geomspace(1.0, 16.0, s[0]))).astype(
+                jnp.float32
+            ),
+            (self.K,),
+        )
         A = -jnp.exp(log_A)  # (K,) - negative for decay
 
         # A_disc = A * dt (discretized decay, like Mamba)
