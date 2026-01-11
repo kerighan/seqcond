@@ -300,8 +300,9 @@ def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=
     compute_dtype = jnp.dtype(compute_dtype)
     keep_weights_fp32 = compute_dtype != jnp.float32
 
-    # Extract apply function to avoid capturing model in closure
+    # Extract functions to avoid capturing objects in closure (FSDP multi-host)
     apply_fn = model.apply
+    optimizer_update = optimizer.update
 
     def train_step(params, opt_state, x, y):
         def loss_fn(p):
@@ -312,7 +313,7 @@ def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=
 
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = _apply_grad_mask(grads, grad_mask)
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        updates, new_opt_state = optimizer_update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
         metrics = compute_batch_metrics(logits, y, ignore_class=0)
