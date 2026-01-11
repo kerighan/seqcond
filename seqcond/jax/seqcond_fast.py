@@ -147,24 +147,50 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         # 2. GRILLE SPECTRALE (THETA & W_INT)
         # ======================================================================
-        theta_min, theta_max = 0.001, 3.0
+        # theta_min=0.001, theta_max=3.0 (hardcoded to avoid closure capture)
         if self.M == 1:
-
-            def init_theta_m1(key, shape):
-                grid = np.geomspace(theta_min, theta_max, self.K).reshape(
-                    1, 1, self.K, 1, 1
-                )
-                base = np.tile(grid, (1, 1, 1, H, 1))
-                # Inverse Softplus (Mamba2 style robust)
-                u = (base - theta_min) / max(theta_max - theta_min, 1e-6)
-                u = np.clip(u, 1e-4, 1 - 1e-4)
-                raw = np.log(u) - np.log(1 - u)
-                return jnp.array(raw, dtype=jnp.float32)
-
-            theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
-            theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(
-                theta_raw
-            ).astype(jnp.float32)
+            # Use lambda with shape to avoid closure capture
+            theta_raw = self.param(
+                "theta_raw",
+                lambda key, shape: jnp.array(
+                    np.log(
+                        np.clip(
+                            (
+                                np.tile(
+                                    np.geomspace(0.001, 3.0, shape[2]).reshape(
+                                        1, 1, shape[2], 1, 1
+                                    ),
+                                    (1, 1, 1, shape[3], 1),
+                                )
+                                - 0.001
+                            )
+                            / 2.999,
+                            1e-4,
+                            1 - 1e-4,
+                        )
+                    )
+                    - np.log(
+                        1
+                        - np.clip(
+                            (
+                                np.tile(
+                                    np.geomspace(0.001, 3.0, shape[2]).reshape(
+                                        1, 1, shape[2], 1, 1
+                                    ),
+                                    (1, 1, 1, shape[3], 1),
+                                )
+                                - 0.001
+                            )
+                            / 2.999,
+                            1e-4,
+                            1 - 1e-4,
+                        )
+                    ),
+                    dtype=jnp.float32,
+                ),
+                (1, 1, self.K, H, 1),
+            )
+            theta = 0.001 + 2.999 * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
 
             # Poids d'intégration appris (initialisés à 1)
             w_int_raw = self.param(
@@ -173,22 +199,30 @@ class SeqCondAttention(nn.Module):
             w_int_raw_clipped = jnp.clip(w_int_raw, -5.0, 5.0)  # Prevent exp overflow
             w_int = jnp.exp(w_int_raw_clipped).astype(jnp.float32)  # Toujours positif
         else:
-
-            def init_theta_deltas(key, shape):
-                grid_m = np.geomspace(theta_min, theta_max, self.M)
-                base = np.tile(grid_m.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-                return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
-
+            # Use lambda with shape to avoid closure capture
             theta_d_raw = self.param(
-                "theta_d_raw", init_theta_deltas, (1, 1, self.K, H, self.M)
+                "theta_d_raw",
+                lambda key, shape: jnp.log(
+                    jnp.exp(
+                        jnp.tile(
+                            jnp.array(np.geomspace(0.001, 3.0, shape[4])).reshape(
+                                1, 1, 1, 1, shape[4]
+                            ),
+                            (1, 1, shape[2], shape[3], 1),
+                        )
+                    )
+                    - 1.0
+                    + 1e-4
+                ).astype(jnp.float32),
+                (1, 1, self.K, H, self.M),
             )
 
             theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
             theta_accum = jnp.cumsum(theta_d, axis=-1)
 
-            scale_range = theta_max - theta_min
+            scale_range = 2.999  # theta_max - theta_min
             total_sum = theta_accum[..., -1:]
-            theta = theta_min + (theta_accum / total_sum) * scale_range
+            theta = 0.001 + (theta_accum / total_sum) * scale_range
 
             dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
             dtheta = dtheta_raw * (scale_range / total_sum)
@@ -462,41 +496,74 @@ class SeqCondAttention(nn.Module):
         q_raw = q_raw.reshape(B, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]  # (B, K_q, 1, H, M)
 
-        # Theta grid
-        theta_min, theta_max = 0.001, 3.0
-
+        # Theta grid (theta_min=0.001, theta_max=3.0 hardcoded to avoid closure capture)
         if self.M == 1:
-
-            def init_theta_m1(key, shape):
-                grid = np.geomspace(theta_min, theta_max, self.K).reshape(
-                    1, 1, self.K, 1, 1
-                )
-                base = np.tile(grid, (1, 1, 1, H, 1))
-                u = (base - theta_min) / max(theta_max - theta_min, 1e-6)
-                u = np.clip(u, 1e-4, 1 - 1e-4)
-                raw = np.log(u) - np.log(1 - u)
-                return jnp.array(raw, dtype=jnp.float32)
-
-            theta_raw = self.param("theta_raw", init_theta_m1, (1, 1, self.K, H, 1))
-            theta = theta_min + (theta_max - theta_min) * jax.nn.sigmoid(
-                theta_raw
-            ).astype(jnp.float32)
+            # Use lambda with shape to avoid closure capture
+            theta_raw = self.param(
+                "theta_raw",
+                lambda key, shape: jnp.array(
+                    np.log(
+                        np.clip(
+                            (
+                                np.tile(
+                                    np.geomspace(0.001, 3.0, shape[2]).reshape(
+                                        1, 1, shape[2], 1, 1
+                                    ),
+                                    (1, 1, 1, shape[3], 1),
+                                )
+                                - 0.001
+                            )
+                            / 2.999,
+                            1e-4,
+                            1 - 1e-4,
+                        )
+                    )
+                    - np.log(
+                        1
+                        - np.clip(
+                            (
+                                np.tile(
+                                    np.geomspace(0.001, 3.0, shape[2]).reshape(
+                                        1, 1, shape[2], 1, 1
+                                    ),
+                                    (1, 1, 1, shape[3], 1),
+                                )
+                                - 0.001
+                            )
+                            / 2.999,
+                            1e-4,
+                            1 - 1e-4,
+                        )
+                    ),
+                    dtype=jnp.float32,
+                ),
+                (1, 1, self.K, H, 1),
+            )
+            theta = 0.001 + 2.999 * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
         else:
-
-            def init_theta_deltas(key, shape):
-                grid_m = np.geomspace(theta_min, theta_max, self.M)
-                base = np.tile(grid_m.reshape(1, 1, 1, 1, self.M), (1, 1, self.K, H, 1))
-                return jnp.log(jnp.exp(base) - 1.0 + 1e-4)
-
+            # Use lambda with shape to avoid closure capture
             theta_d_raw = self.param(
-                "theta_d_raw", init_theta_deltas, (1, 1, self.K, H, self.M)
+                "theta_d_raw",
+                lambda key, shape: jnp.log(
+                    jnp.exp(
+                        jnp.tile(
+                            jnp.array(np.geomspace(0.001, 3.0, shape[4])).reshape(
+                                1, 1, 1, 1, shape[4]
+                            ),
+                            (1, 1, shape[2], shape[3], 1),
+                        )
+                    )
+                    - 1.0
+                    + 1e-4
+                ).astype(jnp.float32),
+                (1, 1, self.K, H, self.M),
             )
             theta_d = jax.nn.softplus(theta_d_raw).astype(jnp.float32) + 1e-4
             theta_accum = jnp.cumsum(theta_d, axis=-1)
 
-            scale_range = theta_max - theta_min
+            scale_range = 2.999  # theta_max - theta_min
             total_sum = theta_accum[..., -1:]
-            theta = theta_min + (theta_accum / total_sum) * scale_range
+            theta = 0.001 + (theta_accum / total_sum) * scale_range
 
             # Compute w_int from theta_accum (reuse for later)
             dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
