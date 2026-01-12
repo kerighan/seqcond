@@ -79,7 +79,7 @@ class ModelConfig:
         """Small model (~30M params). Override any param with kwargs."""
         defaults = dict(
             d_model=768,
-            d_ff=768 * 3,
+            d_ff=int(8 * 768 / 3),
             num_layers=12,
             num_heads=12,
             seqcond_heads=32,
@@ -95,7 +95,7 @@ class ModelConfig:
         """Medium model (~110M params). Override any param with kwargs."""
         defaults = dict(
             d_model=960,
-            d_ff=960 * 3,
+            d_ff=int(8 * 960 / 3),
             num_layers=32,
             num_heads=15,
             seqcond_heads=15,
