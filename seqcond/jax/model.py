@@ -9,9 +9,9 @@ import numpy as np
 
 from .rope import TransformerDecoderBlock, precompute_freqs, get_rope_embeddings
 
-from .seqcond_decay import SeqCondBlock
+# from .seqcond_decay import SeqCondBlock
 
-# from .seqcond_fast import SeqCondBlock
+from .seqcond_fast import SeqCondBlock
 
 # from .seqcond_summary import SeqCondBlock
 from .seqcond_2 import SeqCondBlockV2

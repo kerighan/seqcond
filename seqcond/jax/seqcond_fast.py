@@ -29,7 +29,7 @@ class GatedRMSNorm(nn.Module):
         res = residual.astype(jnp.float32)
 
         # Gate with sigmoid (bounded, stable)
-        x = x * jax.nn.sigmoid(res)
+        x = x * jax.nn.silu(res)
 
         # RMSNorm
         variance = jnp.mean(x**2, axis=-1, keepdims=True)
