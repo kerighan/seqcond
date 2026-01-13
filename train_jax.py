@@ -207,6 +207,12 @@ def parse_args():
         action="store_true",
         help="Disable gradient checkpointing (rematerialization)",
     )
+    parser.add_argument(
+        "--dataset",
+        choices=["synth", "fineweb", "both"],
+        default="synth",
+        help="Dataset curriculum: SYNTH only, FineWeb only, or FineWeb then SYNTH",
+    )
 
     return parser.parse_args()
 
@@ -224,7 +230,12 @@ jax.distributed.initialize()
 
 # Now import application modules
 from seqcond.config import Config, ModelConfig, TrainingConfig
-from seqcond.dataset import tokenizer
+from seqcond.dataset import (
+    tokenizer,
+    data_generator,
+    fineweb_data_generator,
+    fineweb_then_synth_data_generator,
+)
 from seqcond.jax import train
 from jax_smi import initialise_tracking
 
@@ -345,8 +356,26 @@ def main():
             print(f"Checkpoint for step {args.resume_step} not found at {candidate}")
 
     # Start Training
+    data_loader = None
+    if args.dataset in ("fineweb", "both"):
+        tc = config.training
+        micro_steps = tc.total_steps * tc.grad_accum_steps
+        common_kwargs = dict(
+            batch_size=tc.batch_size,
+            max_steps=micro_steps,
+            maxlen=tc.maxlen,
+            log_every_n_steps=tc.log_every_n_steps,
+            tok=tokenizer,
+            shard_data=True,
+        )
+        if args.dataset == "fineweb":
+            data_loader = fineweb_data_generator(**common_kwargs)
+        else:
+            data_loader = fineweb_then_synth_data_generator(**common_kwargs)
+
     train(
         config=config,
+        data_loader=data_loader,
         tokenizer=tokenizer,
         seed=args.seed,
         resume_checkpoint=resume_ckpt,
