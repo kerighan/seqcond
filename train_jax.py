@@ -232,9 +232,9 @@ jax.distributed.initialize()
 from seqcond.config import Config, ModelConfig, TrainingConfig
 from seqcond.dataset import (
     tokenizer,
-    data_generator,
-    fineweb_data_generator,
-    fineweb_then_synth_data_generator,
+    DataLoader,
+    iterate_fineweb,
+    iterate_fineweb_then_synth,
 )
 from seqcond.jax import train
 from jax_smi import initialise_tracking
@@ -360,18 +360,20 @@ def main():
     if args.dataset in ("fineweb", "both"):
         tc = config.training
         micro_steps = tc.total_steps * tc.grad_accum_steps
-        common_kwargs = dict(
+        iterator_fn = (
+            iterate_fineweb if args.dataset == "fineweb" else iterate_fineweb_then_synth
+        )
+        iterator_kwargs = dict(shard_data=True)
+
+        data_loader = DataLoader(
             batch_size=tc.batch_size,
             max_steps=micro_steps,
             maxlen=tc.maxlen,
-            log_every_n_steps=tc.log_every_n_steps,
             tok=tokenizer,
-            shard_data=True,
+            iterator_fn=iterator_fn,
+            iterator_kwargs=iterator_kwargs,
+            log_every_n_steps=tc.log_every_n_steps,
         )
-        if args.dataset == "fineweb":
-            data_loader = fineweb_data_generator(**common_kwargs)
-        else:
-            data_loader = fineweb_then_synth_data_generator(**common_kwargs)
 
     train(
         config=config,

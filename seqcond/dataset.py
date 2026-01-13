@@ -341,11 +341,17 @@ class DataLoader:
         max_steps: int = 1000,
         maxlen: int = 768,
         tok: Tokenizer = None,
+        iterator_fn: Callable[..., Iterator] = None,
+        iterator_kwargs: Optional[dict] = None,
+        log_every_n_steps: int = 0,
     ):
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.maxlen = maxlen
         self.tok = tok or tokenizer
+        self.iterator_fn = iterator_fn or iterate_synth
+        self.iterator_kwargs = iterator_kwargs or {}
+        self.log_every_n_steps = log_every_n_steps
 
         # Tracking state
         self.tokens_seen = 0
@@ -354,7 +360,10 @@ class DataLoader:
 
     def __iter__(self):
         """Iterate over batches."""
-        iterator = iterate_synth(max_samples=None, tokenize=True, tok=self.tok)
+        iterator_kwargs = {"tokenize": True}
+        iterator_kwargs.update(self.iterator_kwargs)
+        iterator_kwargs.setdefault("tok", self.tok)
+        iterator = self.iterator_fn(**iterator_kwargs)
 
         X_batch, y_batch = [], []
 
@@ -373,6 +382,14 @@ class DataLoader:
 
                 X_batch, y_batch = [], []
                 self.steps_done += 1
+
+                if (
+                    self.log_every_n_steps
+                    and self.steps_done % self.log_every_n_steps == 0
+                ):
+                    print(
+                        f"[dataset] steps={self.steps_done} tokens_seen={self.tokens_seen:,}"
+                    )
 
                 if self.steps_done >= self.max_steps:
                     break
