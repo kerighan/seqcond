@@ -747,7 +747,7 @@ class SeqCondBlock(nn.Module):
     num_thetas: int = 1
     num_anchor_heads: int = 0
     conv_kernel_size: int = 4
-    skip_low_rank: bool = True  # If True, use D//4 latent skip; if False, use full dim
+    skip_low_rank: bool = False  # If True, use D//4 latent skip; if False, use full dim
     dropout: float = 0.0
     norm_eps: float = 1e-5
     maxlen: Optional[int] = None
