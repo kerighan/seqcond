@@ -7,7 +7,7 @@
 gcloud config set project seqcond --quiet
 
 # Configuration
-TPU_NAME="${1:-node-v4-32}"
+TPU_NAME="${1:-node-v4-16}"
 ZONE="${2:-us-central2-b}"
 REPO_URL="https://github.com/kerighan/seqcond"
 REMOTE_DIR="$HOME/seqcond"

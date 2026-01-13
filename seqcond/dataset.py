@@ -44,7 +44,17 @@ class Tokenizer:
 
 
 # Default tokenizer instance
-tokenizer = Tokenizer()
+EOT_TOKEN = "<|endoftext|>"
+
+tokenizer = Tokenizer(
+    special_tokens=(
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|think_start|>",
+        "<|think_end|>",
+        EOT_TOKEN,
+    )
+)
 
 
 def format_synth_item(item: dict) -> str:
@@ -139,6 +149,180 @@ def pad_sequences(sequences: list, maxlen: int, padding_value: int = 0) -> np.nd
         result[i, :length] = seq[:length]
 
     return result
+
+
+def _batchify_token_stream(
+    token_iterator: Iterator[list],
+    batch_size: int,
+    max_steps: int,
+    maxlen: int,
+    log_every_n_steps: int,
+    pad_value: int = 0,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    X_batch, y_batch = [], []
+    steps_done = 0
+    tokens_seen = 0
+
+    for tokens in token_iterator:
+        tokens_seen += min(len(tokens), maxlen)
+        X = tokens[:-1]
+        y = tokens[1:]
+        X_batch.append(X)
+        y_batch.append(y)
+
+        if len(X_batch) == batch_size:
+            X_padded = pad_sequences(X_batch, maxlen=maxlen, padding_value=pad_value)
+            y_padded = pad_sequences(y_batch, maxlen=maxlen, padding_value=pad_value)
+
+            yield X_padded, y_padded
+
+            X_batch, y_batch = [], []
+            steps_done += 1
+
+            if log_every_n_steps and steps_done % log_every_n_steps == 0:
+                print(f"[dataset] steps={steps_done} tokens_seen={tokens_seen:,}")
+
+            if steps_done >= max_steps:
+                break
+
+
+def _maybe_init_jax_process_info(shard_data: bool) -> tuple[int, int]:
+    process_index = 0
+    process_count = 1
+
+    if shard_data:
+        try:
+            import jax
+
+            if jax.process_count() > 1:
+                process_index = jax.process_index()
+                process_count = jax.process_count()
+                print(
+                    f"[Process {process_index}/{process_count}] Loading dataset shard..."
+                )
+        except Exception:
+            pass
+
+    return process_index, process_count
+
+
+def iterate_fineweb(
+    max_samples: int = None,
+    tokenize: bool = True,
+    tok: Tokenizer = None,
+    shard_data: bool = True,
+) -> Iterator:
+    """
+    Iterate over HuggingFace FineWeb EDU (sample-10BT) in streaming mode.
+
+    Each document is terminated with an <|endoftext|> token to ensure clean packing.
+    """
+    if tok is None:
+        tok = tokenizer
+
+    process_index, process_count = _maybe_init_jax_process_info(shard_data)
+    dataset = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+    )
+
+    eot = tok.encode(EOT_TOKEN)[0]
+
+    for i, item in enumerate(dataset):
+        if i % process_count != process_index:
+            continue
+
+        if max_samples is not None and i >= max_samples * process_count:
+            break
+
+        text = item.get("text", "")
+        if tokenize:
+            tokens = tok.encode(text)
+            tokens.append(eot)
+            yield tokens
+        else:
+            yield text + EOT_TOKEN
+
+
+def fineweb_data_generator(
+    batch_size: int = 1,
+    max_steps: int = 1000,
+    maxlen: int = 1024,
+    log_every_n_steps: int = 1000,
+    tok: Tokenizer = None,
+    shard_data: bool = True,
+    max_samples: int = None,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Generate batches from FineWeb EDU token stream with <|endoftext|> padding.
+    """
+    tok = tok or tokenizer
+    pad_value = tok.encode(EOT_TOKEN)[0]
+    iterator = iterate_fineweb(
+        max_samples=max_samples, tokenize=True, tok=tok, shard_data=shard_data
+    )
+    yield from _batchify_token_stream(
+        iterator,
+        batch_size=batch_size,
+        max_steps=max_steps,
+        maxlen=maxlen,
+        log_every_n_steps=log_every_n_steps,
+        pad_value=pad_value,
+    )
+
+
+def iterate_fineweb_then_synth(
+    max_fineweb: int = None,
+    max_synth: int = None,
+    tok: Tokenizer = None,
+    shard_data: bool = True,
+) -> Iterator[list]:
+    """
+    Yield tokenized samples from FineWeb EDU followed by SYNTH.
+
+    Useful for curriculum schedules where we pretrain on web data then
+    immediately continue on instruction-style SYNTH samples within a
+    single iterator pass.
+    """
+    tok = tok or tokenizer
+
+    yield from iterate_fineweb(
+        max_samples=max_fineweb, tokenize=True, tok=tok, shard_data=shard_data
+    )
+    yield from iterate_synth(
+        max_samples=max_synth, tokenize=True, tok=tok, shard_data=shard_data
+    )
+
+
+def fineweb_then_synth_data_generator(
+    batch_size: int = 1,
+    max_steps: int = 1000,
+    maxlen: int = 1024,
+    log_every_n_steps: int = 1000,
+    tok: Tokenizer = None,
+    shard_data: bool = True,
+    max_fineweb: int = None,
+    max_synth: int = None,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    """Batch generator that streams FineWeb first, then SYNTH."""
+    tok = tok or tokenizer
+    pad_value = tok.encode(EOT_TOKEN)[0]
+    iterator = iterate_fineweb_then_synth(
+        max_fineweb=max_fineweb,
+        max_synth=max_synth,
+        tok=tok,
+        shard_data=shard_data,
+    )
+    yield from _batchify_token_stream(
+        iterator,
+        batch_size=batch_size,
+        max_steps=max_steps,
+        maxlen=maxlen,
+        log_every_n_steps=log_every_n_steps,
+        pad_value=pad_value,
+    )
 
 
 class DataLoader:
