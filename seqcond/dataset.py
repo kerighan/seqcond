@@ -278,6 +278,8 @@ def iterate_fineweb_then_synth(
     max_synth: int = None,
     tok: Tokenizer = None,
     shard_data: bool = True,
+    tokenize: bool = True,
+    **unused_kwargs,
 ) -> Iterator[list]:
     """
     Yield tokenized samples from FineWeb EDU followed by SYNTH.
@@ -289,10 +291,16 @@ def iterate_fineweb_then_synth(
     tok = tok or tokenizer
 
     yield from iterate_fineweb(
-        max_samples=max_fineweb, tokenize=True, tok=tok, shard_data=shard_data
+        max_samples=max_fineweb,
+        tokenize=tokenize,
+        tok=tok,
+        shard_data=shard_data,
     )
     yield from iterate_synth(
-        max_samples=max_synth, tokenize=True, tok=tok, shard_data=shard_data
+        max_samples=max_synth,
+        tokenize=tokenize,
+        tok=tok,
+        shard_data=shard_data,
     )
 
 
