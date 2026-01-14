@@ -919,11 +919,14 @@ class Trainer:
                 break
 
             try:
-                x_batch, y_batch = next(data_iterator)
-                # Update manual token tracking if using tf.data
                 if using_tf_data:
-                    tokens_in_batch = x_batch.size
-                    tokens_seen += tokens_in_batch
+                    x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
+                    tokens_seen += real_tokens_in_batch
+                else:
+                    x_batch, y_batch = next(data_iterator)
+                    # When not using tf.data, tokens_seen is not used here.
+                    # The DataLoader instance tracks it internally and it's fetched later.
+
             except StopIteration:
                 print("Data loader exhausted.")
                 break
@@ -1092,7 +1095,11 @@ class Trainer:
         current_time = time.time()
         elapsed = current_time - last_log_time
         log_interval = self.train_config.log_every_n_steps
-        batch_per_sec = log_interval / elapsed if elapsed > 0 else 0
+        grad_accum_steps = self.train_config.grad_accum_steps
+
+        # Correctly calculate batches per second (micro-steps per second)
+        num_batches = log_interval * grad_accum_steps
+        batch_per_sec = num_batches / elapsed if elapsed > 0 else 0
         tokens_per_sec = tokens_delta / elapsed if elapsed > 0 else 0
 
         steps_remaining = total_steps - macro_step

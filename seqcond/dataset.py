@@ -158,8 +158,8 @@ def _batchify_token_stream(
     maxlen: int,
     log_every_n_steps: int,
     pad_value: int = 0,
-) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-    X_batch, y_batch = [], []
+) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    X_batch, y_batch, real_lengths = [], [], []
     steps_done = 0
     tokens_seen = 0
 
@@ -169,14 +169,16 @@ def _batchify_token_stream(
         y = tokens[1:]
         X_batch.append(X)
         y_batch.append(y)
+        real_lengths.append(min(len(X), maxlen))
 
         if len(X_batch) == batch_size:
             X_padded = pad_sequences(X_batch, maxlen=maxlen, padding_value=pad_value)
             y_padded = pad_sequences(y_batch, maxlen=maxlen, padding_value=pad_value)
 
-            yield X_padded, y_padded
+            real_tokens_in_batch = sum(real_lengths)
+            yield X_padded, y_padded, np.array(real_tokens_in_batch, dtype=np.int32)
 
-            X_batch, y_batch = [], []
+            X_batch, y_batch, real_lengths = [], [], []
             steps_done += 1
 
             if log_every_n_steps and steps_done % log_every_n_steps == 0:
@@ -419,7 +421,7 @@ def data_generator(
     maxlen: int = 768,
     log_every_n_steps: int = 1000,
     tok: Tokenizer = None,
-) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Generate batches of (X, y) pairs for language model training.
 
@@ -431,12 +433,11 @@ def data_generator(
         tok: Tokenizer to use (default: global tokenizer)
 
     Yields:
-        Tuple of (X, y) numpy arrays with shape (batch_size, maxlen)
-        X = tokens[:-1], y = tokens[1:] (next token prediction)
+        Tuple of (X, y, real_tokens_in_batch) numpy arrays
     """
     iterator = iterate_synth(max_samples=None, tokenize=True, tok=tok)
 
-    X_batch, y_batch = [], []
+    X_batch, y_batch, real_lengths = [], [], []
     steps_done = 0
     tokens_seen = 0
 
@@ -446,14 +447,16 @@ def data_generator(
         y = tokens[1:]
         X_batch.append(X)
         y_batch.append(y)
+        real_lengths.append(min(len(X), maxlen))
 
         if len(X_batch) == batch_size:
             X_padded = pad_sequences(X_batch, maxlen=maxlen)
             y_padded = pad_sequences(y_batch, maxlen=maxlen)
 
-            yield X_padded, y_padded
+            real_tokens_in_batch = sum(real_lengths)
+            yield X_padded, y_padded, np.array(real_tokens_in_batch, dtype=np.int32)
 
-            X_batch, y_batch = [], []
+            X_batch, y_batch, real_lengths = [], [], []
             steps_done += 1
 
             if log_every_n_steps and steps_done % log_every_n_steps == 0:
@@ -481,7 +484,7 @@ def create_tf_dataset(
         prefetch_buffer: Prefetch buffer size (None = AUTOTUNE)
 
     Returns:
-        tf.data.Dataset yielding (X, y) batches
+        tf.data.Dataset yielding (X, y, real_tokens_in_batch) batches
     """
     import tensorflow as tf
 
@@ -498,6 +501,7 @@ def create_tf_dataset(
         output_signature=(
             tf.TensorSpec(shape=(batch_size, maxlen), dtype=tf.int32),
             tf.TensorSpec(shape=(batch_size, maxlen), dtype=tf.int32),
+            tf.TensorSpec(shape=(), dtype=tf.int32),
         ),
     )
     return dataset.prefetch(prefetch_buffer)
