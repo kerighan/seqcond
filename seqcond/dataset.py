@@ -4,7 +4,7 @@ Provides clean, framework-agnostic data loading with optional TensorFlow integra
 """
 
 from dataclasses import dataclass
-from typing import Iterator, Tuple, Optional, Callable
+from typing import Iterator, Tuple, Optional, Callable, Iterable, List
 import numpy as np
 
 from datasets import load_dataset
@@ -213,11 +213,14 @@ def iterate_fineweb(
     tokenize: bool = True,
     tok: Tokenizer = None,
     shard_data: bool = True,
-) -> Iterator:
+    maxlen: int = 1024,
+) -> Iterator[list]:
     """
     Iterate over HuggingFace FineWeb EDU (sample-10BT) in streaming mode.
 
-    Each document is terminated with an <|endoftext|> token to ensure clean packing.
+    Samples are *packed* to fill the provided `maxlen` by concatenating documents
+    with `<|endoftext|>` delimiters. This ensures every returned sample (except
+    possibly the very last) has full context length, maximizing token utilization.
     """
     if tok is None:
         tok = tokenizer
@@ -230,7 +233,48 @@ def iterate_fineweb(
         streaming=True,
     )
 
+    if not tokenize:
+        # Fall back to original behaviour (no packing) when raw text requested
+        for i, item in enumerate(dataset):
+            if i % process_count != process_index:
+                continue
+
+            if max_samples is not None and i >= max_samples * process_count:
+                break
+
+            yield item.get("text", "") + EOT_TOKEN
+        return
+
     eot = tok.encode(EOT_TOKEN)[0]
+    buffer: List[int] = []
+    chunk_size = maxlen + 1  # Need +1 so that X has full `maxlen` tokens after shift
+
+    for doc_tokens in _iterate_fineweb_docs(
+        dataset, process_index, process_count, max_samples, tok=tok
+    ):
+        if not doc_tokens:
+            continue
+
+        buffer.extend(doc_tokens)
+        buffer.append(eot)
+
+        while len(buffer) >= chunk_size:
+            yield buffer[:chunk_size]
+            buffer = buffer[chunk_size:]
+
+    # Flush trailing tokens
+    if len(buffer) > 1:
+        pass
+
+
+def _iterate_fineweb_docs(
+    dataset: Iterable,
+    process_index: int,
+    process_count: int,
+    max_samples: Optional[int],
+    tok: Optional[Tokenizer] = None,
+) -> Iterator[List[int]]:
+    tok = tok or tokenizer
 
     for i, item in enumerate(dataset):
         if i % process_count != process_index:
@@ -240,12 +284,8 @@ def iterate_fineweb(
             break
 
         text = item.get("text", "")
-        if tokenize:
-            tokens = tok.encode(text)
-            tokens.append(eot)
-            yield tokens
-        else:
-            yield text + EOT_TOKEN
+        tokens = tok.encode(text)
+        yield tokens
 
 
 def fineweb_data_generator(
@@ -263,7 +303,11 @@ def fineweb_data_generator(
     tok = tok or tokenizer
     pad_value = tok.encode(EOT_TOKEN)[0]
     iterator = iterate_fineweb(
-        max_samples=max_samples, tokenize=True, tok=tok, shard_data=shard_data
+        max_samples=max_samples,
+        tokenize=True,
+        tok=tok,
+        shard_data=shard_data,
+        maxlen=maxlen,
     )
     yield from _batchify_token_stream(
         iterator,
@@ -354,6 +398,7 @@ class DataLoader:
         iterator_fn: Callable[..., Iterator] = None,
         iterator_kwargs: Optional[dict] = None,
         log_every_n_steps: int = 0,
+        drop_last: bool = False,
     ):
         self.batch_size = batch_size
         self.max_steps = max_steps
@@ -362,6 +407,7 @@ class DataLoader:
         self.iterator_fn = iterator_fn or iterate_synth
         self.iterator_kwargs = iterator_kwargs or {}
         self.log_every_n_steps = log_every_n_steps
+        self.drop_last = drop_last
 
         # Tracking state
         self.tokens_seen = 0
@@ -378,6 +424,9 @@ class DataLoader:
         X_batch, y_batch = [], []
 
         for tokens in iterator:
+            if not tokens:
+                continue
+
             self.tokens_seen += min(len(tokens), self.maxlen)
             X = tokens[:-1]
             y = tokens[1:]
@@ -403,6 +452,12 @@ class DataLoader:
 
                 if self.steps_done >= self.max_steps:
                     break
+
+        # Yield trailing batch if it has samples but is not full
+        if X_batch and not self.drop_last:
+            X_padded = pad_sequences(X_batch, maxlen=self.maxlen)
+            y_padded = pad_sequences(y_batch, maxlen=self.maxlen)
+            yield X_padded, y_padded
 
     def tokens_since_last_check(self) -> int:
         """Get tokens seen since last call to this method."""
@@ -518,6 +573,7 @@ def create_data_loader(
     max_steps: int = 1000,
     maxlen: int = 768,
     tok: Tokenizer = None,
+    drop_last: bool = False,
 ) -> DataLoader:
     """Create a DataLoader instance."""
     return DataLoader(
@@ -525,6 +581,7 @@ def create_data_loader(
         max_steps=max_steps,
         maxlen=maxlen,
         tok=tok,
+        drop_last=drop_last,
     )
 
 
