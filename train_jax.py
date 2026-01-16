@@ -391,7 +391,6 @@ def main():
             iterator_fn=iterator_fn,
             iterator_kwargs=iterator_kwargs,
             log_every_n_steps=tc.log_every_n_steps,
-            name=args.dataset,
         )
 
     train(
