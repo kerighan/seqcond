@@ -225,7 +225,8 @@ def iterate_fineweb(
     if tok is None:
         tok = tokenizer
 
-    process_index, process_count = _maybe_init_jax_process_info(shard_data)
+    # NOTE: No document-level sharding for FineWeb - all hosts see all documents.
+    # Sharding happens at batch level in DataLoader/training loop.
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         name="sample-10BT",
@@ -236,12 +237,8 @@ def iterate_fineweb(
     if not tokenize:
         # Fall back to original behaviour (no packing) when raw text requested
         for i, item in enumerate(dataset):
-            if i % process_count != process_index:
-                continue
-
-            if max_samples is not None and i >= max_samples * process_count:
+            if max_samples is not None and i >= max_samples:
                 break
-
             yield item.get("text", "") + EOT_TOKEN
         return
 
@@ -249,43 +246,54 @@ def iterate_fineweb(
     buffer: List[int] = []
     chunk_size = maxlen + 1  # Need +1 so that X has full `maxlen` tokens after shift
 
-    for doc_tokens in _iterate_fineweb_docs(
-        dataset, process_index, process_count, max_samples, tok=tok
-    ):
+    chunks_yielded = 0
+    total_tokens_from_docs = 0
+
+    for doc_tokens in _iterate_fineweb_docs(dataset, tok=tok):
         if not doc_tokens:
             continue
 
+        total_tokens_from_docs += len(doc_tokens)
         buffer.extend(doc_tokens)
         buffer.append(eot)
 
         while len(buffer) >= chunk_size:
             yield buffer[:chunk_size]
             buffer = buffer[chunk_size:]
+            chunks_yielded += 1
 
-    # Flush trailing tokens
-    if len(buffer) > 1:
-        pass
+            if max_samples is not None and chunks_yielded >= max_samples:
+                print(
+                    f"[dataset] FineWeb reached max_samples={max_samples} packed chunks"
+                )
+                return
+
+    # Flush trailing tokens (discarded - incomplete chunk)
+    print(
+        f"[dataset] FineWeb packing complete: {chunks_yielded:,} chunks yielded, "
+        f"{total_tokens_from_docs:,} tokens from docs, {len(buffer)} trailing tokens discarded"
+    )
 
 
 def _iterate_fineweb_docs(
     dataset: Iterable,
-    process_index: int,
-    process_count: int,
-    max_samples: Optional[int],
     tok: Optional[Tokenizer] = None,
 ) -> Iterator[List[int]]:
+    """Iterate over FineWeb documents.
+
+    Yields tokenized documents until the dataset is exhausted.
+    No sharding here - all hosts see all documents.
+    """
     tok = tok or tokenizer
+    docs_processed = 0
 
-    for i, item in enumerate(dataset):
-        if i % process_count != process_index:
-            continue
-
-        if max_samples is not None and i >= max_samples * process_count:
-            break
-
+    for item in dataset:
         text = item.get("text", "")
         tokens = tok.encode(text)
+        docs_processed += 1
         yield tokens
+
+    print(f"[dataset] FineWeb document stream exhausted after {docs_processed:,} docs")
 
 
 def fineweb_data_generator(
@@ -325,6 +333,7 @@ def iterate_fineweb_then_synth(
     tok: Tokenizer = None,
     shard_data: bool = True,
     tokenize: bool = True,
+    maxlen: int = 1024,
     **unused_kwargs,
 ) -> Iterator[list]:
     """
@@ -333,15 +342,23 @@ def iterate_fineweb_then_synth(
     Useful for curriculum schedules where we pretrain on web data then
     immediately continue on instruction-style SYNTH samples within a
     single iterator pass.
+
+    Args:
+        max_fineweb: Max packed chunks from FineWeb (None = exhaust dataset)
+        max_synth: Max samples from SYNTH (None = infinite)
+        maxlen: Context length for FineWeb packing
     """
     tok = tok or tokenizer
 
+    print("[dataset] Starting FineWeb phase")
     yield from iterate_fineweb(
         max_samples=max_fineweb,
         tokenize=tokenize,
         tok=tok,
         shard_data=shard_data,
+        maxlen=maxlen,
     )
+    print("[dataset] FineWeb exhausted, switching to SYNTH")
     yield from iterate_synth(
         max_samples=max_synth,
         tokenize=tokenize,
@@ -416,7 +433,7 @@ class DataLoader:
 
     def __iter__(self):
         """Iterate over batches."""
-        iterator_kwargs = {"tokenize": True}
+        iterator_kwargs = {"tokenize": True, "maxlen": self.maxlen}
         iterator_kwargs.update(self.iterator_kwargs)
         iterator_kwargs.setdefault("tok", self.tok)
         iterator = self.iterator_fn(**iterator_kwargs)

@@ -213,6 +213,20 @@ def parse_args():
         default="synth",
         help="Dataset curriculum: SYNTH only, FineWeb only, or FineWeb then SYNTH",
     )
+    parser.add_argument(
+        "--max-fineweb",
+        type=int,
+        default=None,
+        dest="max_fineweb",
+        help="Maximum number of FineWeb packed chunks (None = exhaust dataset)",
+    )
+    parser.add_argument(
+        "--max-synth",
+        type=int,
+        default=None,
+        dest="max_synth",
+        help="Maximum number of SYNTH samples (None = infinite)",
+    )
 
     return parser.parse_args()
 
@@ -363,7 +377,11 @@ def main():
         iterator_fn = (
             iterate_fineweb if args.dataset == "fineweb" else iterate_fineweb_then_synth
         )
-        iterator_kwargs = dict(shard_data=True)
+        iterator_kwargs = dict(
+            shard_data=True,
+            max_fineweb=args.max_fineweb,
+            max_synth=args.max_synth,
+        )
 
         data_loader = DataLoader(
             batch_size=tc.batch_size,
@@ -373,6 +391,7 @@ def main():
             iterator_fn=iterator_fn,
             iterator_kwargs=iterator_kwargs,
             log_every_n_steps=tc.log_every_n_steps,
+            name=args.dataset,
         )
 
     train(
