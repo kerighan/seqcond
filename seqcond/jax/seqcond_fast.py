@@ -348,11 +348,13 @@ class SeqCondAttention(nn.Module):
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
-        match_re = state_re_g * q_re + state_im_g * q_im
-        match_im = state_im_g * q_re - state_re_g * q_im
+        # Cast to float32 for numerical stability in integration (SSM sensitive to small variations)
+        match_re = (state_re_g * q_re + state_im_g * q_im).astype(jnp.float32)
+        match_im = (state_im_g * q_re - state_re_g * q_im).astype(jnp.float32)
+        w_int_f32 = w_int.astype(jnp.float32)
 
-        out_re_g = jnp.sum(match_re * w_int, axis=-1)
-        out_im_g = jnp.sum(match_im * w_int, axis=-1)
+        out_re_g = jnp.sum(match_re * w_int_f32, axis=-1)
+        out_im_g = jnp.sum(match_im * w_int_f32, axis=-1)
 
         out_re = out_re_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
@@ -663,12 +665,18 @@ class SeqCondAttention(nn.Module):
         # Compute complex multiplication (matching)
         # q_re, q_im: (B, K_q, 1, H, M) from reshape at line 461
         # state_re_grouped, state_im_grouped: (B, K_q, n_rep, H, M)
-        match_re = state_re_grouped * q_re + state_im_grouped * q_im
-        match_im = state_im_grouped * q_re - state_re_grouped * q_im
+        # Cast to float32 for numerical stability in integration (SSM sensitive to small variations)
+        match_re = (state_re_grouped * q_re + state_im_grouped * q_im).astype(
+            jnp.float32
+        )
+        match_im = (state_im_grouped * q_re - state_re_grouped * q_im).astype(
+            jnp.float32
+        )
+        w_int_f32 = w_int_step.astype(jnp.float32)
 
         # Integrate over M (frequencies) with w_int
-        out_re_g = jnp.sum(match_re * w_int_step, axis=-1)  # (B, K_q, n_rep, H)
-        out_im_g = jnp.sum(match_im * w_int_step, axis=-1)
+        out_re_g = jnp.sum(match_re * w_int_f32, axis=-1)  # (B, K_q, n_rep, H)
+        out_im_g = jnp.sum(match_im * w_int_f32, axis=-1)
 
         # Reshape to (B, K, H)
         out_re = out_re_g.reshape(B, self.K, H).astype(self.compute_dtype)
