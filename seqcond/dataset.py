@@ -59,7 +59,12 @@ tokenizer = Tokenizer(
 
 def format_synth_item(item: dict) -> str:
     """Format a SYNTH dataset item into chat format."""
-    text = "<|im_start|>user\n" + item["query"] + "\n<|im_end|>"
+    if len(str(item["constraints"])) > 0:
+        query = item["query"] + "\n\n" + item["constraints"]
+    else:
+        query = item["query"]
+
+    text = "<|im_start|>user\n" + query + "\n<|im_end|>"
     text += (
         "<|im_start|>assistant\n<|think_start|>"
         + item["synthetic_reasoning"]

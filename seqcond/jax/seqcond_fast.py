@@ -271,7 +271,8 @@ class SeqCondAttention(nn.Module):
         )
 
         # Softplus instead of exp for stability (Mamba-like)
-        p_w_content = jax.nn.softplus(score_raw)
+        # p_w_content = jax.nn.softplus(score_raw)
+        p_w_content = jax.nn.relu(score_raw) ** 2
 
         # Temporal weight with exp
         temporal_weight = jnp.exp(log_time_weight)
