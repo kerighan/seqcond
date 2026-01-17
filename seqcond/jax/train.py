@@ -530,6 +530,13 @@ class Trainer:
         )
         self.optimizer = self._base_optimizer
 
+        # Store LR schedule for logging
+        self._lr_schedule = warmup_cosine_decay_schedule(
+            base_lr=self.train_config.base_lr,
+            warmup_steps=self.train_config.warmup_steps,
+            total_steps=self.train_config.total_steps,
+        )
+
         # Determine multi-device usage
         self.use_fsdp = (
             bool(self.train_config.full_shard_data_parallel) and self.num_devices > 1
@@ -1123,10 +1130,12 @@ class Trainer:
 
         # Wandb detailed logging
         if self._wandb is not None:
+            current_lr = float(self._lr_schedule(macro_step))
             log_data = {
                 **{k: float(v) for k, v in results.items()},
                 "tokens_per_sec": tokens_per_sec,
                 "tokens_seen": tokens_seen,
+                "lr": current_lr,
             }
             self._wandb.log(log_data, step=macro_step)
 

@@ -172,7 +172,7 @@ def parse_args():
         help="Number of gradient accumulation steps",
     )
     grp_train.add_argument(
-        "--total-steps", type=int, default=None, help="Override total training steps"
+        "--total-steps", type=int, default=220000, help="Override total training steps"
     )
     grp_train.add_argument(
         "--save-every-n-steps", type=int, default=None, help="Checkpoint interval"
