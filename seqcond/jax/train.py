@@ -820,6 +820,7 @@ class Trainer:
                         self.params_sharding,
                         self.opt_state_sharding,
                         metrics_sharding,
+                        None,  # grad_norm is a scalar, no sharding needed
                     ),
                 )
         elif self.use_pmap:
