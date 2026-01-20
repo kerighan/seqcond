@@ -246,11 +246,12 @@ def make_train_step(model, optimizer, compute_dtype=jnp.float32, grad_mask=None)
 
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = _apply_grad_mask(grads, grad_mask)
+        grad_norm = _global_norm(grads)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
         metrics = compute_batch_metrics(logits, y, ignore_class=0)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, metrics, grad_norm
 
     return train_step
 
@@ -316,11 +317,12 @@ def make_fsdp_train_step(model, optimizer, compute_dtype=jnp.float32):
 
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = _apply_grad_mask(grads, grad_mask)
+        grad_norm = _global_norm(grads)
         updates, new_opt_state = optimizer_update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
         metrics = compute_batch_metrics(logits, y, ignore_class=0)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, metrics, grad_norm
 
     return train_step
 
@@ -353,9 +355,10 @@ def make_pmap_train_step(
             "loss": jax.lax.psum(metrics_local["loss"], axis_name=axis_name),
         }
 
+        grad_norm = _global_norm(grads)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, metrics, grad_norm
 
     return jax.pmap(train_step, axis_name=axis_name)
 
@@ -476,11 +479,14 @@ class Trainer:
         return jax.tree_util.tree_map(lambda x: x[0], tree)
 
     def _unshard_tree(self, tree):
-        """Unshard a tree from devices to host."""
-        return jax.tree_util.tree_map(
-            lambda x: x.addressable_data(0),
-            tree,
-        )
+        """Unshard a tree from devices to host - reconstruct full params from all shards."""
+
+        def gather_shards(x):
+            # Gather all shards and concatenate along the sharded axis (axis 0)
+            shards = [x.addressable_data(i) for i in range(len(x.addressable_shards))]
+            return jnp.concatenate(shards, axis=0)
+
+        return jax.tree_util.tree_map(gather_shards, tree)
 
     def _host_tree(self, tree):
         if self.use_fsdp:
@@ -939,6 +945,7 @@ class Trainer:
                 break
 
             metrics_batch = None
+            grad_norm_value = None
 
             if self.use_fsdp:
                 # In multi-host setup, each process has its own data shard
@@ -968,6 +975,7 @@ class Trainer:
                             self.params, self.opt_state = self._fsdp_update_step(
                                 self.params, self.opt_state, grads_accum
                             )
+                        grad_norm_value = _global_norm(grads_accum)
                         grads_accum = None
                         metrics_batch = metrics_accum
                         metrics_accum = None
@@ -979,6 +987,7 @@ class Trainer:
                             self.params,
                             self.opt_state,
                             metrics_batch,
+                            grad_norm_value,
                         ) = self._fsdp_train_step(
                             self.params, self.opt_state, x, y, self._grad_mask
                         )
@@ -991,12 +1000,16 @@ class Trainer:
                 y = jnp.array(y_batch, dtype=jnp.int32).reshape(
                     self.num_devices, self.per_device_batch, -1
                 )
-                self.params, self.opt_state, metrics_batch = self._pmap_train_step(
-                    self.params, self.opt_state, x, y
-                )
+                (
+                    self.params,
+                    self.opt_state,
+                    metrics_batch,
+                    grad_norm_value,
+                ) = self._pmap_train_step(self.params, self.opt_state, x, y)
                 # PMAP returns sharded arrays (one per device). Since we psum-ed, they are identical.
                 # Take the first device's output.
                 metrics_batch = jax.tree_util.tree_map(lambda x: x[0], metrics_batch)
+                grad_norm_value = float(grad_norm_value[0])
                 macro_step += 1
 
             else:
@@ -1016,6 +1029,7 @@ class Trainer:
 
                     accum_count += 1
                     if accum_count >= grad_accum_steps:
+                        grad_norm_value = _global_norm(grads_accum)
                         self.params, self.opt_state = self._update_step(
                             self.params, self.opt_state, grads_accum
                         )
@@ -1035,10 +1049,14 @@ class Trainer:
                             )
                         )
                         metrics_batch = compute_batch_metrics(logits, y, ignore_class=0)
+                        grad_norm_value = float(dbg.get("grad_norm", 0.0))
                     else:
-                        self.params, self.opt_state, metrics_batch = self._train_step(
-                            self.params, self.opt_state, x, y
-                        )
+                        (
+                            self.params,
+                            self.opt_state,
+                            metrics_batch,
+                            grad_norm_value,
+                        ) = self._train_step(self.params, self.opt_state, x, y)
                     macro_step += 1
 
             # Update metrics accumulator
@@ -1063,6 +1081,7 @@ class Trainer:
                         last_log_time,
                         tokens_delta,
                         current_tokens_seen,
+                        grad_norm_value,
                     )
                     metrics.reset()
 
@@ -1089,6 +1108,7 @@ class Trainer:
         last_log_time: float,
         tokens_delta: int = 0,
         tokens_seen: int = 0,
+        grad_norm: float | None = None,
     ) -> float:
         """Log training progress (only from process 0 to avoid duplicate logs)."""
         # All processes must participate in metrics.result() for multi-host coordination
@@ -1118,11 +1138,13 @@ class Trainer:
         eta_m = int((eta_seconds % 3600) // 60)
         eta_s = int(eta_seconds % 60)
 
+        grad_norm_str = "n/a" if grad_norm is None else f"{grad_norm:.2f}"
         print(
             f"Step {macro_step:6d}/{total_steps} | "
             f"loss: {results['loss']:.4f} | "
             f"acc: {results['acc']:.4f} | "
             f"ppx: {results['ppx']:.2f} | "
+            f"grad_norm: {grad_norm_str} | "
             f"{tokens_per_sec:,.0f} tok/s | "
             f"{tokens_seen:,} tokens | "
             f"ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
@@ -1137,6 +1159,8 @@ class Trainer:
                 "tokens_seen": tokens_seen,
                 "lr": current_lr,
             }
+            if grad_norm is not None:
+                log_data["grad_norm"] = float(grad_norm)
             self._wandb.log(log_data, step=macro_step)
 
         return current_time
