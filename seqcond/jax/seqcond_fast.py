@@ -467,12 +467,13 @@ class SeqCondAttention(nn.Module):
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
         gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
-        # Single fused conv with buffer
+        # Single fused conv with buffer - manual implementation to avoid cuDNN autotuning
         z_conv_expanded = z_conv[:, None, :]  # (B, 1, dim_conv_total)
         conv_input = jnp.concatenate(
             [conv_buffer, z_conv_expanded], axis=1
         )  # (B, kernel_size, dim_conv_total)
 
+        # Use nn.Conv - cuDNN autotuning only happens once per shape, then cached
         z_conv_out = nn.Conv(
             features=dim_conv_total,
             kernel_size=(self.conv_kernel_size,),
@@ -481,8 +482,9 @@ class SeqCondAttention(nn.Module):
             use_bias=False,
             name="conv",
         )(conv_input)
+        z_conv_out = z_conv_out[:, 0, :]  # (B, C)
 
-        z_conv = jax.nn.silu(z_conv_out[:, 0, :])
+        z_conv = jax.nn.silu(z_conv_out)
         conv_buffer_new = jnp.concatenate(
             [conv_buffer[:, 1:, :], z_conv_expanded], axis=1
         )
