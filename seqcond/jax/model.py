@@ -405,13 +405,14 @@ class SeqCondModel(nn.Module):
             pos_emb = self.position_embedding(jnp.array([[pos]]))[:, 0, :]
             x = x + pos_emb
 
-        # Get RoPE for this position
-        cos_t = self.cos_emb[pos : pos + 1, :][
-            None, :, None, :
-        ]  # (1, 1, 1, head_dim//2)
-        sin_t = self.sin_emb[pos : pos + 1, :][None, :, None, :]
-        cos_t = jnp.broadcast_to(cos_t, (b, 1, self.num_heads, cos_t.shape[-1]))
-        sin_t = jnp.broadcast_to(sin_t, (b, 1, self.num_heads, sin_t.shape[-1]))
+        # Get RoPE for this position (use dynamic_slice for JIT compatibility)
+        head_dim_half = self.cos_emb.shape[1]
+        cos_t = jax.lax.dynamic_slice(self.cos_emb, (pos, 0), (1, head_dim_half))
+        sin_t = jax.lax.dynamic_slice(self.sin_emb, (pos, 0), (1, head_dim_half))
+        cos_t = cos_t[None, :, None, :]  # (1, 1, 1, head_dim//2)
+        sin_t = sin_t[None, :, None, :]
+        cos_t = jnp.broadcast_to(cos_t, (b, 1, self.num_heads, head_dim_half))
+        sin_t = jnp.broadcast_to(sin_t, (b, 1, self.num_heads, head_dim_half))
 
         new_states = []
         for i, (block_type, block) in enumerate(self.blocks):

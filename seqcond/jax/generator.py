@@ -33,6 +33,28 @@ class GeneratorConfig:
     seed: Optional[int] = None
 
 
+@partial(jax.jit, static_argnums=(0,))
+def _step_fn_jit(model, params, token_array, states, pos):
+    """JIT-compiled step function with params as argument (not captured)."""
+    return model.apply(
+        {"params": params},
+        token_array,
+        states,
+        pos,
+        deterministic=True,
+        method=model.step,
+    )
+
+
+def _make_step_fn(model, params):
+    """Create a step function wrapper."""
+
+    def step_fn(token_array, states, pos):
+        return _step_fn_jit(model, params, token_array, states, pos)
+
+    return step_fn
+
+
 def generate_text_stepwise(
     model: SeqCondModel,
     params: dict,
@@ -73,26 +95,29 @@ def generate_text_stepwise(
     # Tokenize prompt
     tokens = tokenizer([prompt])[0]
 
-    if verbose:
-        print(f"Prefilling {len(tokens)} tokens...")
-
     # Initialize states
     batch_size = 1
     states = model.apply({"params": params}, batch_size, method=model.init_state)
 
-    # Prefill: run step for each prompt token to build up states
-    for t, token_id in enumerate(tokens):
-        token_array = jnp.array([[token_id]], dtype=jnp.int32)
-        logits, states = model.apply(
-            {"params": params},
-            token_array,
-            states,
-            t,
-            deterministic=True,
-            method=model.step,
-        )
+    # Create JIT-compiled step function (compiled once, reused for all steps)
+    step_fn = _make_step_fn(model, params)
 
     if verbose:
+        print(f"Compiling and prefilling {len(tokens)} tokens (first call is slow)...")
+
+    # Prefill: run step for each prompt token to build up states
+    import time
+
+    t0 = time.time()
+    for t, token_id in enumerate(tokens):
+        token_array = jnp.array([[token_id]], dtype=jnp.int32)
+        pos_array = jnp.array(t, dtype=jnp.int32)
+        logits, states = step_fn(token_array, states, pos_array)
+    # Block until computation is done
+    logits.block_until_ready()
+
+    if verbose:
+        print(f"Prefill done in {time.time() - t0:.1f}s")
         print(prompt, end="", flush=True)
 
     # Generate new tokens
@@ -152,16 +177,10 @@ def generate_text_stepwise(
         if pos >= model.maxlen - 1:
             break
 
-        # Step for next token
+        # Step for next token (using JIT-compiled function)
         token_array = jnp.array([[token_id]], dtype=jnp.int32)
-        logits, states = model.apply(
-            {"params": params},
-            token_array,
-            states,
-            pos,
-            deterministic=True,
-            method=model.step,
-        )
+        pos_array = jnp.array(pos, dtype=jnp.int32)
+        logits, states = step_fn(token_array, states, pos_array)
         pos += 1
 
     if verbose:

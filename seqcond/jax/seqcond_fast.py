@@ -468,14 +468,16 @@ class SeqCondAttention(nn.Module):
         gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
         # Single fused conv with buffer
-        z_conv_expanded = z_conv[:, None, :]
-        conv_input = jnp.concatenate([conv_buffer, z_conv_expanded], axis=1)
+        z_conv_expanded = z_conv[:, None, :]  # (B, 1, dim_conv_total)
+        conv_input = jnp.concatenate(
+            [conv_buffer, z_conv_expanded], axis=1
+        )  # (B, kernel_size, dim_conv_total)
 
         z_conv_out = nn.Conv(
-            features=conv_input.shape[-1],
+            features=dim_conv_total,
             kernel_size=(self.conv_kernel_size,),
             padding="VALID",
-            feature_group_count=conv_input.shape[-1],
+            feature_group_count=dim_conv_total,
             use_bias=False,
             name="conv",
         )(conv_input)
