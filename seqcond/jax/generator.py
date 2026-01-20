@@ -55,6 +55,33 @@ def _make_step_fn(model, params):
     return step_fn
 
 
+@partial(jax.jit, static_argnums=(0, 5))
+def _generate_scan_jit(
+    model, params, initial_token, initial_states, initial_pos, num_tokens
+):
+    """JIT-compiled generation loop using jax.lax.scan."""
+
+    def scan_fn(carry, _):
+        token, states, pos = carry
+        token_array = token[None, :]  # (1, 1)
+        logits, next_states = model.apply(
+            {"params": params},
+            token_array,
+            states,
+            pos,
+            deterministic=True,
+            method=model.step,
+        )
+        # Greedy sampling (argmax) inside the loop for maximum speed
+        next_token = jnp.argmax(logits[0], axis=-1)
+        return (next_token[None], next_states, pos + 1), next_token
+
+    # Initial carry: (last_token, current_states, current_pos)
+    init_carry = (initial_token, initial_states, initial_pos)
+    _, generated_tokens = jax.lax.scan(scan_fn, init_carry, None, length=num_tokens)
+    return generated_tokens
+
+
 def generate_text_stepwise(
     model: SeqCondModel,
     params: dict,
@@ -67,6 +94,7 @@ def generate_text_stepwise(
     repetition_penalty: float = 1.2,
     seed: Optional[int] = None,
     verbose: bool = True,
+    use_scan: bool = False,  # New option
 ) -> str:
     """
     Generate text using efficient step-by-step decoding.
@@ -85,6 +113,7 @@ def generate_text_stepwise(
         repetition_penalty: Penalty for repeated tokens
         seed: Random seed
         verbose: Print tokens as generated
+        use_scan: Use jax.lax.scan for faster generation (Greedy only)
 
     Returns:
         Generated text including prompt
@@ -99,7 +128,7 @@ def generate_text_stepwise(
     batch_size = 1
     states = model.apply({"params": params}, batch_size, method=model.init_state)
 
-    # Create JIT-compiled step function (compiled once, reused for all steps)
+    # Create JIT-compiled step function
     step_fn = _make_step_fn(model, params)
 
     if verbose:
@@ -109,25 +138,67 @@ def generate_text_stepwise(
     import time
 
     t0 = time.time()
+    last_logits = None
     for t, token_id in enumerate(tokens):
         token_array = jnp.array([[token_id]], dtype=jnp.int32)
         pos_array = jnp.array(t, dtype=jnp.int32)
-        logits, states = step_fn(token_array, states, pos_array)
-    # Block until computation is done
-    logits.block_until_ready()
+        last_logits, states = step_fn(token_array, states, pos_array)
+
+    # Block until prefill is done
+    last_logits.block_until_ready()
+    prefill_time = time.time() - t0
 
     if verbose:
-        print(f"Prefill done in {time.time() - t0:.1f}s")
+        print(
+            f"Prefill done in {prefill_time:.1f}s ({prefill_time/len(tokens)*1000:.1f}ms/token)"
+        )
         print(prompt, end="", flush=True)
 
-    # Generate new tokens
-    generated_tokens = []
-    text = prompt
     pos = len(tokens)
 
-    for _ in range(max_new_tokens):
+    if use_scan:
+        # Use fast lax.scan for generation (Argmax only for now)
+        if verbose:
+            print("\nGenerating with lax.scan (Greedy)...")
+
+        # Sample first token from last prefill logits
+        first_token_id = int(jnp.argmax(last_logits[0]))
+        first_token = jnp.array([first_token_id], dtype=jnp.int32)
+
+        t0_gen = time.time()
+        generated_ids = _generate_scan_jit(
+            model,
+            params,
+            first_token,
+            states,
+            jnp.array(pos, dtype=jnp.int32),
+            max_new_tokens - 1,
+        )
+        generated_ids.block_until_ready()
+        gen_time = time.time() - t0_gen
+
+        # Prepend the first sampled token
+        all_generated_ids = [first_token_id] + generated_ids.tolist()
+        text = prompt + tokenizer.decode(all_generated_ids)
+
+        if verbose:
+            print(tokenizer.decode(all_generated_ids))
+            print(
+                f"Generation done in {gen_time:.1f}s ({gen_time/max_new_tokens*1000:.1f}ms/token)"
+            )
+        return text
+
+    # Standard loop (supports temperature, top-k, etc.)
+    generated_tokens = []
+    text = prompt
+    gen_start_time = time.time()
+    logits = last_logits
+
+    for i in range(max_new_tokens):
         # Sample next token from logits
         logits_np = np.array(logits[0], dtype=np.float64)
+
+        # ... (sampling logic remains same)
 
         # Apply repetition penalty
         if repetition_penalty != 1.0 and generated_tokens:
@@ -184,7 +255,14 @@ def generate_text_stepwise(
         pos += 1
 
     if verbose:
-        print()
+        gen_time = time.time() - gen_start_time
+        num_gen = len(generated_tokens)
+        if num_gen > 0:
+            print(
+                f"\nGeneration done in {gen_time:.1f}s ({gen_time/num_gen*1000:.1f}ms/token)"
+            )
+        else:
+            print()
 
     return text
 
@@ -263,6 +341,7 @@ class Generator:
         repetition_penalty: float = 1.2,
         seed: Optional[int] = None,
         verbose: bool = True,
+        use_scan: bool = False,
     ) -> str:
         """
         Generate text from a prompt using efficient step-by-step decoding.
@@ -276,6 +355,7 @@ class Generator:
             repetition_penalty: Penalty for repeated tokens
             seed: Random seed
             verbose: Print tokens as generated
+            use_scan: Use jax.lax.scan for faster generation (Greedy only)
 
         Returns:
             Generated text including the prompt
@@ -292,4 +372,5 @@ class Generator:
             repetition_penalty=repetition_penalty,
             seed=seed,
             verbose=verbose,
+            use_scan=use_scan,
         )

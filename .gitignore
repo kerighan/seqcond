@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 todo.sh
 *.sh
+checkpoints/
 
 # C extensions
 *.so

@@ -467,22 +467,21 @@ class SeqCondAttention(nn.Module):
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
         gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
-        # Single fused conv with buffer - manual implementation to avoid cuDNN autotuning
+        # Single fused conv with buffer - manual implementation to avoid slow cuDNN autotuning
         z_conv_expanded = z_conv[:, None, :]  # (B, 1, dim_conv_total)
         conv_input = jnp.concatenate(
             [conv_buffer, z_conv_expanded], axis=1
         )  # (B, kernel_size, dim_conv_total)
 
-        # Use nn.Conv - cuDNN autotuning only happens once per shape, then cached
-        z_conv_out = nn.Conv(
-            features=dim_conv_total,
-            kernel_size=(self.conv_kernel_size,),
-            padding="VALID",
-            feature_group_count=dim_conv_total,
-            use_bias=False,
-            name="conv",
-        )(conv_input)
-        z_conv_out = z_conv_out[:, 0, :]  # (B, C)
+        # Get conv kernel (same param structure as __call__ for checkpoint compat)
+        conv_kernel = self.scope.push("conv").param(
+            "kernel",
+            nn.initializers.lecun_normal(),
+            (self.conv_kernel_size, 1, dim_conv_total),
+        )
+
+        # Manual depthwise conv for step: (B, K, C) * (K, C) -> (B, C)
+        z_conv_out = jnp.einsum("bkc,kc->bc", conv_input, conv_kernel[:, 0, :])
 
         z_conv = jax.nn.silu(z_conv_out)
         conv_buffer_new = jnp.concatenate(
