@@ -1093,7 +1093,7 @@ class Trainer:
                     macro_step > 0
                     and tc.save_every_n_steps > 0
                     and macro_step % tc.save_every_n_steps == 0
-                ):
+                ) or macro_step == 1:  # Save at step 1 for early debugging
                     self._save_checkpoint(macro_step)
 
         print("\nTraining complete!")
