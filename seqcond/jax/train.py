@@ -1212,8 +1212,16 @@ class Trainer:
         _ = (txt_fixed, txt_power2)
 
     def _save_checkpoint(self, step: int, final: bool = False):
-        """Save a checkpoint (only from process 0 to avoid race conditions)."""
-        # Only process 0 should save checkpoints in multi-host setup
+        """Save a checkpoint (only from process 0 to avoid race conditions).
+
+        Note: All processes must participate in _params_for_host() because
+        process_allgather is a collective operation. Only process 0 writes the file.
+        """
+        # All processes must participate in gathering params (collective op)
+        params_to_save = self._params_for_host()
+        opt_state_to_save = self._opt_state_for_host()
+
+        # Only process 0 should write the checkpoint file
         if jax.process_index() != 0:
             return
 
@@ -1223,10 +1231,6 @@ class Trainer:
             path = (
                 f"{self.train_config.checkpoint_dir}/{self.model_name}_step{step}.pkl"
             )
-
-        # Get params and opt_state from devices before saving
-        params_to_save = self._params_for_host()
-        opt_state_to_save = self._opt_state_for_host()
 
         save_checkpoint(params_to_save, opt_state_to_save, self.config, path, step)
         print(f"[Process 0] Checkpoint saved: {path}")
