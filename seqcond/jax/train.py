@@ -479,14 +479,14 @@ class Trainer:
         return jax.tree_util.tree_map(lambda x: x[0], tree)
 
     def _unshard_tree(self, tree):
-        """Unshard a tree from devices to host - reconstruct full params from all shards."""
+        """Unshard a tree from devices to host - reconstruct full params from all shards.
 
-        def gather_shards(x):
-            # Gather all shards and concatenate along the sharded axis (axis 0)
-            shards = [x.addressable_data(i) for i in range(len(x.addressable_shards))]
-            return jnp.concatenate(shards, axis=0)
+        Uses multihost_utils.process_allgather to collect shards from all hosts.
+        """
+        from jax.experimental import multihost_utils
 
-        return jax.tree_util.tree_map(gather_shards, tree)
+        # process_allgather collects the sharded array from all hosts and returns the full array
+        return multihost_utils.process_allgather(tree)
 
     def _host_tree(self, tree):
         if self.use_fsdp:
