@@ -204,6 +204,10 @@ class RotarySelfAttention(nn.Module):
         # Ensure pos is a scalar (squeeze if it's an array)
         pos_scalar = jnp.squeeze(pos) if hasattr(pos, "shape") else pos
 
+        # Cast k_new and v_new to cache dtype for dynamic_update_slice
+        k_new = k_new.astype(k_cache.dtype)
+        v_new = v_new.astype(v_cache.dtype)
+
         # Update cache at position using dynamic slice update
         k_cache = jax.lax.dynamic_update_slice(k_cache, k_new, (0, pos_scalar, 0, 0))
         v_cache = jax.lax.dynamic_update_slice(v_cache, v_new, (0, pos_scalar, 0, 0))

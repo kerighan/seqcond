@@ -767,13 +767,14 @@ class SeqCondBlock(nn.Module):
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        self.norm = nn.RMSNorm(
+    @nn.compact
+    def __call__(self, x, mask=None, deterministic=True):
+        h = nn.RMSNorm(
             epsilon=self.norm_eps,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )
-        self.attn = SeqCondAttention(
+        )(x)
+        h = SeqCondAttention(
             num_heads=self.num_heads,
             num_query_heads=self.num_query_heads,
             expand_factor=self.expand_factor,
@@ -788,13 +789,10 @@ class SeqCondBlock(nn.Module):
             use_square_matrix=self.use_square_matrix,
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )
-
-    def __call__(self, x, mask=None, deterministic=True):
-        h = self.norm(x)
-        h = self.attn(h, mask=mask, deterministic=deterministic)
+        )(h, mask=mask, deterministic=deterministic)
         return x + h
 
+    @nn.compact
     def step(self, x_t, state, deterministic=True):
         """
         O(1) step for SeqCondBlock.
@@ -808,6 +806,25 @@ class SeqCondBlock(nn.Module):
             out: (B, D) - output for this step
             new_state: Updated state tuple
         """
-        h = self.norm(x_t)
-        h, new_state = self.attn.step(h, state, deterministic=deterministic)
+        h = nn.RMSNorm(
+            epsilon=self.norm_eps,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(x_t)
+        h, new_state = SeqCondAttention(
+            num_heads=self.num_heads,
+            num_query_heads=self.num_query_heads,
+            expand_factor=self.expand_factor,
+            out_expand_factor=self.out_expand_factor,
+            num_thetas=self.num_thetas,
+            num_anchor_heads=self.num_anchor_heads,
+            conv_kernel_size=self.conv_kernel_size,
+            skip_low_rank=self.skip_low_rank,
+            dropout=self.dropout,
+            maxlen=self.maxlen,
+            chunk_size=self.chunk_size,
+            use_square_matrix=self.use_square_matrix,
+            compute_dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        ).step(h, state, deterministic=deterministic)
         return x_t + h, new_state
