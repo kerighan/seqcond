@@ -767,14 +767,13 @@ class SeqCondBlock(nn.Module):
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
 
-    @nn.compact
-    def __call__(self, x, mask=None, deterministic=True):
-        h = nn.RMSNorm(
+    def setup(self):
+        self.norm = nn.RMSNorm(
             epsilon=self.norm_eps,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )(x)
-        h = SeqCondAttention(
+        )
+        self.attn = SeqCondAttention(
             num_heads=self.num_heads,
             num_query_heads=self.num_query_heads,
             expand_factor=self.expand_factor,
@@ -789,5 +788,26 @@ class SeqCondBlock(nn.Module):
             use_square_matrix=self.use_square_matrix,
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )(h, mask=mask, deterministic=deterministic)
+        )
+
+    def __call__(self, x, mask=None, deterministic=True):
+        h = self.norm(x)
+        h = self.attn(h, mask=mask, deterministic=deterministic)
         return x + h
+
+    def step(self, x_t, state, deterministic=True):
+        """
+        O(1) step for SeqCondBlock.
+
+        Args:
+            x_t: Input token embedding (B, D)
+            state: State tuple from SeqCondAttention.step
+            deterministic: Whether to use dropout
+
+        Returns:
+            out: (B, D) - output for this step
+            new_state: Updated state tuple
+        """
+        h = self.norm(x_t)
+        h, new_state = self.attn.step(h, state, deterministic=deterministic)
+        return x_t + h, new_state

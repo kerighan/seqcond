@@ -177,10 +177,10 @@ def test_transformer_step_correctness():
     # Step-by-step decoding with KV cache
     print("Running step-by-step decoding with KV cache...")
 
-    # Initialize empty KV cache
+    # Initialize KV cache pre-allocated to maxlen
     head_dim = d_model // num_heads
-    k_cache = jnp.zeros((batch_size, 0, num_kv_heads, head_dim), dtype=x.dtype)
-    v_cache = jnp.zeros((batch_size, 0, num_kv_heads, head_dim), dtype=x.dtype)
+    k_cache = jnp.zeros((batch_size, maxlen, num_kv_heads, head_dim), dtype=x.dtype)
+    v_cache = jnp.zeros((batch_size, maxlen, num_kv_heads, head_dim), dtype=x.dtype)
     kv_cache = (k_cache, v_cache)
 
     outputs_step = []
@@ -440,10 +440,10 @@ def benchmark_speed():
         jax.block_until_ready(_)
         time_full = (time.time() - start) / 10 * 1000  # ms
 
-        # Time step-by-step with KV cache
+        # Time step-by-step with KV cache (pre-allocated to maxlen)
         head_dim = d_model // num_heads
-        k_cache = jnp.zeros((batch_size, 0, num_kv_heads, head_dim), dtype=x.dtype)
-        v_cache = jnp.zeros((batch_size, 0, num_kv_heads, head_dim), dtype=x.dtype)
+        k_cache = jnp.zeros((batch_size, maxlen, num_kv_heads, head_dim), dtype=x.dtype)
+        v_cache = jnp.zeros((batch_size, maxlen, num_kv_heads, head_dim), dtype=x.dtype)
         kv_cache = (k_cache, v_cache)
 
         # Warmup

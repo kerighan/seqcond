@@ -311,6 +311,130 @@ class SeqCondModel(nn.Module):
 
         return logits
 
+    def init_state(self, batch_size: int = 1):
+        """
+        Initialize states for all blocks for step-by-step generation.
+
+        Returns:
+            states: List of states, one per block
+                - SeqCond: (den_acc, re_acc, im_acc, pos, conv_buffer)
+                - Transformer: (k_cache, v_cache)
+        """
+        states = []
+        _seqcond_heads = (
+            self.seqcond_heads if self.seqcond_heads is not None else self.num_heads
+        )
+
+        for block_type, block in self.blocks:
+            if block_type == "seqcond":
+                # SeqCond state
+                num_heads = _seqcond_heads
+                num_query_heads = self.num_query_heads or num_heads
+                num_thetas = self.num_thetas
+
+                d_inner = int(self.d_model * self.expand_factor)
+                H = max(1, d_inner // (num_heads * num_thetas))
+                conv_kernel_size = self.conv_kernel_size
+
+                dim_memory = num_heads * H
+                dim_query_head = H * num_thetas * 2
+                dim_query_total = num_query_heads * dim_query_head
+                dim_mem_total = dim_memory + num_heads
+                dim_conv_total = dim_mem_total + dim_query_total
+
+                den_acc = jnp.zeros((batch_size, num_heads), dtype=jnp.float32)
+                re_acc = jnp.zeros(
+                    (batch_size, num_heads, H, num_thetas), dtype=jnp.float32
+                )
+                im_acc = jnp.zeros(
+                    (batch_size, num_heads, H, num_thetas), dtype=jnp.float32
+                )
+                pos = jnp.zeros((batch_size,), dtype=jnp.int32)
+                conv_buffer = jnp.zeros(
+                    (batch_size, conv_kernel_size - 1, dim_conv_total),
+                    dtype=jnp.float32,
+                )
+                states.append((den_acc, re_acc, im_acc, pos, conv_buffer))
+            else:
+                # Transformer KV cache - pre-allocate to maxlen
+                num_kv_heads = self.num_kv_heads or self.num_heads
+                head_dim = self.d_model // self.num_heads
+
+                k_cache = jnp.zeros(
+                    (batch_size, self.maxlen, num_kv_heads, head_dim),
+                    dtype=jnp.bfloat16,
+                )
+                v_cache = jnp.zeros(
+                    (batch_size, self.maxlen, num_kv_heads, head_dim),
+                    dtype=jnp.bfloat16,
+                )
+                states.append((k_cache, v_cache))
+
+        return states
+
+    def step(
+        self,
+        token_id: jnp.ndarray,
+        states: list,
+        pos: int,
+        deterministic: bool = True,
+    ):
+        """
+        O(1) step for SeqCond blocks, O(L) step for Transformer blocks.
+
+        Args:
+            token_id: Token ID (B,) or (B, 1)
+            states: List of states from init_state() or previous step()
+            pos: Current position in sequence
+            deterministic: Whether to use dropout
+
+        Returns:
+            logits: (B, vocab_size) logits for next token
+            new_states: Updated states for next step
+        """
+        # Handle input shape
+        if token_id.ndim == 1:
+            token_id = token_id[:, None]  # (B,) -> (B, 1)
+
+        b = token_id.shape[0]
+
+        # Embed token
+        x = self.embedding(token_id)[:, 0, :]  # (B, D)
+
+        if self.use_positional_embedding:
+            pos_emb = self.position_embedding(jnp.array([[pos]]))[:, 0, :]
+            x = x + pos_emb
+
+        # Get RoPE for this position
+        cos_t = self.cos_emb[pos : pos + 1, :][
+            None, :, None, :
+        ]  # (1, 1, 1, head_dim//2)
+        sin_t = self.sin_emb[pos : pos + 1, :][None, :, None, :]
+        cos_t = jnp.broadcast_to(cos_t, (b, 1, self.num_heads, cos_t.shape[-1]))
+        sin_t = jnp.broadcast_to(sin_t, (b, 1, self.num_heads, sin_t.shape[-1]))
+
+        new_states = []
+        for i, (block_type, block) in enumerate(self.blocks):
+            if block_type == "transformer":
+                x, new_state = block.step(
+                    x, states[i], pos, cos_t, sin_t, deterministic=deterministic
+                )
+                new_states.append(new_state)
+            else:
+                # SeqCond block step (uses block.step which handles norm + attn + residual)
+                x, new_state = block.step(x, states[i], deterministic=deterministic)
+                new_states.append(new_state)
+
+        # Output projection
+        if self.tie_weights:
+            logits = self.output_projection(x[:, None, :], self.embedding.embedding)[
+                :, 0, :
+            ]
+        else:
+            logits = self.output_projection(x)
+
+        return logits, new_states
+
 
 class SeqCondModelV2(nn.Module):
     """SeqCond model with dynamic thetas projected from input."""
