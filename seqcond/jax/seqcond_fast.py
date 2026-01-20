@@ -614,8 +614,8 @@ class SeqCondAttention(nn.Module):
         )
         # score_raw = jnp.clip(score_raw, -20.0, 20.0)
 
-        # Softplus instead of exp for stability
-        p_w_content = jax.nn.softplus(score_raw)
+        # ReLU^2 (matches __call__)
+        p_w_content = jax.nn.relu(score_raw) ** 2
         temporal_weight = jnp.exp(log_time_weight)
         p_w = p_w_content * temporal_weight
         p_w = jnp.clip(p_w, 1e-6, 1000.0)

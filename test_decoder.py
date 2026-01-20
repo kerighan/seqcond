@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from seqcond.jax.seqcond_summary import SeqCondAttention, SeqCondBlock
+from seqcond.jax.seqcond_fast import SeqCondAttention, SeqCondBlock
 from seqcond.jax.rope import (
     TransformerDecoderBlock,
     RotarySelfAttention,
@@ -29,12 +29,14 @@ def test_seqcond_step_correctness():
     seq_len = 16
     d_model = 64
     num_heads = 4
+    num_query_heads = 4  # Same as num_heads for simpler test
     num_thetas = 1
     maxlen = 32
 
     # Create model
     model = SeqCondAttention(
         num_heads=num_heads,
+        num_query_heads=num_query_heads,
         num_thetas=num_thetas,
         expand_factor=1.0,
         out_expand_factor=2,
@@ -59,17 +61,24 @@ def test_seqcond_step_correctness():
     # Step-by-step decoding
     print("Running step-by-step decoding...")
 
-    # Initialize state
+    # Initialize state (matching seqcond_fast.py dimensions)
     H = max(1, int(d_model * 1.0) // (num_heads * num_thetas))
     conv_kernel_size = 4
     dim_memory = num_heads * H
+
+    # seqcond_fast uses num_query_heads (default = num_heads // 2 for GQA)
+    num_query_heads = num_heads  # For this test, use same as num_heads
+    dim_query_head = H * num_thetas * 2
+    dim_query_total = num_query_heads * dim_query_head
+    dim_mem_total = dim_memory + num_heads  # k_val + s_raw
+    dim_conv_total = dim_mem_total + dim_query_total  # Everything through conv
 
     den_acc = jnp.zeros((batch_size, num_heads), dtype=jnp.float32)
     re_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
     im_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
     pos = jnp.zeros((batch_size,), dtype=jnp.int32)
     conv_buffer = jnp.zeros(
-        (batch_size, conv_kernel_size - 1, dim_memory + num_heads), dtype=jnp.float32
+        (batch_size, conv_kernel_size - 1, dim_conv_total), dtype=jnp.float32
     )
 
     state = (den_acc, re_acc, im_acc, pos, conv_buffer)
@@ -225,11 +234,14 @@ def test_seqcond_block_step():
     seq_len = 8
     d_model = 64
     num_heads = 4
+    num_query_heads = 4
+    num_thetas = 1
 
     model = SeqCondBlock(
         num_heads=num_heads,
+        num_query_heads=num_query_heads,
         expand_factor=1.0,
-        num_thetas=1,
+        num_thetas=num_thetas,
         maxlen=32,
         use_square_matrix=False,
         compute_dtype=jnp.float32,
@@ -245,17 +257,21 @@ def test_seqcond_block_step():
     # Full forward
     output_full = model.apply({"params": params}, x, deterministic=True)
 
-    # Step-by-step
-    H = max(1, int(d_model * 1.0) // (num_heads * 1))
+    # Step-by-step (matching seqcond_fast.py dimensions)
+    H = max(1, int(d_model * 1.0) // (num_heads * num_thetas))
     conv_kernel_size = 4
     dim_memory = num_heads * H
+    dim_query_head = H * num_thetas * 2
+    dim_query_total = num_query_heads * dim_query_head
+    dim_mem_total = dim_memory + num_heads
+    dim_conv_total = dim_mem_total + dim_query_total
 
     den_acc = jnp.zeros((batch_size, num_heads), dtype=jnp.float32)
-    re_acc = jnp.zeros((batch_size, num_heads, H, 1), dtype=jnp.float32)
-    im_acc = jnp.zeros((batch_size, num_heads, H, 1), dtype=jnp.float32)
+    re_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
+    im_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
     pos = jnp.zeros((batch_size,), dtype=jnp.int32)
     conv_buffer = jnp.zeros(
-        (batch_size, conv_kernel_size - 1, dim_memory + num_heads), dtype=jnp.float32
+        (batch_size, conv_kernel_size - 1, dim_conv_total), dtype=jnp.float32
     )
     state = (den_acc, re_acc, im_acc, pos, conv_buffer)
 
@@ -325,17 +341,23 @@ def benchmark_speed():
         jax.block_until_ready(_)
         time_full = (time.time() - start) / 10 * 1000  # ms
 
-        # Time step-by-step
-        H = max(1, int(d_model * 1.0) // (num_heads * 1))
+        # Time step-by-step (matching seqcond_fast.py dimensions)
+        num_thetas = 1
+        num_query_heads = num_heads
+        H = max(1, int(d_model * 1.0) // (num_heads * num_thetas))
         conv_kernel_size = 4
         dim_memory = num_heads * H
+        dim_query_head = H * num_thetas * 2
+        dim_query_total = num_query_heads * dim_query_head
+        dim_mem_total = dim_memory + num_heads
+        dim_conv_total = dim_mem_total + dim_query_total
 
         den_acc = jnp.zeros((batch_size, num_heads), dtype=jnp.float32)
-        re_acc = jnp.zeros((batch_size, num_heads, H, 1), dtype=jnp.float32)
-        im_acc = jnp.zeros((batch_size, num_heads, H, 1), dtype=jnp.float32)
+        re_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
+        im_acc = jnp.zeros((batch_size, num_heads, H, num_thetas), dtype=jnp.float32)
         pos = jnp.zeros((batch_size,), dtype=jnp.int32)
         conv_buffer = jnp.zeros(
-            (batch_size, conv_kernel_size - 1, dim_memory + num_heads),
+            (batch_size, conv_kernel_size - 1, dim_conv_total),
             dtype=jnp.float32,
         )
         state = (den_acc, re_acc, im_acc, pos, conv_buffer)
