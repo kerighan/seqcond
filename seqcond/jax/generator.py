@@ -196,45 +196,47 @@ def generate_text_stepwise(
 
     for i in range(max_new_tokens):
         # Sample next token from logits
-        logits_np = np.array(logits[0], dtype=np.float64)
+        if temperature == 0:
+            token_id = int(jnp.argmax(logits[0]))
+        else:
+            logits_np = np.array(logits[0], dtype=np.float64)
 
-        # ... (sampling logic remains same)
+            # Apply repetition penalty
+            if repetition_penalty != 1.0 and generated_tokens:
+                for t_id in set(generated_tokens):
+                    if logits_np[t_id] > 0:
+                        logits_np[t_id] /= repetition_penalty
+                    else:
+                        logits_np[t_id] *= repetition_penalty
 
-        # Apply repetition penalty
-        if repetition_penalty != 1.0 and generated_tokens:
-            for token_id in set(generated_tokens):
-                if logits_np[token_id] > 0:
-                    logits_np[token_id] /= repetition_penalty
-                else:
-                    logits_np[token_id] *= repetition_penalty
+            # Apply temperature
+            logits_np = logits_np / temperature
 
-        # Apply temperature
-        logits_np = logits_np / temperature
-
-        # Convert to probabilities
-        probs = np.exp(logits_np - logits_np.max())
-        probs = probs / probs.sum()
-
-        # Top-k filtering
-        if top_k > 0:
-            top_k_idx = np.argpartition(probs, -top_k)[-top_k:]
-            mask = np.zeros_like(probs)
-            mask[top_k_idx] = 1
-            probs = probs * mask
+            # Convert to probabilities
+            probs = np.exp(logits_np - logits_np.max())
             probs = probs / probs.sum()
 
-        # Top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_idx = np.argsort(probs)[::-1]
-            cumsum = np.cumsum(probs[sorted_idx])
-            cutoff_idx = np.searchsorted(cumsum, top_p) + 1
-            mask = np.zeros_like(probs)
-            mask[sorted_idx[:cutoff_idx]] = 1
-            probs = probs * mask
-            probs = probs / probs.sum()
+            # Top-k filtering
+            if top_k > 0:
+                top_k_idx = np.argpartition(probs, -top_k)[-top_k:]
+                mask = np.zeros_like(probs)
+                mask[top_k_idx] = 1
+                probs = probs * mask
+                probs = probs / probs.sum()
 
-        # Sample
-        token_id = int(np.random.choice(len(probs), p=probs))
+            # Top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_idx = np.argsort(probs)[::-1]
+                cumsum = np.cumsum(probs[sorted_idx])
+                cutoff_idx = np.searchsorted(cumsum, top_p) + 1
+                mask = np.zeros_like(probs)
+                mask[sorted_idx[:cutoff_idx]] = 1
+                probs = probs * mask
+                probs = probs / probs.sum()
+
+            # Sample
+            token_id = int(np.random.choice(len(probs), p=probs))
+
         token = tokenizer.decode([token_id])
 
         tokens.append(token_id)
