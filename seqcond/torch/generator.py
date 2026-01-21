@@ -68,30 +68,70 @@ class TorchGenerator:
 
         print("CUDA graph captured.")
 
+    def _sample(self, logits, temperature=1.0, top_p=1.0, top_k=50):
+        if temperature == 0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        # Apply temperature
+        logits = logits / temperature
+
+        # Top-K optimization (default 50) to avoid sorting huge vocabulary
+        if top_k > 0:
+            v, i = torch.topk(logits, min(top_k, logits.size(-1)))
+            # We construct a smaller logits tensor with only top-k values
+            # But simpler is to scatter -inf to everything else
+            # Or just work on the top-k values directly?
+            # Working on top-k directly is faster.
+            logits = v
+            indices = i
+        else:
+            indices = torch.arange(logits.size(-1), device=logits.device).unsqueeze(0)
+
+        if top_p < 1.0:
+            # Sort logits (now small if top-k used)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            # Scatter -inf to removed indices in the small logits tensor
+            logits[sorted_indices_to_remove] = float("-inf")
+
+        probs = torch.softmax(logits, dim=-1)
+        # Sample from the (possibly reduced) set
+        idx_in_top = torch.multinomial(probs, num_samples=1)
+        # Map back to original vocabulary index
+        return indices.gather(-1, idx_in_top)
+
     @torch.no_grad()
     def generate(
         self,
         prompt: str,
         max_new_tokens: int = 128,
         temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
         verbose: bool = True,
         use_cuda_graph: bool = True,
     ):
         tokens = self.tokenizer([prompt])[0]
         input_ids = torch.tensor([tokens], device=self.device)
+        batch_size = input_ids.size(0)
 
-        batch_size = 1
-        states = self.model.init_state(batch_size, device=self.device)
-
-        # Prefill
+        # Prefill (Parallel)
         t0 = time.time()
-        logits = None
-        for i in range(len(tokens)):
-            token_id = input_ids[:, i : i + 1]
-            logits, states = self.model.step(token_id, states)
-
+        logits, states = self.model.forward(input_ids)
         torch.cuda.synchronize()
         prefill_time = time.time() - t0
+
         if verbose:
             print(
                 f"Prefill done in {prefill_time:.3f}s ({prefill_time/len(tokens)*1000:.1f}ms/token)"
@@ -102,8 +142,9 @@ class TorchGenerator:
         generated_tokens = []
         gen_start_time = time.time()
 
-        # Current token is the last one from prefill
-        curr_token_id = torch.argmax(logits, dim=-1, keepdim=True)
+        # Current token is sampled from the last logit of prefill
+        last_logits = logits[:, -1, :]
+        curr_token_id = self._sample(last_logits, temperature, top_p, top_k)
 
         # Initialize graph if needed and not present
         if use_cuda_graph and self.graph is None:
@@ -127,11 +168,7 @@ class TorchGenerator:
             else:
                 logits, states = self.model.step(curr_token_id, states)
 
-            if temperature == 0:
-                curr_token_id = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                probs = torch.softmax(logits / temperature, dim=-1)
-                curr_token_id = torch.multinomial(probs, num_samples=1)
+            curr_token_id = self._sample(logits, temperature, top_p, top_k)
 
         torch.cuda.synchronize()
         gen_time = time.time() - gen_start_time

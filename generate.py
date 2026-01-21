@@ -11,7 +11,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_20k.pt",
+        default="checkpoints/seqcond_torch_30k.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(
@@ -25,6 +25,15 @@ def main():
     )
     parser.add_argument(
         "--temp", type=float, default=0.7, help="Sampling temperature (0.0 for greedy)"
+    )
+    parser.add_argument(
+        "--top_p", type=float, default=0.9, help="Nucleus sampling top-p probability"
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k filtering (default 50, 0 to disable)",
     )
     parser.add_argument(
         "--no_cuda_graph", action="store_true", help="Disable CUDA Graphs optimization"
@@ -56,6 +65,8 @@ def main():
             args.prompt,
             max_new_tokens=5,
             temperature=args.temp,
+            top_p=args.top_p,
+            top_k=args.top_k,
             verbose=False,
             use_cuda_graph=True,
         )
@@ -67,6 +78,8 @@ def main():
         args.prompt,
         max_new_tokens=args.max_tokens,
         temperature=args.temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
     )

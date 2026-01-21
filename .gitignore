@@ -5,6 +5,9 @@ __pycache__/
 todo.sh
 *.sh
 checkpoints/
+hf_checkpoints/
+archive_tests/
+eval_*
 
 # C extensions
 *.so

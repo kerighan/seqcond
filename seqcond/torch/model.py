@@ -123,6 +123,72 @@ class TransformerDecoderBlock(nn.Module):
         self.qk_norm = config.qk_norm
         self.qk_norm_eps = config.qk_norm_eps
 
+    def forward(self, x, cos, sin, state=None):
+        # x: (B, L, D)
+        # cos, sin: (1, 1, L, D//2) - broadcastable to (B, H, L, D//2)
+        B, L, _ = x.size()
+
+        h = self.norm(x)
+        q = (
+            self.q_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        )  # (B, H, L, D)
+        k = (
+            self.k_proj(h).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        )  # (B, H, L, D)
+        v = (
+            self.v_proj(h).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        )  # (B, H, L, D)
+
+        # Apply RoPE
+        # For KV heads, slice if needed
+        # cos, sin are (1, 1, L, D//2). Broadcasting handles num_heads.
+        q, _ = apply_rotary_pos_emb(q, q, cos, sin)
+        k, _ = apply_rotary_pos_emb(k, k, cos, sin)
+
+        # QK Norm
+        if self.qk_norm:
+            q_f32 = q.float()
+            k_f32 = k.float()
+            q_ms = q_f32.pow(2).mean(-1, keepdim=True)
+            k_ms = k_f32.pow(2).mean(-1, keepdim=True)
+            q = (q_f32 * torch.rsqrt(q_ms + self.qk_norm_eps)).to(q.dtype)
+            k = (k_f32 * torch.rsqrt(k_ms + self.qk_norm_eps)).to(k.dtype)
+
+        # Update Cache (if state provided)
+        # Assumes fresh start (prefill from 0)
+        if state is not None:
+            k_cache, v_cache, pos = state
+            # k_cache: (B, H, MaxL, D)
+            # Update [0:L]
+            # Assumes L <= MaxL
+            k_cache[:, :, :L, :] = k
+            v_cache[:, :, :L, :] = v
+            pos.fill_(L)  # Update position to L
+
+        # Attention
+        # GQA
+        if self.n_rep > 1:
+            k_rep = k.repeat_interleave(self.n_rep, dim=1)
+            v_rep = v.repeat_interleave(self.n_rep, dim=1)
+        else:
+            k_rep, v_rep = k, v
+
+        # Flash Attention / SDPA
+        # is_causal=True handles the causal mask
+        out = F.scaled_dot_product_attention(q, k_rep, v_rep, is_causal=True)
+
+        out = out.transpose(1, 2).contiguous().view(B, L, -1)
+        out = self.o_proj(out)
+
+        h = x + out
+
+        # FFN
+        f = self.ffn_norm(h)
+        ffn_out = self.ffn_down(self.ffn_gate(f) * F.silu(self.ffn_up(f)))
+        out = h + ffn_out
+
+        return out, state
+
     def step(self, x_t, state, cos_t, sin_t):
         # x_t: [B, D]
         # state: (k_cache, v_cache, pos)
@@ -257,13 +323,13 @@ class SeqCondAttention(nn.Module):
         self.dim_conv_total = (
             self.dim_mem_total + self.dim_query_total
         )  # 510 + 3840 = 4350
-        self.dim_skip = 1920  # Matches checkpoint
+        self.dim_swiglu_head = 64
+        self.dim_swiglu_total = self.num_heads * self.dim_swiglu_head  # 30 * 64 = 1920
+        self.dim_skip = self.dim_swiglu_total  # Matches checkpoint size (1920)
         self.dim_gate = self.num_heads  # 30 (from checkpoint gate_proj shape)
         self.dim_total = (
             self.dim_conv_total + self.dim_skip + self.dim_gate
         )  # 4350 + 1920 + 30 = 6300
-        self.dim_swiglu_head = 64
-        self.dim_swiglu_total = self.num_heads * self.dim_swiglu_head  # 30 * 64 = 1920
 
         self.in_proj = nn.Linear(d_model, self.dim_total, bias=False)
         self.conv_weight = nn.Parameter(
@@ -287,16 +353,218 @@ class SeqCondAttention(nn.Module):
             torch.empty(1, 1, self.num_heads, self.H, self.num_thetas)
         )
 
-        # gate_proj: (30, 960) in checkpoint -> input=num_heads, output=960
-        self.gate_proj = nn.Linear(self.num_heads, 960, bias=False)
-        self.gated_norm = GatedRMSNorm(960, eps=1e-5)  # JAX uses 1e-5 by default
+        self.dim_out_complex = self.num_heads * self.H * 2
+
+        # gate_proj: input=num_heads, output=dim_out_complex (matches d_model typically, but computed here)
+        self.gate_proj = nn.Linear(self.num_heads, self.dim_out_complex, bias=False)
+        self.gated_norm = GatedRMSNorm(
+            self.dim_out_complex, eps=1e-5
+        )  # JAX uses 1e-5 by default
 
         self.W_readout = nn.Parameter(
             torch.empty(self.num_heads, self.H * 2, self.dim_swiglu_head)
         )
 
         self.highway_scale = nn.Parameter(torch.ones(1, 1, self.num_heads, 1))
-        self.out_proj = nn.Linear(960, d_model, bias=False)
+        # out_proj input matches gated_norm size if not for swiglu/readout?
+        # Actually out_proj input is from y_act reshape.
+        # y_act is (B, K, dim_swiglu_head // 2).
+        self.dim_final_act = self.num_heads * (self.dim_swiglu_head // 2)
+        self.out_proj = nn.Linear(self.dim_final_act, d_model, bias=False)
+
+    def forward(self, x, state=None):
+        # x: (B, L, D)
+        # state: optional previous state (not supported in parallel mode currently, assumes fresh start)
+        # For now, we assume this is used for PREFILL (starting from empty state).
+        # We will return the final state for generation.
+
+        B, L, D = x.size()
+
+        z_all = self.in_proj(x)  # (B, L, Total)
+
+        z_conv = z_all[:, :, : self.dim_conv_total]
+        c_skip = z_all[:, :, self.dim_conv_total : self.dim_conv_total + self.dim_skip]
+        gate_logits = z_all[:, :, self.dim_conv_total + self.dim_skip :]
+
+        # Parallel Convolution
+        # z_conv: (B, L, C) -> (B, C, L)
+        z_conv_t = z_conv.transpose(1, 2)
+
+        # Pad left for causal conv
+        padding = self.conv_kernel_size - 1
+        # If we had previous state, we would pad with buffer. Here we assume zero padding (fresh start).
+        z_conv_padded = F.pad(z_conv_t, (padding, 0))
+
+        # Kernel: (C, 1, K)
+        kernel = self.conv_weight
+
+        # Depthwise conv
+        z_conv_out = F.conv1d(z_conv_padded, kernel, groups=self.dim_conv_total)
+        z_conv_out = z_conv_out.transpose(1, 2)  # (B, L, C)
+
+        z_conv_act = F.silu(z_conv_out)
+
+        # Split
+        z_mem = z_conv_act[:, :, : self.dim_mem_total]
+        q_raw = z_conv_act[:, :, self.dim_mem_total :]
+
+        k_val = z_mem[:, :, : self.dim_memory].reshape(B, L, self.num_heads, self.H)
+        k_val = self.k_norm(k_val)
+        s_raw = z_mem[:, :, self.dim_memory :]
+
+        q_raw_norm = self.q_norm(q_raw)
+        q_view = q_raw_norm.view(
+            B, L, self.num_query_heads, 1, self.H, self.num_thetas, 2
+        )
+        q_re, q_im = q_view[..., 0], q_view[..., 1]
+
+        # Theta & Weights
+        if self.num_thetas == 1:
+            theta = 0.001 + 2.999 * torch.sigmoid(self.theta_raw)[0, 0]
+            # w_int ...
+            # Simplified for M=1
+            theta = theta.view(1, 1, self.num_heads, self.H, 1)
+        else:
+            theta_d = F.softplus(self.theta_d_raw) + 1e-4
+            theta_accum = theta_d.cumsum(dim=-1)
+            total_sum = theta_accum[..., -1:]
+            scale_range = 2.999
+            theta = 0.001 + (theta_accum / total_sum) * scale_range
+
+            dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
+            dtheta = dtheta_raw * (scale_range / total_sum)
+            w0 = dtheta[..., :1] * 0.5
+            w_mid = 0.5 * (dtheta[..., :-1] + dtheta[..., 1:])
+            wL = dtheta[..., -1:] * 0.5
+            w_int = torch.cat([w0, w_mid, wL], dim=-1)
+            w_int = w_int.view(
+                1, 1, 1, self.num_query_heads, self.n_rep, self.H, self.num_thetas
+            )
+
+            # theta is (1, 1, K, H, M), view for broadcasting (1, 1, K, H, M)
+            # q_re is (B, L, K, 1, H, M)
+            theta = theta  # matches
+
+        # Pos and Log Time Weight
+        # Assume pos starts at 0 for now
+        pos = torch.arange(L, device=x.device).unsqueeze(0)  # (1, L)
+
+        log_w_list = []
+        if self.num_decay_heads > 0:
+            slopes = F.softplus(self.decay_slopes).view(1, 1, -1)
+            dist = (float(self.maxlen) - 1.0 - pos.float()).unsqueeze(-1).clamp(min=0.0)
+            log_w_list.append(-slopes * dist)
+        if self.num_anchor_heads > 0:
+            slopes_a = F.softplus(self.anchor_slopes).view(1, 1, -1)
+            log_w_list.append(-slopes_a * pos.float().unsqueeze(-1))
+
+        log_time_weight = (
+            torch.cat(log_w_list, dim=-1)
+            if log_w_list
+            else torch.zeros((B, L, self.num_heads), device=x.device)
+        )
+
+        # Scores
+        score_raw = self.score_scale * s_raw + self.score_bias
+        p_w_content = F.relu(score_raw).pow(2)
+        p_w = (p_w_content * torch.exp(log_time_weight)).clamp(1e-6, 1000.0)
+
+        # Phi
+        # k_scaled: (B, L, K, H)
+        k_scaled = k_val.unsqueeze(-1) * self.phase_scale.view(
+            1, 1, self.num_heads, 1, 1
+        )
+        # theta: (1, 1, K, H, M)
+        phi = (k_scaled / (1.0 + torch.abs(k_scaled))) * theta
+
+        # kvw
+        kvw = k_val.unsqueeze(-1) * p_w.view(B, L, self.num_heads, 1, 1)
+
+        re = kvw * torch.cos(phi)
+        im = kvw * torch.sin(phi)
+
+        # Accumulate (Parallel Scan)
+        den_acc = p_w.cumsum(dim=1)
+        re_acc = re.cumsum(dim=1)
+        im_acc = im.cumsum(dim=1)
+
+        # Integration
+        state_re_grouped = re_acc.view(
+            B, L, self.num_query_heads, self.n_rep, self.H, self.num_thetas
+        )
+        state_im_grouped = im_acc.view(
+            B, L, self.num_query_heads, self.n_rep, self.H, self.num_thetas
+        )
+
+        match_re = (state_re_grouped * q_re + state_im_grouped * q_im).float()
+        match_im = (state_im_grouped * q_re - state_re_grouped * q_im).float()
+
+        w_int_step = w_int[0, 0, 0]  # (K_q, n_rep, H, M)
+        out_re_g = (match_re * w_int_step).sum(dim=-1)
+        out_im_g = (match_im * w_int_step).sum(dim=-1)
+
+        out_re_g = out_re_g.view(B, L, self.num_heads, self.H)
+        out_im_g = out_im_g.view(B, L, self.num_heads, self.H)
+
+        out_re = out_re_g.to(x.dtype)
+        out_im = out_im_g.to(x.dtype)
+
+        out_complex = torch.cat([out_re, out_im], dim=-1)
+
+        # Readout
+        gate_for_norm = self.gate_proj(gate_logits)
+        out_normed = self.gated_norm(
+            out_complex.reshape(B * L, -1), gate_for_norm.reshape(B * L, -1)
+        )
+        out_normed = out_normed.view(B, L, self.num_heads, self.H * 2)
+
+        y_spec = torch.einsum("blkf,kfn->blkn", out_normed, self.W_readout)
+        y_skip = c_skip.view(B, L, self.num_heads, self.dim_swiglu_head)
+
+        y_spec_val, y_spec_gate = y_spec.chunk(2, dim=-1)
+        y_skip_val, y_skip_gate = y_skip.chunk(2, dim=-1)
+
+        h_scale = self.highway_scale.view(self.num_heads, 1)
+        y_val = y_spec_val + (y_skip_val * h_scale)
+        y_gate = y_spec_gate + (y_skip_gate * h_scale)
+
+        y_act = y_val * torch.sigmoid(y_gate)
+        out = self.out_proj(y_act.reshape(B, L, -1))
+
+        # Prepare state for next step (for generation after prefill)
+        # We need the LAST values of accumulators and buffer
+        # den_acc: (B, L, K) -> take last (B, K)
+        final_den = den_acc[:, -1, :]
+        final_re = re_acc[:, -1, :, :, :]
+        final_im = im_acc[:, -1, :, :, :]
+
+        # Pos
+        final_pos = pos[:, -1] + 1
+
+        # Buffer
+        # Needs last K-1 inputs of z_conv
+        # z_conv is (B, L, C)
+        # We need (B, K-1, C)
+        if self.conv_kernel_size > 1:
+            k_size = self.conv_kernel_size - 1
+            if L >= k_size:
+                final_buffer = z_conv[:, -k_size:, :]
+            else:
+                # If sequence is shorter than buffer, we need to pad with previous buffer (which is 0 here)
+                # For now assume L >= K-1
+                final_buffer = torch.cat(
+                    [
+                        torch.zeros(
+                            B, k_size - L, self.dim_conv_total, device=x.device
+                        ),
+                        z_conv,
+                    ],
+                    dim=1,
+                )
+        else:
+            final_buffer = torch.zeros(B, 0, self.dim_conv_total, device=x.device)
+
+        return out, (final_den, final_re, final_im, final_pos, final_buffer)
 
     def step(self, x_t, state):
         den_acc, re_acc, im_acc, pos, conv_buffer = state
@@ -491,6 +759,11 @@ class SeqCondBlock(nn.Module):
         h, new_state = self.attn.step(h, state)
         return x_t + h, new_state
 
+    def forward(self, x, state=None):
+        h = self.norm(x)
+        h, new_state = self.attn.forward(h, state)
+        return x + h, new_state
+
 
 class SeqCondModel(nn.Module):
     def __init__(self, config):
@@ -517,6 +790,42 @@ class SeqCondModel(nn.Module):
         self.output_projection = nn.Linear(self.d_model, self.vocab_size, bias=False)
         if config.tie_weights:
             self.output_projection.weight = self.embedding.weight
+
+    def forward(self, input_ids, states=None):
+        # input_ids: (B, L)
+        # states: optional list of states for each block.
+        # If provided, they are updated in-place or new states returned.
+        # Currently, forward assumes we are in PREFILL mode (processing a sequence).
+        # We assume states correspond to t=0 (empty) if we want correct results,
+        # or we handle continuation correctly (not implemented fully for parallel yet).
+
+        B, L = input_ids.size()
+        x = self.embedding(input_ids)  # (B, L, D)
+
+        # RoPE: Compute for all positions [0, L]
+        # We need (1, 1, L, D//2) for broadcasting
+        # self.rotary_emb returns (L, D//2)
+        cos_all, sin_all = self.rotary_emb(x, seq_len=self.maxlen)
+
+        # Extract relevant part [0:L] or [pos:pos+L] if we supported offset
+        # Assume start at 0
+        cos = cos_all[:L].view(1, 1, L, -1)
+        sin = sin_all[:L].view(1, 1, L, -1)
+
+        # If states is None, initialize them
+        if states is None:
+            states = self.init_state(B, device=input_ids.device)
+
+        new_states = []
+        for i, block in enumerate(self.blocks):
+            if isinstance(block, TransformerDecoderBlock):
+                x, new_s = block.forward(x, cos, sin, states[i])
+            else:
+                x, new_s = block.forward(x, states[i])
+            new_states.append(new_s)
+
+        logits = self.output_projection(x)
+        return logits, new_states
 
     def step(self, token_id, states):
         # token_id: [B, 1]
