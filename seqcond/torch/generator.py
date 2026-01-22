@@ -10,22 +10,115 @@ from seqcond.dataset import Tokenizer
 
 
 class TorchGenerator:
-    def __init__(self, checkpoint_path: str, device: str = "cuda"):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cuda",
+        compile: bool = False,  # Disabled by default - dynamic shapes make it slower
+        dtype: str = "float32",
+    ):
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
         self.device = device
         self.config = checkpoint["config"]
         self.tokenizer = Tokenizer()
+        self.compile = compile
 
-        self.model = SeqCondModel(**self.config).to(device).eval()
+        # Set dtype
+        self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+
+        self.model = SeqCondModel(**self.config).to(device).to(self.dtype).eval()
         self.model.load_state_dict(checkpoint["state_dict"], strict=False)
 
+        if compile and hasattr(torch, "compile"):
+            print("Compiling model with torch.compile()...")
+            # Use default mode - reduce-overhead requires static shapes
+            self.model.step = torch.compile(self.model.step, dynamic=True)
+
         print(
-            f"Model loaded: {self.config['num_layers']} layers, d_model={self.config['d_model']}"
+            f"Model loaded: {self.config['num_layers']} layers, d_model={self.config['d_model']}, dtype={self.dtype}"
         )
 
-    @torch.inference_mode()
+        # CUDA graph state - power-of-2 multi-graph system
+        self._graphs = {}  # seq_len -> CUDAGraph
+        self._static_logits_dict = {}  # seq_len -> logits tensor
+        self._static_token = None
+        self._static_states = None
+        self._seq_lens = [8, 16, 32, 64, 128, 256, 512, 1024]  # Power-of-2 lengths
+
+    def _get_quantized_seq_len(self, pos: int) -> int:
+        """Get the smallest power-of-2 seq_len that covers pos+1."""
+        needed = pos + 1  # Need to cover positions 0..pos
+        for seq_len in self._seq_lens:
+            if seq_len >= needed:
+                return seq_len
+        return self._seq_lens[-1]  # Fallback to max
+
+    def _capture_graph_for_seq_len(self, seq_len: int):
+        """Capture CUDA graph for a specific seq_len, preserving states."""
+        print(f"Capturing graph for seq_len={seq_len}...")
+
+        # Save current states (deep copy of tensor values)
+        saved = self.model.init_state(1, device=self.device)
+        self._copy_states(self._static_states, saved)
+
+        # Warmup runs (will corrupt states)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                logits, _ = self.model.step(
+                    self._static_token, self._static_states, seq_len=seq_len
+                )
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Restore states before capture
+        self._copy_states(saved, self._static_states)
+
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits, _ = self.model.step(
+                self._static_token, self._static_states, seq_len=seq_len
+            )
+
+        # Restore states after capture
+        self._copy_states(saved, self._static_states)
+
+        self._graphs[seq_len] = graph
+        self._static_logits_dict[seq_len] = logits
+
+    def _copy_states(self, src, dst):
+        """Copy state tensors from src to dst."""
+        for s, d in zip(src, dst):
+            for st, dt in zip(s, d):
+                dt.copy_(st)
+
+    @torch.no_grad()
+    def precompute(self, max_seq_len: int = 1024):
+        """Pre-capture all CUDA graphs up to max_seq_len.
+
+        Call this after loading the model to eliminate graph capture
+        overhead from the first real generation.
+        """
+        print(f"Pre-capturing CUDA graphs up to seq_len={max_seq_len}...")
+
+        # Initialize static tensors
+        self._static_token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._static_states = self.model.init_state(1, device=self.device)
+
+        # Capture graphs for all relevant seq_lens
+        for seq_len in self._seq_lens:
+            if seq_len > max_seq_len:
+                break
+            self._capture_graph_for_seq_len(seq_len)
+
+        print(
+            f"Pre-captured {len(self._graphs)} CUDA graphs. Ready for fast generation!"
+        )
+
+    @torch.no_grad()
     def generate(
         self,
         prompt: str,
@@ -41,13 +134,16 @@ class TorchGenerator:
     ) -> str:
         tokens = self.tokenizer([prompt])[0]
 
-        # Initialize state
-        states = self.model.init_state(batch_size=1, device=self.device)
+        # Flag to indicate new generation (need to copy prefill states)
+        self._new_generation = True
 
-        # Process prompt
-        for token_id in tokens:
-            token_tensor = torch.tensor([[token_id]], device=self.device)
-            logits, states = self.model.step(token_tensor, states)
+        # Fast prefill
+        input_ids = torch.tensor([tokens], device=self.device)
+        logits, states = self.model.prefill(input_ids)
+        logits = logits.squeeze(1)  # (B, vocab_size)
+
+        # Pre-allocate token tensor for generation loop
+        token_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
 
         # Track generated tokens for penalties
         generated = list(tokens)
@@ -116,7 +212,32 @@ class TorchGenerator:
                 print(self.tokenizer.decode([next_token]), end="", flush=True)
 
             # Next step
-            token_tensor = torch.tensor([[next_token]], device=self.device)
-            logits, states = self.model.step(token_tensor, states)
+            token_tensor[0, 0] = next_token
+
+            if use_cuda_graph:
+                # Initialize static tensors on first use
+                if self._static_token is None:
+                    self._static_token = token_tensor.clone()
+                    self._static_states = self.model.init_state(1, device=self.device)
+
+                # Copy prefill states at start of new generation
+                if self._new_generation:
+                    self._copy_states(states, self._static_states)
+                    self._new_generation = False
+
+                # Get current position and quantized seq_len
+                current_pos = len(generated) - 1  # Position we're generating for
+                seq_len = self._get_quantized_seq_len(current_pos)
+
+                # Capture graph for this seq_len if needed
+                if seq_len not in self._graphs:
+                    self._capture_graph_for_seq_len(seq_len)
+
+                # Copy token to static tensor and replay appropriate graph
+                self._static_token.copy_(token_tensor)
+                self._graphs[seq_len].replay()
+                logits = self._static_logits_dict[seq_len]
+            else:
+                logits, states = self.model.step(token_tensor, states)
 
         return self.tokenizer.decode(generated)

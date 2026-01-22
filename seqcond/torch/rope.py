@@ -27,7 +27,9 @@ def precompute_freqs(maxlen: int, head_dim: int) -> Tuple[torch.Tensor, torch.Te
     return torch.from_numpy(cos), torch.from_numpy(sin)
 
 
-def apply_rope(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rope(
+    tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
     """Apply rotary positional embedding to tensor - matches JAX apply_rope."""
     if tensor.shape[-1] % 2 != 0:
         raise ValueError("RoPE tensor last dimension must be even.")
@@ -98,7 +100,8 @@ class RotarySelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_state: bool = False,
+    ):
         """Forward pass - matches JAX __call__."""
         b, l = x.shape[0], x.shape[1]
 
@@ -122,18 +125,20 @@ class RotarySelfAttention(nn.Module):
             q = (q_f32 * torch.rsqrt(q_ms + self.qk_norm_eps)).to(q.dtype)
             k = (k_f32 * torch.rsqrt(k_ms + self.qk_norm_eps)).to(k.dtype)
 
+        # Save K, V before repeat for KV cache (non-repeated)
+        k_for_cache = k
+        v_for_cache = v
+
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        # einsum: blhd,bmhd->bhlm  (JAX style)
         scores = torch.einsum("blhd,bmhd->bhlm", q, k) * scale
 
-        # Causal mask
         causal_mask = torch.tril(torch.ones(l, l, dtype=torch.bool, device=x.device))
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
-        large_neg = -1e4  # Match JAX
+        large_neg = -1e4
         if mask is not None:
             key_mask = mask.to(scores.dtype).unsqueeze(1).unsqueeze(2)
             scores = scores + (1.0 - key_mask) * large_neg
@@ -146,7 +151,11 @@ class RotarySelfAttention(nn.Module):
 
         out = torch.einsum("bhql,blhd->bqhd", attn, v)
         out = out.reshape(b, l, self.d_model)
-        return self.out_proj(out)
+        output = self.out_proj(out)
+
+        if return_state:
+            return output, (k_for_cache, v_for_cache)
+        return output
 
     def step(
         self,
@@ -155,8 +164,14 @@ class RotarySelfAttention(nn.Module):
         pos: torch.Tensor,
         cos_t: torch.Tensor,
         sin_t: torch.Tensor,
+        seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """O(L) autoregressive decoding step - matches JAX step."""
+        """O(L) autoregressive decoding step - matches JAX step.
+
+        Args:
+            seq_len: If provided, only attend to first seq_len positions of KV cache.
+                     Used for power-of-2 CUDA graph optimization.
+        """
         b = x_t.shape[0]
 
         # Project query for current token
@@ -183,35 +198,34 @@ class RotarySelfAttention(nn.Module):
 
         # Update KV cache
         k_cache, v_cache = kv_cache
-        cache_len = k_cache.shape[1]
 
-        # pos is (B,) tensor
-        pos_idx = pos[0].long()  # Assume same pos for all batch elements
+        # Use index_copy_ for CUDA graph compatibility (no dynamic slicing)
+        pos_idx = pos[0:1].long()
+        k_cache.index_copy_(1, pos_idx, k_new.to(k_cache.dtype))
+        v_cache.index_copy_(1, pos_idx, v_new.to(v_cache.dtype))
 
-        # Update cache at position
-        k_cache[:, pos_idx : pos_idx + 1, :, :] = k_new.to(k_cache.dtype)
-        v_cache[:, pos_idx : pos_idx + 1, :, :] = v_new.to(v_cache.dtype)
+        # Use seq_len slice if provided (power-of-2 optimization), else full cache
+        if seq_len is not None:
+            k_slice = k_cache[:, :seq_len, :, :]
+            v_slice = v_cache[:, :seq_len, :, :]
+            L = seq_len
+        else:
+            k_slice = k_cache
+            v_slice = v_cache
+            L = k_cache.shape[1]
 
-        # Create attention mask for valid positions
-        positions = torch.arange(cache_len, device=x_t.device)
-        valid_mask = positions <= pos_idx  # (cache_len,)
+        k_repeated = self._repeat_kv(k_slice)
+        v_repeated = self._repeat_kv(v_slice)
 
-        # Repeat KV for GQA
-        k_repeated = self._repeat_kv(k_cache)
-        v_repeated = self._repeat_kv(v_cache)
+        # Create mask for positions > current pos within the slice
+        all_pos = torch.arange(L, device=k_cache.device)
+        mask = all_pos.view(1, 1, 1, L) > pos[0:1].view(b, 1, 1, 1)
 
-        # Compute attention
+        # Attention with masking
         scale = 1.0 / math.sqrt(self.head_dim)
         scores = torch.einsum("bqhd,bkhd->bhqk", q, k_repeated) * scale
-
-        # Apply mask
-        mask_broadcast = valid_mask.view(1, 1, 1, cache_len)
-        large_neg = -1e9
-        scores = torch.where(mask_broadcast, scores, torch.full_like(scores, large_neg))
-
-        attn = F.softmax(scores.float(), dim=-1).to(v_repeated.dtype)
-
-        # Compute output
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn = F.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bkhd->bqhd", attn, v_repeated)
         out = out.reshape(b, self.d_model)
 
@@ -256,21 +270,29 @@ class TransformerDecoderBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_state: bool = False,
+    ):
         """Forward pass - matches JAX __call__ exactly."""
         y = self.norm1(x)
-        y = self.attn(y, cos=cos, sin=sin, mask=mask)
+        if return_state:
+            y, kv_state = self.attn(y, cos=cos, sin=sin, mask=mask, return_state=True)
+        else:
+            y = self.attn(y, cos=cos, sin=sin, mask=mask)
         if self.dropout > 0 and self.training:
             y = F.dropout(y, p=self.dropout)
         x = x + y
 
         y = self.norm2(x)
-        u, v = self.ff_in(y).chunk(2, dim=-1)  # Match JAX split
-        y = F.silu(v) * u  # Match JAX: swish(v) * u
+        u, v = self.ff_in(y).chunk(2, dim=-1)
+        y = F.silu(v) * u
         y = self.ff_out(y)
         if self.dropout > 0 and self.training:
             y = F.dropout(y, p=self.dropout)
-        return x + y
+        output = x + y
+
+        if return_state:
+            return output, kv_state
+        return output
 
     def step(
         self,
@@ -279,11 +301,14 @@ class TransformerDecoderBlock(nn.Module):
         pos: torch.Tensor,
         cos_t: torch.Tensor,
         sin_t: torch.Tensor,
+        seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """O(L) autoregressive decoding step - matches JAX step exactly."""
         # Attention with KV cache
         y = self.norm1(x_t)
-        y, new_kv_cache = self.attn.step(y, kv_cache, pos, cos_t, sin_t)
+        y, new_kv_cache = self.attn.step(
+            y, kv_cache, pos, cos_t, sin_t, seq_len=seq_len
+        )
         x_t = x_t + y
 
         # FFN - match JAX exactly

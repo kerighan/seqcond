@@ -41,7 +41,7 @@ def main():
     parser.add_argument(
         "--rep_penalty",
         type=float,
-        default=1.0,
+        default=1.2,
         help="Repetition penalty (1.0 = no penalty, >1.0 penalizes repetition)",
     )
     parser.add_argument(
@@ -74,23 +74,10 @@ def main():
 
     start = time.time()
 
-    # Warmup if using CUDA graphs to ensure accurate timing of the actual run
-    # and to capture the graph if it's the first run
+    # Pre-capture CUDA graphs for fast generation
     if not args.no_cuda_graph:
-        if not args.quiet:
-            print("Initializing CUDA Graphs (warmup)...")
-        gen.generate(
-            args.prompt,
-            max_new_tokens=5,
-            temperature=args.temp,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            verbose=False,
-            use_cuda_graph=True,
-        )
-        if not args.quiet:
-            print("Ready.\n")
-        start = time.time()  # Reset start time after warmup
+        gen.precompute(max_seq_len=1024)
+        start = time.time()  # Reset start time after precompute
 
     output = gen.generate(
         args.prompt,

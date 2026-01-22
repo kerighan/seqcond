@@ -2,7 +2,7 @@
 SeqCondAttention - mirrors JAX seqcond_fast.py exactly.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,10 +57,20 @@ class SeqCondAttention(nn.Module):
         self.dim_total = self.dim_conv_total + self.dim_skip + self.dim_gate
 
         self.in_proj = nn.Linear(d_model, self.dim_total, bias=False)
+        # Depthwise conv (matches JAX nn.Conv with feature_group_count)
         self.conv_weight = nn.Parameter(
             torch.empty(self.dim_conv_total, 1, conv_kernel_size)
         )
         nn.init.kaiming_normal_(self.conv_weight)
+        # Register buffers for cached computations (computed lazily in step)
+        self.register_buffer("_conv_kernel_t", None)
+        self.register_buffer("_theta_cached", None)
+        self.register_buffer("_w_int_cached", None)
+        self.register_buffer("_decay_slopes_cached", None)
+        self.register_buffer("_anchor_slopes_cached", None)
+        self.register_buffer("_phase_scale_b", None)
+        self.register_buffer("_score_scale_b", None)
+        self.register_buffer("_score_bias_b", None)
         self.k_norm = RMSNorm(self.H)
         self.q_norm = RMSNorm(self.dim_query_total)
 
@@ -116,15 +126,18 @@ class SeqCondAttention(nn.Module):
         self.out_proj = nn.Linear(self.dim_swiglu_total // 2, d_model, bias=False)
 
     def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_state: bool = False,
+    ):
         B, L, D = x.shape
         z_all = self.in_proj(x)
-        z_conv = z_all[..., : self.dim_conv_total]
+        z_conv_raw = z_all[..., : self.dim_conv_total]
         c_skip = z_all[..., self.dim_conv_total : self.dim_conv_total + self.dim_skip]
         gate_logits = z_all[..., self.dim_conv_total + self.dim_skip :]
 
-        z_conv_t = z_conv.transpose(1, 2)
+        z_conv_t = z_conv_raw.transpose(1, 2)
         z_conv_t = F.pad(z_conv_t, (self.conv_kernel_size - 1, 0))
         z_conv_t = F.conv1d(z_conv_t, self.conv_weight, groups=self.dim_conv_total)
         z_conv = F.silu(z_conv_t.transpose(1, 2))
@@ -201,8 +214,8 @@ class SeqCondAttention(nn.Module):
         match_im = (state_im_g * q_re - state_re_g * q_im).float()
         out_re_g = (match_re * w_int.float()).sum(dim=-1)
         out_im_g = (match_im * w_int.float()).sum(dim=-1)
-        out_re = out_re_g.reshape(B, L, self.K, self.H)
-        out_im = out_im_g.reshape(B, L, self.K, self.H)
+        out_re = out_re_g.reshape(B, L, self.K, self.H).to(x.dtype)
+        out_im = out_im_g.reshape(B, L, self.K, self.H).to(x.dtype)
         out_complex = torch.cat([out_re, out_im], dim=-1)
 
         out_flat = out_complex.reshape(B, L, -1)
@@ -210,7 +223,9 @@ class SeqCondAttention(nn.Module):
         out_normed = self.gated_norm(out_flat, gate_for_norm)
         out_complex = out_normed.reshape(B, L, self.K, 2 * self.H)
 
-        y_spec_raw = torch.einsum("blkf,kfn->blkn", out_complex, self.W_readout)
+        y_spec_raw = torch.einsum(
+            "blkf,kfn->blkn", out_complex, self.W_readout.to(out_complex.dtype)
+        )
         y_skip_raw = self.skip_up(c_skip) if self.skip_low_rank else c_skip
         y_skip = y_skip_raw.reshape(B, L, self.K, self.dim_swiglu_head)
 
@@ -220,7 +235,31 @@ class SeqCondAttention(nn.Module):
         y_gate = y_spec_gate + y_skip_gate * self.highway_scale
         y_act = y_val * torch.sigmoid(y_gate)
 
-        return self.out_proj(y_act.reshape(B, L, -1))
+        output = self.out_proj(y_act.reshape(B, L, -1))
+
+        if return_state:
+            # Extract final state for continuing with step()
+            # den_acc: sum of p_w over sequence
+            den_acc_final = p_w.sum(dim=1)  # (B, K)
+            # re_acc, im_acc: final cumsum values
+            re_acc_final = re_acc[:, -1]  # (B, K, H, M)
+            im_acc_final = im_acc[:, -1]  # (B, K, H, M)
+            # pos: sequence length
+            pos_final = torch.full((B,), L, dtype=torch.float32, device=x.device)
+            # conv_buffer: last (kernel_size-1) values of z_conv_raw
+            conv_buffer_final = z_conv_raw[
+                :, -(self.conv_kernel_size - 1) :, :
+            ]  # (B, K-1, C)
+            state = (
+                den_acc_final,
+                re_acc_final,
+                im_acc_final,
+                pos_final,
+                conv_buffer_final,
+            )
+            return output, state
+
+        return output
 
     def step(self, x_t: torch.Tensor, state: Tuple) -> Tuple[torch.Tensor, Tuple]:
         B, D = x_t.shape
@@ -231,13 +270,20 @@ class SeqCondAttention(nn.Module):
         c_skip = z_all[..., self.dim_conv_total : self.dim_conv_total + self.dim_skip]
         gate_logits = z_all[..., self.dim_conv_total + self.dim_skip :]
 
+        # Cache transposed kernel on first call
+        if self._conv_kernel_t is None or self._conv_kernel_t.device != z_conv.device:
+            self._conv_kernel_t = self.conv_weight[:, 0, :].t().contiguous()  # (K, C)
+
+        # Build conv input: [buffer, new_token]
         z_conv_expanded = z_conv.unsqueeze(1)
         conv_input = torch.cat([conv_buffer, z_conv_expanded], dim=1)
-        # conv_weight is (C, 1, K) in PyTorch format, need (K, C) for einsum
-        conv_kernel = self.conv_weight[:, 0, :].t()  # (K, C)
-        z_conv_out = torch.einsum("bkc,kc->bc", conv_input, conv_kernel)
+
+        # Depthwise conv via matmul (faster than einsum for this shape)
+        # conv_input: (B, K, C), kernel: (K, C) -> output: (B, C)
+        z_conv_out = (conv_input * self._conv_kernel_t).sum(dim=1)
         z_conv_act = F.silu(z_conv_out)
-        conv_buffer_new = torch.cat([conv_buffer[:, 1:, :], z_conv_expanded], dim=1)
+
+        # conv_buffer will be updated in-place at the end of step()
 
         z_mem = z_conv_act[..., : self.dim_mem_total]
         q_raw = z_conv_act[..., self.dim_mem_total :]
@@ -249,66 +295,82 @@ class SeqCondAttention(nn.Module):
         q_raw = q_raw.reshape(B, self.K_q, 1, self.H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
-        if self.M == 1:
-            theta = (0.001 + 2.999 * torch.sigmoid(self.theta_raw))[0, 0]
-            w_int = torch.exp(self.w_int_raw.clamp(-5.0, 5.0))[0, 0]
-        else:
-            theta_d = F.softplus(self.theta_d_raw) + 1e-4
-            theta_accum = torch.cumsum(theta_d, dim=-1)
-            total_sum = theta_accum[..., -1:]
-            theta = (0.001 + (theta_accum / total_sum) * 2.999)[0, 0]
-            dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
-            dtheta = dtheta_raw * (2.999 / total_sum)
-            w_int = torch.cat(
-                [
-                    dtheta[..., :1] * 0.5,
-                    0.5 * (dtheta[..., :-1] + dtheta[..., 1:]),
-                    dtheta[..., -1:] * 0.5,
-                ],
-                dim=-1,
-            )
-            w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, self.H, self.M)[0, 0]
+        # Cache theta and w_int on first call (they only depend on parameters)
+        if self._theta_cached is None:
+            if self.M == 1:
+                self._theta_cached = (0.001 + 2.999 * torch.sigmoid(self.theta_raw))[
+                    0, 0
+                ]
+                self._w_int_cached = torch.exp(self.w_int_raw.clamp(-5.0, 5.0))[0, 0]
+            else:
+                theta_d = F.softplus(self.theta_d_raw) + 1e-4
+                theta_accum = torch.cumsum(theta_d, dim=-1)
+                total_sum = theta_accum[..., -1:]
+                self._theta_cached = (0.001 + (theta_accum / total_sum) * 2.999)[0, 0]
+                dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
+                dtheta = dtheta_raw * (2.999 / total_sum)
+                w_int = torch.cat(
+                    [
+                        dtheta[..., :1] * 0.5,
+                        0.5 * (dtheta[..., :-1] + dtheta[..., 1:]),
+                        dtheta[..., -1:] * 0.5,
+                    ],
+                    dim=-1,
+                )
+                self._w_int_cached = w_int.reshape(
+                    1, 1, self.K_q, self.n_rep, self.H, self.M
+                )[0, 0]
+        theta = self._theta_cached
+        w_int = self._w_int_cached
+
+        # Cache slopes on first call
+        if self._decay_slopes_cached is None and self.num_decay_heads > 0:
+            self._decay_slopes_cached = F.softplus(self.decay_slopes).view(1, -1)
+        if self._anchor_slopes_cached is None and self.num_anchor_heads > 0:
+            self._anchor_slopes_cached = F.softplus(self.anchor_slopes).view(1, -1)
 
         log_w_list = []
         if self.num_decay_heads > 0:
-            slopes = F.softplus(self.decay_slopes).view(1, -1)
-            dist = torch.clamp((self.maxlen or 2048) - 1 - pos.unsqueeze(-1), min=0.0)
-            log_w_list.append(-slopes * dist)
+            dist = (self.maxlen or 2048) - 1 - pos.unsqueeze(-1)
+            log_w_list.append(-self._decay_slopes_cached * dist.clamp(min=0.0))
         if self.num_anchor_heads > 0:
-            slopes_a = F.softplus(self.anchor_slopes).view(1, -1)
-            log_w_list.append(-slopes_a * pos.unsqueeze(-1))
+            log_w_list.append(-self._anchor_slopes_cached * pos.unsqueeze(-1))
         log_time_weight = (
             torch.cat(log_w_list, dim=1)
             if log_w_list
             else torch.zeros(B, self.K, device=x_t.device)
         )
 
-        score_raw = self.score_scale.view(1, -1) * s_raw.float() + self.score_bias.view(
-            1, -1
-        )
+        # Cache views on first call
+        if self._score_scale_b is None:
+            self._score_scale_b = self.score_scale.view(1, -1)
+            self._score_bias_b = self.score_bias.view(1, -1)
+            self._phase_scale_b = self.phase_scale.view(1, self.K, 1, 1)
+
+        score_raw = self._score_scale_b * s_raw.float() + self._score_bias_b
         p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(1e-6, 1000.0)
 
         k_f32 = k_val.float().unsqueeze(-1)
         p_w_b = p_w.unsqueeze(-1).unsqueeze(-1)
-        phase_scale_b = self.phase_scale.view(1, self.K, 1, 1)
-        k_scaled = k_f32 * phase_scale_b
+        k_scaled = k_f32 * self._phase_scale_b
         phi = (k_scaled / (1.0 + k_scaled.abs())) * theta
         kvw = k_f32 * p_w_b
         re = kvw * torch.cos(phi)
         im = kvw * torch.sin(phi)
 
-        den_acc_new = den_acc + p_w
-        re_acc_new = re_acc + re
-        im_acc_new = im_acc + im
+        # Update accumulators in-place for CUDA graph compatibility
+        den_acc.add_(p_w)
+        re_acc.add_(re)
+        im_acc.add_(im)
 
-        state_re_g = re_acc_new.reshape(B, self.K_q, self.n_rep, self.H, self.M)
-        state_im_g = im_acc_new.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+        state_re_g = re_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+        state_im_g = im_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
         match_re = (state_re_g * q_re + state_im_g * q_im).float()
         match_im = (state_im_g * q_re - state_re_g * q_im).float()
         out_re_g = (match_re * w_int.float()).sum(dim=-1)
         out_im_g = (match_im * w_int.float()).sum(dim=-1)
-        out_re = out_re_g.reshape(B, self.K, self.H)
-        out_im = out_im_g.reshape(B, self.K, self.H)
+        out_re = out_re_g.reshape(B, self.K, self.H).to(x_t.dtype)
+        out_im = out_im_g.reshape(B, self.K, self.H).to(x_t.dtype)
         out_complex = torch.cat([out_re, out_im], dim=-1)
 
         out_flat = out_complex.reshape(B, -1)
@@ -328,8 +390,17 @@ class SeqCondAttention(nn.Module):
         y_act = y_val * torch.sigmoid(y_gate)
 
         out = self.out_proj(y_act.reshape(B, -1))
-        pos_new = pos + 1
-        return out, (den_acc_new, re_acc_new, im_acc_new, pos_new, conv_buffer_new)
+
+        # Update position in-place for CUDA graph compatibility
+        pos.add_(1)
+
+        # Update conv_buffer in-place (shift left and insert new value)
+        if self.conv_kernel_size > 1:
+            if self.conv_kernel_size > 2:
+                conv_buffer[:, :-1, :].copy_(conv_buffer[:, 1:, :].clone())
+            conv_buffer[:, -1, :].copy_(z_conv)
+
+        return out, (den_acc, re_acc, im_acc, pos, conv_buffer)
 
 
 class SeqCondBlock(nn.Module):
@@ -341,8 +412,14 @@ class SeqCondBlock(nn.Module):
         self.attn = SeqCondAttention(d_model=d_model, **kwargs)
 
     def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
+        if return_state:
+            out, state = self.attn(self.norm(x), mask=mask, return_state=True)
+            return x + out, state
         return x + self.attn(self.norm(x), mask=mask)
 
     def step(self, x_t: torch.Tensor, state: Tuple) -> Tuple[torch.Tensor, Tuple]:

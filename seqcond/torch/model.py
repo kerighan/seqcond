@@ -131,6 +131,55 @@ class SeqCondModel(nn.Module):
         x = self.final_norm(x)
         return self.lm_head(x)
 
+    def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, List[Tuple]]:
+        """
+        Process prompt in parallel and return logits + states for step() continuation.
+        Much faster than processing token-by-token with step().
+        """
+        B, L = input_ids.shape
+        device = input_ids.device
+
+        x = self.embedding(input_ids)
+
+        if self.use_positional_embedding:
+            positions = torch.arange(L, device=device)
+            x = x + self.position_embedding(positions)
+
+        # Get RoPE embeddings
+        cos = self.cos_emb[:L].unsqueeze(0).unsqueeze(2)
+        sin = self.sin_emb[:L].unsqueeze(0).unsqueeze(2)
+        cos = cos.expand(B, L, self.num_heads, -1)
+        sin = sin.expand(B, L, self.num_heads, -1)
+
+        states = []
+        for block, block_type in zip(self.blocks, self.block_types):
+            if block_type == "transformer":
+                x, kv_state = block(x, cos, sin, return_state=True)
+                # kv_state is (k, v) with shape (B, L, num_kv_heads, head_dim)
+                # Pad to maxlen for KV cache
+                k, v = kv_state
+                k_cache = torch.zeros(
+                    B,
+                    self.maxlen,
+                    self.num_kv_heads,
+                    self.d_model // self.num_heads,
+                    device=device,
+                    dtype=k.dtype,
+                )
+                v_cache = torch.zeros_like(k_cache)
+                k_cache[:, :L] = k
+                v_cache[:, :L] = v
+                states.append((k_cache, v_cache))
+            else:
+                x, state = block(x, return_state=True)
+                states.append(state)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        # Return only last token logits for generation
+        return logits[:, -1:, :], states
+
     def init_state(self, batch_size: int, device: torch.device) -> List[Tuple]:
         """Initialize states for all blocks - matches JAX init_state."""
         states = []
@@ -169,8 +218,15 @@ class SeqCondModel(nn.Module):
         token_id: torch.Tensor,
         states: List[Tuple],
         pos: Optional[torch.Tensor] = None,
+        seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[Tuple]]:
-        """Single step for generation - matches JAX step."""
+        """Single step for generation - matches JAX step.
+
+        Args:
+            seq_len: Optional fixed sequence length for transformer attention.
+                     If provided, uses k_cache[:, :seq_len] instead of full cache.
+                     Used for power-of-2 CUDA graph optimization.
+        """
         B = token_id.size(0)
 
         # Get position from first SeqCond state if not provided
@@ -183,13 +239,13 @@ class SeqCondModel(nn.Module):
         x = self.embedding(token_id).squeeze(1)  # (B, D)
 
         if self.use_positional_embedding:
-            pos_int = pos[0].long()
-            x = x + self.position_embedding.weight[pos_int]
+            pos_idx = pos[0:1].long()
+            x = x + torch.index_select(self.position_embedding.weight, 0, pos_idx)
 
-        # Get RoPE for current position
-        pos_int = pos[0].long()
-        cos_t = self.cos_emb[pos_int].unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        sin_t = self.sin_emb[pos_int].unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        # Get RoPE for current position (use index_select for CUDA graph compatibility)
+        pos_idx = pos[0:1].long()  # Keep as 1D tensor to avoid CPU sync
+        cos_t = torch.index_select(self.cos_emb, 0, pos_idx).unsqueeze(0).unsqueeze(0)
+        sin_t = torch.index_select(self.sin_emb, 0, pos_idx).unsqueeze(0).unsqueeze(0)
         cos_t = cos_t.expand(B, 1, self.num_heads, -1)
         sin_t = sin_t.expand(B, 1, self.num_heads, -1)
 
@@ -198,7 +254,7 @@ class SeqCondModel(nn.Module):
             zip(self.blocks, self.block_types, states)
         ):
             if block_type == "transformer":
-                x, new_state = block.step(x, state, pos, cos_t, sin_t)
+                x, new_state = block.step(x, state, pos, cos_t, sin_t, seq_len=seq_len)
             else:
                 x, new_state = block.step(x, state)
             new_states.append(new_state)
