@@ -16,10 +16,9 @@ def main():
     # Path to your local HF checkpoint
     MODEL_PATH = os.path.abspath("hf_checkpoints/seqcond-30k")
     # Task to evaluate
-    # MMLU is a suite of many tasks. "mmlu" covers them all.
     BENCHMARKS = "hellaswag"
 
-    output_dir = f"eval_results_{BENCHMARKS}"
+    output_dir = f"eval_results_{BENCHMARKS.replace(':', '_')}"
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading model from {MODEL_PATH}...")

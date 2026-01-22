@@ -11,7 +11,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_30k.pt",
+        default="checkpoints/seqcond_torch2_60k.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(
@@ -37,6 +37,24 @@ def main():
     )
     parser.add_argument(
         "--no_cuda_graph", action="store_true", help="Disable CUDA Graphs optimization"
+    )
+    parser.add_argument(
+        "--rep_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty (1.0 = no penalty, >1.0 penalizes repetition)",
+    )
+    parser.add_argument(
+        "--freq_penalty",
+        type=float,
+        default=0.0,
+        help="Frequency penalty (0.0 = no penalty, additive penalty per occurrence)",
+    )
+    parser.add_argument(
+        "--no_repeat_ngram",
+        type=int,
+        default=0,
+        help="Block repeated n-grams of this size (0 = disabled, try 3-6 for paragraphs)",
     )
     parser.add_argument(
         "--quiet", action="store_true", help="Disable token streaming output"
@@ -80,6 +98,9 @@ def main():
         temperature=args.temp,
         top_p=args.top_p,
         top_k=args.top_k,
+        repetition_penalty=args.rep_penalty,
+        frequency_penalty=args.freq_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram,
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
     )

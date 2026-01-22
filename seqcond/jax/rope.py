@@ -197,6 +197,14 @@ class RotarySelfAttention(nn.Module):
         else:
             k_new = apply_rope(k_new, cos_t, sin_t)
 
+        if self.qk_norm:
+            q_f32 = q.astype(jnp.float32)
+            k_f32 = k_new.astype(jnp.float32)
+            q_ms = jnp.mean(jnp.square(q_f32), axis=-1, keepdims=True)
+            k_ms = jnp.mean(jnp.square(k_f32), axis=-1, keepdims=True)
+            q = (q_f32 * jax.lax.rsqrt(q_ms + self.qk_norm_eps)).astype(q.dtype)
+            k_new = (k_f32 * jax.lax.rsqrt(k_ms + self.qk_norm_eps)).astype(k_new.dtype)
+
         # Update KV cache at current position (in-place update for fixed-size cache)
         k_cache, v_cache = kv_cache
         cache_len = k_cache.shape[1]
@@ -217,21 +225,8 @@ class RotarySelfAttention(nn.Module):
         positions = jnp.arange(cache_len)
         valid_mask = positions <= pos_scalar  # (cache_len,)
 
-        # QK normalization
-        if self.qk_norm:
-            q_f32 = q.astype(jnp.float32)
-            k_f32 = k_cache.astype(jnp.float32)
-            q_ms = jnp.mean(jnp.square(q_f32), axis=-1, keepdims=True)
-            k_ms = jnp.mean(jnp.square(k_f32), axis=-1, keepdims=True)
-            q = (q_f32 * jax.lax.rsqrt(q_ms + self.qk_norm_eps)).astype(q.dtype)
-            k_cache_norm = (k_f32 * jax.lax.rsqrt(k_ms + self.qk_norm_eps)).astype(
-                k_cache.dtype
-            )
-        else:
-            k_cache_norm = k_cache
-
         # Repeat KV for GQA
-        k_repeated = self._repeat_kv(k_cache_norm)
+        k_repeated = self._repeat_kv(k_cache)
         v_repeated = self._repeat_kv(v_cache)
 
         # Compute attention (only for current query position)

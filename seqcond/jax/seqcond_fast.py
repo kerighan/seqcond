@@ -467,13 +467,13 @@ class SeqCondAttention(nn.Module):
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
         gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
-        # Single fused conv with buffer - manual implementation to avoid slow cuDNN autotuning
+        # Single fused conv with buffer
         z_conv_expanded = z_conv[:, None, :]  # (B, 1, dim_conv_total)
         conv_input = jnp.concatenate(
             [conv_buffer, z_conv_expanded], axis=1
         )  # (B, kernel_size, dim_conv_total)
 
-        # Get conv kernel (same param structure as __call__ for checkpoint compat)
+        # Get conv kernel
         conv_kernel = self.scope.push("conv").param(
             "kernel",
             nn.initializers.lecun_normal(),
@@ -483,14 +483,22 @@ class SeqCondAttention(nn.Module):
         # Manual depthwise conv for step: (B, K, C) * (K, C) -> (B, C)
         z_conv_out = jnp.einsum("bkc,kc->bc", conv_input, conv_kernel[:, 0, :])
 
-        z_conv = jax.nn.silu(z_conv_out)
+        z_conv_act = jax.nn.silu(z_conv_out)
+
+        # DEBUG
+        # if self.num_heads == 30:
+        #    print(f"DEBUG JAX step z_conv_act: {z_conv_act.mean()}, {z_conv_act.std()}")
+
+        # DEBUG: Print z_conv_act stats
+        # jax.debug.print("step z_conv_act mean={x}", x=jnp.mean(z_conv_act))
+
         conv_buffer_new = jnp.concatenate(
             [conv_buffer[:, 1:, :], z_conv_expanded], axis=1
         )
 
         # Split conv output into memory and query
-        z_mem = z_conv[..., :dim_mem_total]
-        q_raw = z_conv[..., dim_mem_total:]
+        z_mem = z_conv_act[..., :dim_mem_total]
+        q_raw = z_conv_act[..., dim_mem_total:]
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, self.K, H)

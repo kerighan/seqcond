@@ -65,6 +65,9 @@ from .configuration_seqcond import SeqCondHFConfig, ModelConfig
     for line in model_lines:
         if line.startswith("import ") or line.startswith("from typing"):
             continue
+        # Skip triton imports - not needed for HF inference
+        if "triton" in line.lower() and ("import" in line or "from" in line):
+            continue
         model_body.append(line)
     model_body = "\n".join(model_body)
     final_modeling_content = (
@@ -135,29 +138,26 @@ def convert_flax_to_torch_state_dict(flax_params: Dict, config: Dict) -> Dict:
                     np.array(attn["k_norm"]["scale"])
                 )
 
-            # FFN (SwiGLU)
+            # FFN (SwiGLU) - keep ff_in together to match JAX
             torch_state_dict[torch_prefix + "ffn_norm.weight"] = torch.from_numpy(
                 np.array(f_block["norm2"]["scale"])
             )
 
+            # Keep ff_in as a single matrix (will be split in forward/step)
             full_ff_in = np.array(f_block["ff_in"]["kernel"])
-            gate_w, up_w = np.split(full_ff_in, 2, axis=-1)
-            torch_state_dict[torch_prefix + "ffn_gate.weight"] = torch.from_numpy(
-                gate_w
-            ).t()
-            torch_state_dict[torch_prefix + "ffn_up.weight"] = torch.from_numpy(
-                up_w
+            torch_state_dict[torch_prefix + "ff_in.weight"] = torch.from_numpy(
+                full_ff_in
             ).t()
 
             full_ff_bias = np.array(f_block["ff_in"]["bias"])
-            gate_b, up_b = np.split(full_ff_bias, 2)
-            torch_state_dict[torch_prefix + "ffn_gate.bias"] = torch.from_numpy(gate_b)
-            torch_state_dict[torch_prefix + "ffn_up.bias"] = torch.from_numpy(up_b)
+            torch_state_dict[torch_prefix + "ff_in.bias"] = torch.from_numpy(
+                full_ff_bias
+            )
 
-            torch_state_dict[torch_prefix + "ffn_down.weight"] = torch.from_numpy(
+            torch_state_dict[torch_prefix + "ff_out.weight"] = torch.from_numpy(
                 np.array(f_block["ff_out"]["kernel"])
             ).t()
-            torch_state_dict[torch_prefix + "ffn_down.bias"] = torch.from_numpy(
+            torch_state_dict[torch_prefix + "ff_out.bias"] = torch.from_numpy(
                 np.array(f_block["ff_out"]["bias"])
             )
 
