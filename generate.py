@@ -11,7 +11,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch2_60k.pt",
+        # default="checkpoints/seqcond_torch_80k.pt",
+        default="checkpoints/thin_torch.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(
@@ -72,6 +73,11 @@ def main():
     print(f"\nPrompt: '{args.prompt}'")
     print(f"Generating {args.max_tokens} tokens (temp={args.temp})...\n")
 
+    # Reset memory stats before generation
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
     start = time.time()
 
     # Pre-capture CUDA graphs for fast generation
@@ -107,6 +113,16 @@ def main():
     print(f"  Time: {duration:.2f}s")
     print(f"  Speed: {tps:.2f} tokens/sec")
     print(f"  Latency: {duration*1000/args.max_tokens:.2f} ms/token")
+
+    # Memory stats
+    if torch.cuda.is_available():
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**3  # GB
+        current_mem = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved_mem = torch.cuda.memory_reserved() / 1024**3  # GB
+        print(f"\nMemory:")
+        print(f"  Peak allocated: {peak_mem:.2f} GB")
+        print(f"  Current allocated: {current_mem:.2f} GB")
+        print(f"  Reserved: {reserved_mem:.2f} GB")
 
 
 if __name__ == "__main__":

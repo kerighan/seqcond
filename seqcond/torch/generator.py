@@ -209,7 +209,11 @@ class TorchGenerator:
             token_counts[next_token] = token_counts.get(next_token, 0) + 1
 
             if verbose:
-                print(self.tokenizer.decode([next_token]), end="", flush=True)
+                try:
+                    print(self.tokenizer.decode([next_token]), end="", flush=True)
+                except Exception as e:
+                    # print(f"Error decoding token: {e}")
+                    next_token = next_token // 2
 
             # Next step
             token_tensor[0, 0] = next_token

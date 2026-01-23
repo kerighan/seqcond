@@ -1,4 +1,3 @@
-import os
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -9,12 +8,12 @@ from lighteval.models.transformers.transformers_model import (
 )
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
 
-from seqcond.torch.tokenizer_wrapper import SeqCondTokenizer
+from seqcond.dataset import Tokenizer
 
 
 def main():
     # Path to your local HF checkpoint
-    MODEL_PATH = os.path.abspath("hf_checkpoints/seqcond-30k")
+    MODEL_PATH = os.path.abspath("hf_checkpoints/seqcond-80k")
     # Task to evaluate
     BENCHMARKS = "hellaswag"
 
@@ -39,7 +38,7 @@ def main():
     print(f"Model device: {model.device}")
 
     # Create our custom tokenizer with +1 offset to match training
-    tokenizer = SeqCondTokenizer()
+    tokenizer = Tokenizer()
 
     evaluation_tracker = EvaluationTracker(output_dir=output_dir)
     pipeline_params = PipelineParameters(

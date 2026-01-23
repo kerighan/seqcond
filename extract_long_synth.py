@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os
+
+os.environ["HF_TOKEN"] = ""
 import tqdm
 from seqcond.dataset import iterate_synth, tokenizer
 

@@ -1,22 +1,40 @@
 """
-Convert JAX checkpoint to torch2 format.
+Convert JAX checkpoint to torch format.
 Matches JAX parameter names exactly.
+Can also export to HuggingFace format.
 """
 
 import argparse
 import pickle
 import torch
 import numpy as np
-from seqcond.torch2.model import SeqCondModel
+import os
+from seqcond.torch.model import SeqCondModel
 
 
-def convert_jax_to_torch2(jax_path: str, torch_path: str):
+def get_config_value(config, key, default=None):
+    """Get config value from either dict or object."""
+    if isinstance(config, dict):
+        return config.get(key, default)
+    else:
+        return getattr(config, key, default)
+
+
+def convert_jax_to_torch(jax_path: str, torch_path: str):
     print(f"Loading JAX checkpoint from {jax_path}...")
     with open(jax_path, "rb") as f:
         data = pickle.load(f)
 
     jax_params = data["params"]
-    config = data["config"]["model"]
+
+    # Handle both Config object and dict formats
+    config_data = data["config"]
+    if hasattr(config_data, "model"):
+        # Config object from count_params.py
+        config = config_data.model
+    else:
+        # Dict format from training checkpoints
+        config = config_data["model"]
 
     print("Converting weights...")
     state_dict = {}
@@ -29,11 +47,11 @@ def convert_jax_to_torch2(jax_path: str, torch_path: str):
     # Final norm is initialized with ones, no weights to copy
 
     # Blocks
-    seqcond_ratio = config.get("seqcond_ratio", 3)
+    seqcond_ratio = get_config_value(config, "seqcond_ratio", 3)
     transformer_idx = 0
     seqcond_idx = 0
 
-    for i in range(config["num_layers"]):
+    for i in range(get_config_value(config, "num_layers")):
         torch_prefix = f"blocks.{i}."
 
         if (i + 1) % (seqcond_ratio + 1) == 0:
@@ -183,40 +201,169 @@ def convert_jax_to_torch2(jax_path: str, torch_path: str):
 
     # Create model config
     model_config = {
-        "d_model": config["d_model"],
-        "d_ff": config["d_ff"],
-        "num_layers": config["num_layers"],
-        "vocab_size": config["vocab_size"],
-        "maxlen": config["maxlen"],
-        "num_heads": config["num_heads"],
-        "num_kv_heads": config.get("num_kv_heads"),
-        "qk_norm": config.get("qk_norm", True),
-        "qk_norm_eps": config.get("qk_norm_eps", 1e-6),
-        "seqcond_heads": config.get("seqcond_heads", 32),
-        "num_query_heads": config.get("num_query_heads", 6),
-        "num_thetas": config.get("num_thetas", 4),
-        "conv_kernel_size": config.get("conv_kernel_size", 4),
-        "expand_factor": config.get("expand_factor", 1),
-        "out_expand_factor": config.get("out_expand_factor", 3),
-        "seqcond_ratio": config.get("seqcond_ratio", 3),
+        "d_model": get_config_value(config, "d_model"),
+        "d_ff": get_config_value(config, "d_ff"),
+        "num_layers": get_config_value(config, "num_layers"),
+        "vocab_size": get_config_value(config, "vocab_size"),
+        "maxlen": get_config_value(config, "maxlen"),
+        "num_heads": get_config_value(config, "num_heads"),
+        "num_kv_heads": get_config_value(config, "num_kv_heads"),
+        "qk_norm": get_config_value(config, "qk_norm", True),
+        "qk_norm_eps": get_config_value(config, "qk_norm_eps", 1e-6),
+        "seqcond_heads": get_config_value(config, "seqcond_heads", 32),
+        "num_query_heads": get_config_value(config, "num_query_heads", 6),
+        "num_thetas": get_config_value(config, "num_thetas", 4),
+        "conv_kernel_size": get_config_value(config, "conv_kernel_size", 4),
+        "expand_factor": get_config_value(config, "expand_factor", 1),
+        "out_expand_factor": get_config_value(config, "out_expand_factor", 3),
+        "seqcond_ratio": get_config_value(config, "seqcond_ratio", 3),
         "skip_low_rank": skip_low_rank,
-        "num_anchor_heads": config.get("num_anchor_heads", 0),
+        "num_anchor_heads": get_config_value(config, "num_anchor_heads", 0),
     }
 
     print(f"Saving to {torch_path}...")
     torch.save({"config": model_config, "state_dict": state_dict}, torch_path)
     print("Done!")
+    return model_config, state_dict
+
+
+def read_file(path):
+    with open(path, "r") as f:
+        return f.read()
+
+
+def write_file(path, content):
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def prepare_hf_code(output_dir):
+    """Copy necessary files for trust_remote_code=True."""
+    print(f"Preparing autonomous HF code in {output_dir}...")
+
+    # 1. configuration_seqcond.py
+    config_content = read_file("seqcond/config.py")
+    hf_wrapper_content = read_file("seqcond/torch/hf_wrapper.py")
+
+    start_idx = hf_wrapper_content.find("class SeqCondHFConfig")
+    end_idx = hf_wrapper_content.find("class SeqCondForCausalLM")
+    seqcond_hf_config_code = hf_wrapper_content[start_idx:end_idx]
+
+    config_header = """from transformers import PretrainedConfig
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Literal
+"""
+    lines = config_content.splitlines()
+    filtered_lines = [
+        l
+        for l in lines
+        if not l.startswith("from dataclasses") and not l.startswith("from typing")
+    ]
+    config_body = "\n".join(filtered_lines)
+    final_config_content = (
+        config_header + "\n" + config_body + "\n\n" + seqcond_hf_config_code
+    )
+    write_file(
+        os.path.join(output_dir, "configuration_seqcond.py"), final_config_content
+    )
+
+    # 2. modeling_seqcond.py
+    model_content = read_file("seqcond/torch/model.py")
+    seqcond_content = read_file("seqcond/torch/seqcond.py")
+    rope_content = read_file("seqcond/torch/rope.py")
+    norm_content = read_file("seqcond/torch/norm.py")
+
+    start_idx = hf_wrapper_content.find("class SeqCondForCausalLM")
+    seqcond_for_causal_lm_code = hf_wrapper_content[start_idx:]
+
+    modeling_header = """import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple, List
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from .configuration_seqcond import SeqCondHFConfig
+import math
+"""
+
+    final_modeling_content = (
+        modeling_header
+        + "\n\n"
+        + norm_content
+        + "\n\n"
+        + rope_content
+        + "\n\n"
+        + seqcond_content
+        + "\n\n"
+        + model_content
+        + "\n\n"
+        + seqcond_for_causal_lm_code
+    )
+    write_file(os.path.join(output_dir, "modeling_seqcond.py"), final_modeling_content)
+
+    # 3. generation_config.json
+    generation_config = {"_from_model_config": True}
+    import json
+
+    with open(os.path.join(output_dir, "generation_config.json"), "w") as f:
+        json.dump(generation_config, f, indent=2)
+
+
+def export_to_hf(model_config, state_dict, hf_dir):
+    """Export PyTorch checkpoint to HuggingFace format."""
+    from seqcond.torch.hf_wrapper import SeqCondForCausalLM, SeqCondHFConfig
+
+    os.makedirs(hf_dir, exist_ok=True)
+    print(f"Initializing HF Model...")
+    hf_config = SeqCondHFConfig(**model_config)
+    hf_model = SeqCondForCausalLM(hf_config)
+
+    # Prefix keys with 'model.' for HF wrapper
+    hf_state_dict = {f"model.{k}": v for k, v in state_dict.items()}
+
+    print("Loading state dict into HF model...")
+    hf_model.load_state_dict(hf_state_dict, strict=True)
+
+    print(f"Saving HF model files to {hf_dir}...")
+    hf_model.save_pretrained(hf_dir, safe_serialization=False)
+
+    # Prepare autonomous code for trust_remote_code=True
+    prepare_hf_code(hf_dir)
+    print(f"HF model saved to {hf_dir}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Convert JAX checkpoint to PyTorch and optionally HuggingFace"
+    )
     parser.add_argument("jax_path", help="Path to JAX checkpoint")
     parser.add_argument(
         "--torch_path", default=None, help="Path to save torch checkpoint"
     )
+    parser.add_argument(
+        "--hf_dir", default=None, help="Directory to save HuggingFace model"
+    )
     args = parser.parse_args()
 
-    if args.torch_path is None:
-        args.torch_path = args.jax_path.replace(".pkl", "_torch2.pt")
+    if args.torch_path is None and args.hf_dir is None:
+        args.torch_path = args.jax_path.replace(".pkl", "_torch.pt")
 
-    convert_jax_to_torch2(args.jax_path, args.torch_path)
+    # Convert to PyTorch
+    if args.torch_path:
+        model_config, state_dict = convert_jax_to_torch(args.jax_path, args.torch_path)
+    else:
+        # Load for HF export only
+        print(f"Loading JAX checkpoint from {args.jax_path}...")
+        with open(args.jax_path, "rb") as f:
+            data = pickle.load(f)
+        jax_params = data["params"]
+        config = data["config"]["model"]
+        # Run conversion without saving
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as tmp:
+            model_config, state_dict = convert_jax_to_torch(args.jax_path, tmp.name)
+
+    # Export to HuggingFace if requested
+    if args.hf_dir:
+        export_to_hf(model_config, state_dict, args.hf_dir)

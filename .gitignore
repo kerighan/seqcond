@@ -8,6 +8,7 @@ checkpoints/
 hf_checkpoints/
 archive_tests/
 eval_*
+*.jsonl
 
 # C extensions
 *.so

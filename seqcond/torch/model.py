@@ -131,10 +131,16 @@ class SeqCondModel(nn.Module):
         x = self.final_norm(x)
         return self.lm_head(x)
 
-    def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, List[Tuple]]:
+    def prefill(
+        self, input_ids: torch.Tensor, return_all_logits: bool = False
+    ) -> Tuple[torch.Tensor, List[Tuple]]:
         """
         Process prompt in parallel and return logits + states for step() continuation.
         Much faster than processing token-by-token with step().
+
+        Args:
+            return_all_logits: If True, return logits for all positions (for evaluation).
+                               If False (default), return only last token logits (for generation).
         """
         B, L = input_ids.shape
         device = input_ids.device
@@ -177,7 +183,10 @@ class SeqCondModel(nn.Module):
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
-        # Return only last token logits for generation
+        # Return only last token logits for generation (default)
+        # Use return_all_logits=True for evaluation
+        if return_all_logits:
+            return logits, states
         return logits[:, -1:, :], states
 
     def init_state(self, batch_size: int, device: torch.device) -> List[Tuple]:

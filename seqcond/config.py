@@ -111,7 +111,7 @@ class ModelConfig:
         """Large model (~350M params). Override any param with kwargs."""
         defaults = dict(
             d_model=1024,
-            d_ff=1024 * 4,
+            d_ff=int(8 * 1024 / 3),
             num_layers=24,
             num_heads=16,
             seqcond_heads=32,
@@ -125,7 +125,7 @@ class ModelConfig:
         """XLarge model (~770M params). Override any param with kwargs."""
         defaults = dict(
             d_model=1536,
-            d_ff=1536 * 4,
+            d_ff=int(8 * 1536 / 3),
             num_layers=24,
             num_heads=16,
             seqcond_heads=96,

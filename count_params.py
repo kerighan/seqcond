@@ -6,6 +6,7 @@ Uses the same argument parsing as train_jax.py.
 import os
 import argparse
 import logging
+import pickle
 from dataclasses import fields
 
 # 1. Environment and Distributed Init MUST happen first
@@ -214,6 +215,14 @@ def parse_args():
         help="Disable gradient checkpointing (rematerialization)",
     )
 
+    # Save option
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Save the untrained model to the specified filepath (e.g., model.pkl)",
+    )
+
     return parser.parse_args()
 
 
@@ -326,6 +335,18 @@ def main():
     print("-" * 40)
     print(f"Total Parameters: {total_params:,}")
     print("-" * 40)
+
+    # Save model if requested
+    if args.save:
+        print(f"\nSaving untrained model to {args.save}...")
+        save_data = {
+            "params": params,
+            "config": config,
+            "model": model,
+        }
+        with open(args.save, "wb") as f:
+            pickle.dump(save_data, f)
+        print(f"Model saved successfully to {args.save}")
 
 
 if __name__ == "__main__":
