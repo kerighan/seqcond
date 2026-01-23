@@ -19,52 +19,6 @@ except ImportError:
 
 if TRITON_AVAILABLE:
 
-    # Fast sin/cos approximations using 7th order Taylor series
-    # For x in [-π, π], error < 1e-4
-    # sin(x) ≈ x - x³/6 + x⁵/120 - x⁷/5040
-    # cos(x) ≈ 1 - x²/2 + x⁴/24 - x⁶/720
-
-    @triton.jit
-    def fast_sin(x):
-        """Fast sine approximation using 7th order Taylor series."""
-        # Reduce to [-π, π] using modulo
-        PI = 3.141592653589793
-        TWO_PI = 6.283185307179586
-        # x = x - tl.floor((x + PI) / TWO_PI) * TWO_PI  # Expensive modulo
-        # For small angles (which is our case), skip reduction
-        x2 = x * x
-        x3 = x2 * x
-        x5 = x3 * x2
-        x7 = x5 * x2
-        # Taylor: x - x³/6 + x⁵/120 - x⁷/5040
-        return (
-            x
-            - x3 * 0.16666666666666666
-            + x5 * 0.008333333333333333
-            - x7 * 0.0001984126984126984
-        )
-
-    @triton.jit
-    def fast_cos(x):
-        """Fast cosine approximation using 6th order Taylor series."""
-        x2 = x * x
-        x4 = x2 * x2
-        x6 = x4 * x2
-        # Taylor: 1 - x²/2 + x⁴/24 - x⁶/720
-        return 1.0 - x2 * 0.5 + x4 * 0.041666666666666664 - x6 * 0.001388888888888889
-
-    @triton.jit
-    def fast_sincos(x):
-        """Compute both sin and cos efficiently using 5th order Taylor."""
-        # Optimized for small angles (|x| < 2)
-        # sin(x) ≈ x - x³/6 + x⁵/120
-        # cos(x) ≈ 1 - x²/2 + x⁴/24
-        x2 = x * x
-        x4 = x2 * x2
-        cos_x = 1.0 - x2 * 0.5 + x4 * 0.041666666666666664
-        sin_x = x * (1.0 - x2 * 0.16666666666666666 + x4 * 0.008333333333333333)
-        return sin_x, cos_x
-
     @triton.autotune(
         configs=[
             # Single head per block - good for small H
@@ -216,6 +170,7 @@ if TRITON_AVAILABLE:
             )
 
             # Compute phi and sin/cos: (BLOCK_H, BLOCK_M)
+            # Keep sin/cos separate to allow GPU dual-issue on SFU
             phi = phi_base[:, None] * theta_vals
             cos_phi = tl.cos(phi)
             sin_phi = tl.sin(phi)

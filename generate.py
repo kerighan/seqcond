@@ -13,6 +13,7 @@ def main():
         type=str,
         default="checkpoints/seqcond_torch_90k.pt",
         # default="checkpoints/thin_torch.pt",
+        # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(

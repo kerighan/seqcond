@@ -47,6 +47,7 @@ class TorchGenerator:
         self._static_token = None
         self._static_states = None
         self._seq_lens = [8, 16, 32, 64, 128, 256, 512, 1024]  # Power-of-2 lengths
+        # self._seq_lens = [16, 64, 256, 1024]  # Power-of-4 lengths
         self._use_triton = False  # Whether to use Triton kernels in CUDA graphs
 
     def _get_quantized_seq_len(self, pos: int) -> int:
@@ -261,4 +262,7 @@ class TorchGenerator:
                     token_tensor, states, use_triton=use_triton
                 )
 
-        return self.tokenizer.decode(generated)
+        try:
+            return self.tokenizer.decode(generated)
+        except Exception as e:
+            print(f"Error decoding token: {e}")

@@ -7,7 +7,9 @@ import tqdm
 from seqcond.dataset import iterate_synth, tokenizer
 
 
-def extract_long_samples(threshold=1024, output_file="long_synth_samples.jsonl"):
+def extract_long_samples(
+    threshold=1024, output_file="/media/maixent/2To/corpus/long_synth_samples.jsonl"
+):
     """
     Iterates through the SYNTH dataset, tokenizes samples,
     and saves those longer than the threshold to a JSONL file.
