@@ -482,11 +482,207 @@ def evaluate_gsm8k(gen, dataset, max_samples=None):
     return accuracy
 
 
+def evaluate_commonsenseqa(gen, dataset, max_samples=None):
+    """Evaluate on CommonsenseQA using log probabilities."""
+    correct = 0
+    total = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    print(f"Evaluating on {len(dataset)} samples...")
+    start_time = time.time()
+
+    for idx, example in enumerate(dataset):
+        question = example["question"]
+        choices = example["choices"]["text"]
+        labels = example["choices"]["label"]
+        answer_key = example["answerKey"]
+
+        if (idx + 1) % 50 == 0:
+            print(f"Progress: {idx + 1}/{len(dataset)}")
+
+        # Compute log probability for each choice
+        scores = []
+        for choice in choices:
+            prompt = f"Question: {question}\nAnswer: {choice}"
+            tokens = gen.tokenizer([prompt])[0]
+
+            if len(tokens) < 2:
+                scores.append(float("-inf"))
+                continue
+
+            input_ids = torch.tensor([tokens], device=gen.device)
+            with torch.no_grad():
+                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
+
+            log_probs = torch.log_softmax(logits[0], dim=-1)
+            target_tokens = torch.tensor(tokens[1:], device=gen.device)
+            seq_len = min(len(tokens) - 1, log_probs.shape[0])
+            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
+            scores.append(token_log_probs.mean().item())
+
+        best_choice_idx = max(range(len(choices)), key=lambda i: scores[i])
+        predicted_label = labels[best_choice_idx]
+
+        if predicted_label == answer_key:
+            correct += 1
+        total += 1
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100
+
+    print(f"\n{'='*60}")
+    print(f"Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
+def evaluate_triviaqa(gen, dataset, max_samples=None):
+    """Evaluate on TriviaQA using exact match on generated answer."""
+    import re
+
+    correct = 0
+    total = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    print(f"Evaluating on {len(dataset)} samples...")
+    start_time = time.time()
+
+    for idx, example in enumerate(dataset):
+        question = example["question"]
+        answer_dict = example["answer"]
+
+        # Get all valid answer aliases
+        valid_answers = [answer_dict["value"]]
+        if "aliases" in answer_dict and answer_dict["aliases"]:
+            valid_answers.extend(answer_dict["aliases"])
+
+        # Normalize answers
+        valid_answers = [ans.lower().strip() for ans in valid_answers]
+
+        if (idx + 1) % 50 == 0:
+            print(f"Progress: {idx + 1}/{len(dataset)}")
+
+        # Generate answer with better prompt
+        prompt = f"Q: {question}\nA:"
+        generated = gen.generate(
+            prompt,
+            max_new_tokens=20,
+            temperature=0.0,
+            verbose=False,
+        )
+
+        # Extract just the answer part (after "A:")
+        if "A:" in generated:
+            pred_answer = generated.split("A:")[-1].strip()
+        else:
+            pred_answer = generated.strip()
+
+        # Take first line and remove trailing punctuation
+        pred_answer = pred_answer.split("\n")[0].strip()
+        # Remove common question starters if model continues generating
+        for stop_word in ["Q:", "Question:", "\n"]:
+            if stop_word in pred_answer:
+                pred_answer = pred_answer.split(stop_word)[0].strip()
+        pred_answer = pred_answer.rstrip(".,!?").lower()
+
+        # Check if any valid answer is in the prediction
+        is_correct = any(
+            ans in pred_answer or pred_answer in ans for ans in valid_answers
+        )
+
+        if is_correct:
+            correct += 1
+        total += 1
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100
+
+    print(f"\n{'='*60}")
+    print(f"Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
+def evaluate_hotpotqa(gen, dataset, max_samples=None):
+    """Evaluate on HotpotQA using exact match on generated answer."""
+    correct = 0
+    total = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    print(f"Evaluating on {len(dataset)} samples...")
+    start_time = time.time()
+
+    for idx, example in enumerate(dataset):
+        question = example["question"]
+        answer = example["answer"].lower().strip()
+
+        if (idx + 1) % 50 == 0:
+            print(f"Progress: {idx + 1}/{len(dataset)}")
+
+        # Generate answer with better prompt
+        prompt = f"Q: {question}\nA:"
+        generated = gen.generate(
+            prompt,
+            max_new_tokens=20,
+            temperature=0.0,
+            verbose=False,
+        )
+
+        # Extract just the answer part
+        if "A:" in generated:
+            pred_answer = generated.split("A:")[-1].strip()
+        else:
+            pred_answer = generated.strip()
+
+        # Take first line and remove trailing punctuation
+        pred_answer = pred_answer.split("\n")[0].strip()
+        # Remove common question starters if model continues generating
+        for stop_word in ["Q:", "Question:", "\n"]:
+            if stop_word in pred_answer:
+                pred_answer = pred_answer.split(stop_word)[0].strip()
+        pred_answer = pred_answer.rstrip(".,!?").lower()
+
+        # Check exact match or substring match
+        is_correct = (
+            answer in pred_answer or pred_answer in answer or answer == pred_answer
+        )
+
+        if is_correct:
+            correct += 1
+        total += 1
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100
+
+    print(f"\n{'='*60}")
+    print(f"Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_80k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_90k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -641,7 +837,9 @@ def main():
                 print(f"ARC-{subset} Accuracy: {accuracy:.2f}%")
     elif args.benchmark == "piqa":
         print(f"\nLoading PIQA dataset (split={args.split})...")
-        dataset = load_dataset("ybisk/piqa", split=args.split)
+        dataset = load_dataset(
+            "ybisk/piqa", split=args.split, revision="refs/convert/parquet"
+        )
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_piqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
@@ -661,6 +859,24 @@ def main():
         dataset = load_dataset("openai/gsm8k", "main", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_gsm8k(gen, dataset, max_samples=args.max_samples)
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+    elif args.benchmark == "commonsenseqa":
+        print(f"\nLoading CommonsenseQA dataset (split={args.split})...")
+        dataset = load_dataset("commonsense_qa", split=args.split)
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_commonsenseqa(gen, dataset, max_samples=args.max_samples)
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+    elif args.benchmark == "triviaqa":
+        print(f"\nLoading TriviaQA dataset (split={args.split})...")
+        dataset = load_dataset("trivia_qa", "unfiltered.nocontext", split=args.split)
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_triviaqa(gen, dataset, max_samples=args.max_samples)
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+    elif args.benchmark == "hotpotqa":
+        print(f"\nLoading HotpotQA dataset (split={args.split})...")
+        dataset = load_dataset("hotpot_qa", "distractor", split=args.split)
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_hotpotqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
     else:
         print(f"Benchmark {args.benchmark} not implemented yet")

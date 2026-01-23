@@ -9,6 +9,13 @@ import torch.nn.functional as F
 import numpy as np
 from .norm import RMSNorm, GatedRMSNorm
 
+# Triton kernels (optional)
+try:
+    from .triton_kernels import seqcond_step_triton, TRITON_AVAILABLE
+except ImportError:
+    TRITON_AVAILABLE = False
+    seqcond_step_triton = None
+
 
 class SeqCondAttention(nn.Module):
     """SeqCond attention - matches JAX exactly."""
@@ -247,9 +254,21 @@ class SeqCondAttention(nn.Module):
             # pos: sequence length
             pos_final = torch.full((B,), L, dtype=torch.float32, device=x.device)
             # conv_buffer: last (kernel_size-1) values of z_conv_raw
-            conv_buffer_final = z_conv_raw[
-                :, -(self.conv_kernel_size - 1) :, :
-            ]  # (B, K-1, C)
+            # Pad with zeros if sequence is shorter than kernel_size-1
+            buffer_size = self.conv_kernel_size - 1
+            if L >= buffer_size:
+                conv_buffer_final = z_conv_raw[:, -buffer_size:, :]
+            else:
+                # Pad with zeros at the beginning
+                pad_size = buffer_size - L
+                padding = torch.zeros(
+                    B,
+                    pad_size,
+                    self.dim_conv_total,
+                    device=x.device,
+                    dtype=z_conv_raw.dtype,
+                )
+                conv_buffer_final = torch.cat([padding, z_conv_raw], dim=1)
             state = (
                 den_acc_final,
                 re_acc_final,
@@ -261,7 +280,9 @@ class SeqCondAttention(nn.Module):
 
         return output
 
-    def step(self, x_t: torch.Tensor, state: Tuple) -> Tuple[torch.Tensor, Tuple]:
+    def step(
+        self, x_t: torch.Tensor, state: Tuple, use_triton: bool = False
+    ) -> Tuple[torch.Tensor, Tuple]:
         B, D = x_t.shape
         den_acc, re_acc, im_acc, pos, conv_buffer = state
 
@@ -347,38 +368,62 @@ class SeqCondAttention(nn.Module):
             self._score_bias_b = self.score_bias.view(1, -1)
             self._phase_scale_b = self.phase_scale.view(1, self.K, 1, 1)
 
-        score_raw = self._score_scale_b * s_raw.float() + self._score_bias_b
-        p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(1e-6, 1000.0)
+        # Use Triton kernels if requested and available
+        if use_triton and TRITON_AVAILABLE and seqcond_step_triton is not None:
+            out_re, out_im = seqcond_step_triton(
+                k_val.contiguous(),
+                s_raw.contiguous(),
+                q_re.squeeze(2).contiguous(),
+                q_im.squeeze(2).contiguous(),
+                re_acc,
+                im_acc,
+                den_acc,
+                theta.contiguous(),
+                w_int.contiguous(),
+                self.phase_scale,
+                self.score_scale,
+                self.score_bias,
+                log_time_weight.contiguous(),
+            )
+            out_complex = torch.cat([out_re, out_im], dim=-1)
+        else:
+            # Standard PyTorch path
+            score_raw = self._score_scale_b * s_raw.float() + self._score_bias_b
+            p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(
+                1e-6, 1000.0
+            )
 
-        k_f32 = k_val.float().unsqueeze(-1)
-        p_w_b = p_w.unsqueeze(-1).unsqueeze(-1)
-        k_scaled = k_f32 * self._phase_scale_b
-        phi = (k_scaled / (1.0 + k_scaled.abs())) * theta
-        kvw = k_f32 * p_w_b
-        re = kvw * torch.cos(phi)
-        im = kvw * torch.sin(phi)
+            k_f32 = k_val.float().unsqueeze(-1)
+            p_w_b = p_w.unsqueeze(-1).unsqueeze(-1)
+            k_scaled = k_f32 * self._phase_scale_b
+            phi = (k_scaled / (1.0 + k_scaled.abs())) * theta
+            kvw = k_f32 * p_w_b
+            re = kvw * torch.cos(phi)
+            im = kvw * torch.sin(phi)
 
-        # Update accumulators in-place for CUDA graph compatibility
-        den_acc.add_(p_w)
-        re_acc.add_(re)
-        im_acc.add_(im)
+            # Update accumulators in-place for CUDA graph compatibility
+            den_acc.add_(p_w)
+            re_acc.add_(re)
+            im_acc.add_(im)
 
-        state_re_g = re_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
-        state_im_g = im_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
-        match_re = (state_re_g * q_re + state_im_g * q_im).float()
-        match_im = (state_im_g * q_re - state_re_g * q_im).float()
-        out_re_g = (match_re * w_int.float()).sum(dim=-1)
-        out_im_g = (match_im * w_int.float()).sum(dim=-1)
-        out_re = out_re_g.reshape(B, self.K, self.H).to(x_t.dtype)
-        out_im = out_im_g.reshape(B, self.K, self.H).to(x_t.dtype)
-        out_complex = torch.cat([out_re, out_im], dim=-1)
+            state_re_g = re_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+            state_im_g = im_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+            match_re = (state_re_g * q_re + state_im_g * q_im).float()
+            match_im = (state_im_g * q_re - state_re_g * q_im).float()
+            out_re_g = (match_re * w_int.float()).sum(dim=-1)
+            out_im_g = (match_im * w_int.float()).sum(dim=-1)
+            out_re = out_re_g.reshape(B, self.K, self.H).to(x_t.dtype)
+            out_im = out_im_g.reshape(B, self.K, self.H).to(x_t.dtype)
+            out_complex = torch.cat([out_re, out_im], dim=-1)
 
         out_flat = out_complex.reshape(B, -1)
         gate_for_norm = self.gate_proj(gate_logits)
         out_normed = self.gated_norm(out_flat, gate_for_norm)
         out_complex = out_normed.reshape(B, self.K, 2 * self.H)
 
-        y_spec_raw = torch.einsum("bkf,kfn->bkn", out_complex, self.W_readout)
+        y_spec_raw = torch.einsum(
+            "bkf,kfn->bkn", out_complex, self.W_readout.to(out_complex.dtype)
+        )
         y_skip_raw = self.skip_up(c_skip) if self.skip_low_rank else c_skip
         y_skip = y_skip_raw.reshape(B, self.K, self.dim_swiglu_head)
 
@@ -422,6 +467,8 @@ class SeqCondBlock(nn.Module):
             return x + out, state
         return x + self.attn(self.norm(x), mask=mask)
 
-    def step(self, x_t: torch.Tensor, state: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        out, new_state = self.attn.step(self.norm(x_t), state)
+    def step(
+        self, x_t: torch.Tensor, state: Tuple, use_triton: bool = False
+    ) -> Tuple[torch.Tensor, Tuple]:
+        out, new_state = self.attn.step(self.norm(x_t), state, use_triton=use_triton)
         return x_t + out, new_state

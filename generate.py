@@ -11,8 +11,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        # default="checkpoints/seqcond_torch_80k.pt",
-        default="checkpoints/thin_torch.pt",
+        default="checkpoints/seqcond_torch_90k.pt",
+        # default="checkpoints/thin_torch.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(
@@ -60,12 +60,24 @@ def main():
     parser.add_argument(
         "--quiet", action="store_true", help="Disable token streaming output"
     )
+    parser.add_argument(
+        "--use_triton",
+        action="store_true",
+        help="Use Triton kernels for SeqCond acceleration (requires triton package)",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Model dtype (float32, float16, bfloat16)",
+    )
 
     args = parser.parse_args()
 
     print(f"Loading model from {args.checkpoint}...")
     try:
-        gen = TorchGenerator(args.checkpoint)
+        gen = TorchGenerator(args.checkpoint, dtype=args.dtype)
     except FileNotFoundError:
         print(f"Error: Checkpoint not found at {args.checkpoint}")
         return
@@ -82,7 +94,7 @@ def main():
 
     # Pre-capture CUDA graphs for fast generation
     if not args.no_cuda_graph:
-        gen.precompute(max_seq_len=1024)
+        gen.precompute(max_seq_len=1024, use_triton=args.use_triton)
         start = time.time()  # Reset start time after precompute
 
     output = gen.generate(
@@ -96,6 +108,7 @@ def main():
         no_repeat_ngram_size=args.no_repeat_ngram,
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
+        use_triton=args.use_triton,
     )
 
     torch.cuda.synchronize()

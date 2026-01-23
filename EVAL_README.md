@@ -109,20 +109,59 @@ python eval.py --benchmark winogrande:xs --split validation
 
 ### 7. GSM8K (Grade School Math 8K)
 
-Math word problems requiring multi-step reasoning. Uses generative evaluation with exact match on final numerical answer.
+Math word problems requiring multi-step reasoning.
 
 ```bash
-# Test split (1319 examples)
+# Full test set (1319 examples)
 python eval.py --benchmark gsm8k --split test
-
-# Train split (7473 examples, for few-shot examples)
-python eval.py --benchmark gsm8k --split train
 
 # Quick test with limited samples
 python eval.py --benchmark gsm8k --split test --max_samples 100
 ```
 
 **Note**: GSM8K uses **generative evaluation** (generates full solution) unlike other benchmarks which use log probability scoring. This makes it slower but tests actual reasoning ability.
+
+### 8. CommonsenseQA
+
+Commonsense reasoning with 5-way multiple choice questions.
+
+```bash
+# Validation split (1221 examples)
+python eval.py --benchmark commonsenseqa --split validation
+
+# Quick test
+python eval.py --benchmark commonsenseqa --split validation --max_samples 50
+```
+
+**Note**: Uses log probability scoring for each choice.
+
+### 9. TriviaQA
+
+Open-domain question answering with factual questions.
+
+```bash
+# Validation split (11313 examples)
+python eval.py --benchmark triviaqa --split validation
+
+# Quick test
+python eval.py --benchmark triviaqa --split validation --max_samples 50
+```
+
+**Note**: Uses **generative evaluation** - model generates free-form answers. Requires exact or substring match with reference answers. Performance may be low without fine-tuning.
+
+### 10. HotpotQA
+
+Multi-hop question answering requiring reasoning across multiple facts.
+
+```bash
+# Validation split (7405 examples)
+python eval.py --benchmark hotpotqa --split validation
+
+# Quick test
+python eval.py --benchmark hotpotqa --split validation --max_samples 50
+```
+
+**Note**: Uses **generative evaluation** with exact/substring matching. Challenging for base models without fine-tuning.
 
 ## Common Options
 
@@ -180,7 +219,10 @@ python eval.py --benchmark hellaswag --split validation --max_samples 500
 python eval.py --benchmark arc:challenge --split test --max_samples 500
 python eval.py --benchmark piqa --split validation --max_samples 500
 python eval.py --benchmark winogrande:xl --split validation --max_samples 500
+python eval.py --benchmark commonsenseqa --split validation --max_samples 500
 python eval.py --benchmark gsm8k --split test --max_samples 100
+python eval.py --benchmark triviaqa --split validation --max_samples 100
+python eval.py --benchmark hotpotqa --split validation --max_samples 100
 
 # Full evaluation suite (takes longer)
 python eval.py --benchmark hellaswag --split validation
@@ -188,6 +230,10 @@ python eval.py --benchmark arc:easy --split test
 python eval.py --benchmark arc:challenge --split test
 python eval.py --benchmark piqa --split validation
 python eval.py --benchmark winogrande:xl --split validation
+python eval.py --benchmark commonsenseqa --split validation
+python eval.py --benchmark gsm8k --split test
+python eval.py --benchmark triviaqa --split validation
+python eval.py --benchmark hotpotqa --split validation
 python eval.py --benchmark gpqa:diamond
 python eval.py --benchmark gsm8k --split test
 python eval.py --benchmark mmlu:anatomy --split test

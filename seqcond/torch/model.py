@@ -228,6 +228,7 @@ class SeqCondModel(nn.Module):
         states: List[Tuple],
         pos: Optional[torch.Tensor] = None,
         seq_len: Optional[int] = None,
+        use_triton: bool = False,
     ) -> Tuple[torch.Tensor, List[Tuple]]:
         """Single step for generation - matches JAX step.
 
@@ -235,6 +236,7 @@ class SeqCondModel(nn.Module):
             seq_len: Optional fixed sequence length for transformer attention.
                      If provided, uses k_cache[:, :seq_len] instead of full cache.
                      Used for power-of-2 CUDA graph optimization.
+            use_triton: If True, use Triton kernels for SeqCond blocks.
         """
         B = token_id.size(0)
 
@@ -265,7 +267,7 @@ class SeqCondModel(nn.Module):
             if block_type == "transformer":
                 x, new_state = block.step(x, state, pos, cos_t, sin_t, seq_len=seq_len)
             else:
-                x, new_state = block.step(x, state)
+                x, new_state = block.step(x, state, use_triton=use_triton)
             new_states.append(new_state)
 
         x = self.final_norm(x)

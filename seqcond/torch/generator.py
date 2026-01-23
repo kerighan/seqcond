@@ -28,7 +28,8 @@ class TorchGenerator:
         # Set dtype
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
 
-        self.model = SeqCondModel(**self.config).to(device).to(self.dtype).eval()
+        # Load model (FP32 only for now - FP16 requires deeper changes)
+        self.model = SeqCondModel(**self.config).to(device).eval()
         self.model.load_state_dict(checkpoint["state_dict"], strict=False)
 
         if compile and hasattr(torch, "compile"):
@@ -46,6 +47,7 @@ class TorchGenerator:
         self._static_token = None
         self._static_states = None
         self._seq_lens = [8, 16, 32, 64, 128, 256, 512, 1024]  # Power-of-2 lengths
+        self._use_triton = False  # Whether to use Triton kernels in CUDA graphs
 
     def _get_quantized_seq_len(self, pos: int) -> int:
         """Get the smallest power-of-2 seq_len that covers pos+1."""
@@ -69,7 +71,10 @@ class TorchGenerator:
         with torch.cuda.stream(s):
             for _ in range(3):
                 logits, _ = self.model.step(
-                    self._static_token, self._static_states, seq_len=seq_len
+                    self._static_token,
+                    self._static_states,
+                    seq_len=seq_len,
+                    use_triton=self._use_triton,
                 )
         torch.cuda.current_stream().wait_stream(s)
 
@@ -80,7 +85,10 @@ class TorchGenerator:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             logits, _ = self.model.step(
-                self._static_token, self._static_states, seq_len=seq_len
+                self._static_token,
+                self._static_states,
+                seq_len=seq_len,
+                use_triton=self._use_triton,
             )
 
         # Restore states after capture
@@ -96,13 +104,17 @@ class TorchGenerator:
                 dt.copy_(st)
 
     @torch.no_grad()
-    def precompute(self, max_seq_len: int = 1024):
+    def precompute(self, max_seq_len: int = 1024, use_triton: bool = False):
         """Pre-capture all CUDA graphs up to max_seq_len.
 
         Call this after loading the model to eliminate graph capture
         overhead from the first real generation.
         """
-        print(f"Pre-capturing CUDA graphs up to seq_len={max_seq_len}...")
+        self._use_triton = use_triton
+        backend = "Triton" if use_triton else "PyTorch"
+        print(
+            f"Pre-capturing CUDA graphs up to seq_len={max_seq_len} (backend: {backend})..."
+        )
 
         # Initialize static tensors
         self._static_token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
@@ -130,7 +142,8 @@ class TorchGenerator:
         frequency_penalty: float = 0.0,
         no_repeat_ngram_size: int = 0,
         verbose: bool = True,
-        use_cuda_graph: bool = False,  # Not implemented yet
+        use_cuda_graph: bool = False,
+        use_triton: bool = False,
     ) -> str:
         tokens = self.tokenizer([prompt])[0]
 
@@ -152,6 +165,8 @@ class TorchGenerator:
             token_counts[t] = token_counts.get(t, 0) + 1
 
         # Generate
+        if verbose:
+            print(prompt, end="", flush=True)
         for _ in range(max_new_tokens):
             # Apply temperature
             if temperature > 0:
@@ -213,7 +228,7 @@ class TorchGenerator:
                     print(self.tokenizer.decode([next_token]), end="", flush=True)
                 except Exception as e:
                     # print(f"Error decoding token: {e}")
-                    next_token = next_token // 2
+                    next_token = 12
 
             # Next step
             token_tensor[0, 0] = next_token
@@ -242,6 +257,8 @@ class TorchGenerator:
                 self._graphs[seq_len].replay()
                 logits = self._static_logits_dict[seq_len]
             else:
-                logits, states = self.model.step(token_tensor, states)
+                logits, states = self.model.step(
+                    token_tensor, states, use_triton=use_triton
+                )
 
         return self.tokenizer.decode(generated)
