@@ -88,7 +88,7 @@ def iterate_synth(
         max_samples: Maximum number of samples to yield (None = infinite)
         tokenize: If True, yield token IDs; if False, yield formatted text
         tok: Tokenizer to use (default: global tokenizer)
-        shard_data: If True, shard data across JAX processes for multi-host training
+        shard_data: If True, shard data across JAX processes.
 
     Yields:
         Token IDs (list[int]) or formatted text (str)
@@ -96,51 +96,59 @@ def iterate_synth(
     if tok is None:
         tok = tokenizer
 
-    # Check if we should shard data across processes
-    process_index = 0
-    process_count = 1
+    process_index, process_count = _maybe_init_jax_process_info(shard_data)
 
-    if shard_data:
-        try:
-            import jax
+    # Counter for total samples yielded by this process
+    samples_yielded = 0
 
-            if jax.process_count() > 1:
-                process_index = jax.process_index()
-                process_count = jax.process_count()
-                print(
-                    f"[Process {process_index}/{process_count}] Loading dataset shard..."
-                )
-        except:
-            pass  # JAX not initialized or single process
+    # Loop indefinitely if max_samples is None
+    while True:
+        dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
 
-    dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+        # Track iteration index for sharding logic
+        dataset_idx = 0
 
-    for i, item in enumerate(dataset):
-        # Shard data: each process takes every Nth sample
-        if i % process_count != process_index:
-            continue
+        for item in dataset:
+            # Shard data: each process takes every Nth sample
+            current_idx = dataset_idx
+            dataset_idx += 1
 
-        if max_samples is not None and i >= max_samples * process_count:
-            break
+            if current_idx % process_count != process_index:
+                continue
 
-        text = format_synth_item(item)
+            if max_samples is not None and samples_yielded >= max_samples:
+                return
 
-        if tokenize:
-            try:
-                tokens = tok.encode(text)
-                yield tokens
-            except ValueError as e:
-                if "disallowed special token" in str(e):
-                    # Skip this sample entirely and continue to next one
-                    if process_index == 0:  # Only log from process 0
-                        print(
-                            f"[WARNING] Skipping sample with disallowed special token: {e}"
-                        )
-                    continue
-                else:
-                    raise
+            text = format_synth_item(item)
+
+            if tokenize:
+                try:
+                    tokens = tok.encode(text)
+                    yield tokens
+                    samples_yielded += 1
+                except ValueError as e:
+                    if "disallowed special token" in str(e):
+                        if samples_yielded % 10000 == 0:
+                            print(
+                                f"[WARNING] Skipping sample (stream_idx={current_idx}) with disallowed special token"
+                            )
+                        continue
+                    else:
+                        raise
+            else:
+                yield text
+                samples_yielded += 1
+
+        if max_samples is not None:
+            if samples_yielded >= max_samples:
+                break
+            print(
+                f"[Process {process_index}] SYNTH dataset epoch done, restarting to reach max_samples..."
+            )
         else:
-            yield text
+            print(
+                f"[Process {process_index}] SYNTH dataset epoch done, restarting (infinite)..."
+            )
 
 
 def pad_sequences(sequences: list, maxlen: int, padding_value: int = 0) -> np.ndarray:
@@ -163,6 +171,7 @@ def _batchify_token_stream(
     maxlen: int,
     log_every_n_steps: int,
     pad_value: int = 0,
+    drop_last: bool = True,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     X_batch, y_batch, real_lengths = [], [], []
     steps_done = 0
@@ -191,6 +200,21 @@ def _batchify_token_stream(
 
             if steps_done >= max_steps:
                 break
+
+    # Handle remaining samples when iterator is exhausted
+    if X_batch and not drop_last:
+        # Yield partial batch (WARNING: may cause issues with multi-device training)
+        print(
+            f"[dataset] WARNING: Yielding partial batch of size {len(X_batch)} (drop_last=False)"
+        )
+        X_padded = pad_sequences(X_batch, maxlen=maxlen, padding_value=pad_value)
+        y_padded = pad_sequences(y_batch, maxlen=maxlen, padding_value=pad_value)
+        real_tokens_in_batch = sum(real_lengths)
+        yield X_padded, y_padded, np.array(real_tokens_in_batch, dtype=np.int32)
+    elif X_batch:
+        print(
+            f"[dataset] Dropping incomplete final batch of size {len(X_batch)} (need {batch_size})"
+        )
 
 
 def _maybe_init_jax_process_info(shard_data: bool) -> tuple[int, int]:
@@ -234,7 +258,7 @@ def iterate_fineweb(
     # Sharding happens at batch level in DataLoader/training loop.
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
-        name="sample-100BT",
+        name="sample-350BT",
         split="train",
         streaming=True,
     )
@@ -287,12 +311,22 @@ def _iterate_fineweb_docs(
     """Iterate over FineWeb documents.
 
     Yields tokenized documents until the dataset is exhausted.
-    No sharding here - all hosts see all documents.
+    Sharded across processes.
     """
     tok = tok or tokenizer
     docs_processed = 0
 
+    # Initialize sharding info (assuming shard_data=True for FineWeb always)
+    process_index, process_count = _maybe_init_jax_process_info(shard_data=True)
+
+    dataset_idx = 0
     for item in dataset:
+        current_idx = dataset_idx
+        dataset_idx += 1
+
+        if current_idx % process_count != process_index:
+            continue
+
         text = item.get("text", "")
         tokens = tok.encode(text)
         docs_processed += 1
@@ -498,6 +532,7 @@ def data_generator(
     maxlen: int = 768,
     log_every_n_steps: int = 1000,
     tok: Tokenizer = None,
+    drop_last: bool = True,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Generate batches of (X, y) pairs for language model training.
@@ -508,6 +543,7 @@ def data_generator(
         maxlen: Maximum sequence length
         log_every_n_steps: Print progress every N steps
         tok: Tokenizer to use (default: global tokenizer)
+        drop_last: If True, drop incomplete final batch (required for multi-device training)
 
     Yields:
         Tuple of (X, y, real_tokens_in_batch) numpy arrays
@@ -541,6 +577,20 @@ def data_generator(
 
             if steps_done >= max_steps:
                 break
+
+    # Handle remaining samples when iterator is exhausted
+    if X_batch and not drop_last:
+        print(
+            f"[dataset] WARNING: Yielding partial batch of size {len(X_batch)} (drop_last=False)"
+        )
+        X_padded = pad_sequences(X_batch, maxlen=maxlen)
+        y_padded = pad_sequences(y_batch, maxlen=maxlen)
+        real_tokens_in_batch = sum(real_lengths)
+        yield X_padded, y_padded, np.array(real_tokens_in_batch, dtype=np.int32)
+    elif X_batch:
+        print(
+            f"[dataset] Dropping incomplete final batch of size {len(X_batch)} (need {batch_size})"
+        )
 
 
 def create_tf_dataset(
