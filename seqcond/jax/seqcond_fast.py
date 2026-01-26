@@ -379,8 +379,14 @@ class SeqCondAttention(nn.Module):
         y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
 
-        y_val = y_spec_val + y_skip_val
-        y_gate = y_spec_gate + y_skip_gate
+        # y_val = y_spec_val + y_skip_val
+        # y_gate = y_spec_gate + y_skip_gate
+        highway_scale = self.param(
+            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
+        )
+
+        y_val = y_spec_val + (y_skip_val * highway_scale)
+        y_gate = y_spec_gate + (y_skip_gate * highway_scale)
 
         y_act = y_val * jax.nn.sigmoid(y_gate)
 
