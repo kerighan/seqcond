@@ -364,7 +364,7 @@ class SeqCondAttention(nn.Module):
         # Apply GatedRMSNorm to spectral output (Mamba2 style)
         # gate_logits acts as the residual gate
         out_complex_flat = out_complex.reshape(B, L, -1)
-        out_complex_flat = RMSNorm(dtype=self.compute_dtype, name="out_norm")(
+        out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
             out_complex_flat
         )
         # gate_for_norm = nn.Dense(
