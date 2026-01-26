@@ -44,7 +44,7 @@ def parse_args():
         "--resume-step", type=int, default=None, help="Step to resume training from"
     )
     parser.add_argument(
-        "--resume-checkpoint",
+        "--resume_checkpoint",
         type=str,
         default=None,
         help="Specific checkpoint file path",
