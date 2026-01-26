@@ -246,24 +246,47 @@ def parse_args():
 # Parse args immediately to configure environment
 args = parse_args()
 
+import sys
+
+print("[DEBUG] Args parsed, importing JAX...", flush=True)
+sys.stdout.flush()
+
 import jax
 
 if args.model_type == "mamba":
     print("Enabling float32 matmul precision for Mamba stability")
     jax.config.update("jax_default_matmul_precision", "float32")
 
+print("[DEBUG] Calling jax.distributed.initialize()...", flush=True)
+sys.stdout.flush()
 jax.distributed.initialize()
+print(
+    f"[DEBUG] JAX distributed initialized. Process {jax.process_index()}/{jax.process_count()}",
+    flush=True,
+)
+sys.stdout.flush()
 
 # Now import application modules
+print("[DEBUG] Importing seqcond modules...", flush=True)
+sys.stdout.flush()
 from seqcond.config import Config, ModelConfig, TrainingConfig
+
+print("[DEBUG] Config imported", flush=True)
 from seqcond.dataset import (
     tokenizer,
     DataLoader,
     iterate_fineweb,
     iterate_fineweb_then_synth,
 )
+
+print("[DEBUG] Dataset imported", flush=True)
 from seqcond.jax import train
+
+print("[DEBUG] Train imported", flush=True)
 from jax_smi import initialise_tracking
+
+print("[DEBUG] All imports done", flush=True)
+sys.stdout.flush()
 
 
 def get_config(args) -> Config:
