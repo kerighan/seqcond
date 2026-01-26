@@ -316,16 +316,7 @@ def _iterate_fineweb_docs(
     tok = tok or tokenizer
     docs_processed = 0
 
-    # Initialize sharding info (assuming shard_data=True for FineWeb always)
-    process_index, process_count = _maybe_init_jax_process_info(shard_data=True)
-
-    dataset_idx = 0
     for item in dataset:
-        current_idx = dataset_idx
-        dataset_idx += 1
-
-        if current_idx % process_count != process_index:
-            continue
 
         text = item.get("text", "")
         tokens = tok.encode(text)

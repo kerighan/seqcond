@@ -13,6 +13,12 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["JAX_PLATFORMS"] = "tpu"
 
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+os.environ.setdefault("HF_HUB_DOWNLOAD_MAX_RETRIES", "20")
+os.environ.setdefault("HF_HUB_DOWNLOAD_RETRY_DELAY", "5")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 logging.getLogger("jax").setLevel(logging.ERROR)
 
 
@@ -42,6 +48,12 @@ def parse_args():
         type=str,
         default=None,
         help="Specific checkpoint file path",
+    )
+    parser.add_argument(
+        "--load-checkpoint",
+        type=str,
+        default=None,
+        help="Load weights from checkpoint but start training from scratch (ignores step/opt state)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
@@ -391,6 +403,7 @@ def main():
             iterator_fn=iterator_fn,
             iterator_kwargs=iterator_kwargs,
             log_every_n_steps=tc.log_every_n_steps,
+            drop_last=True,
         )
 
     train(
@@ -399,6 +412,7 @@ def main():
         tokenizer=tokenizer,
         seed=args.seed,
         resume_checkpoint=resume_ckpt,
+        load_checkpoint=args.load_checkpoint,
     )
 
 
