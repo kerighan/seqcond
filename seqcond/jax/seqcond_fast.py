@@ -337,7 +337,8 @@ class SeqCondAttention(nn.Module):
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
-        scale = 1.0 / jnp.array(H, dtype=jnp.float32)  # = 1/H (more aggressive)
+        # scale = 1 / jnp.array(H, dtype=jnp.float32)  # = 1/H
+        scale = 1
 
         match_re = (state_re_g * q_re + state_im_g * q_im) * scale
         match_im = (state_im_g * q_re - state_re_g * q_im) * scale
@@ -346,9 +347,6 @@ class SeqCondAttention(nn.Module):
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
 
         # Normalize before fusion
-        out_re_g = nn.RMSNorm(dtype=self.compute_dtype, name="out_re_g_norm")(out_re_g)
-        out_im_g = nn.RMSNorm(dtype=self.compute_dtype, name="out_im_g_norm")(out_im_g)
-
         out_re = out_re_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
 
@@ -364,10 +362,13 @@ class SeqCondAttention(nn.Module):
         )
 
         # Simple RMSNorm (states already normalized before readout)
-        out_complex_flat = out_complex.reshape(B, L, -1)
-        out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
-            out_complex_flat
+        complex_scale = self.param(
+            "complex_scale", nn.initializers.constant(0.001), (1,)
         )
+        out_complex_flat = complex_scale * out_complex.reshape(B, L, -1)
+        # out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
+        #     out_complex_flat
+        # )
         out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
