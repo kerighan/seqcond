@@ -991,18 +991,27 @@ class Trainer:
         if not using_tf_data:
             self.data_loader.reset_stats()
 
-        print("\nStarting training...")
+        print("\nStarting training...", flush=True)
 
         for step in itertools.count(start=1):
             if step > tc.total_steps * grad_accum_steps:
                 break
 
             try:
+                if step == 1:
+                    print(
+                        "[DEBUG] Fetching first batch from data iterator...", flush=True
+                    )
                 if using_tf_data:
                     x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
                     tokens_seen += real_tokens_in_batch
                 else:
                     x_batch, y_batch = next(data_iterator)
+                if step == 1:
+                    print(
+                        f"[DEBUG] First batch fetched: x_batch.shape={x_batch.shape}",
+                        flush=True,
+                    )
                     # When not using tf.data, tokens_seen is not used here.
                     # The DataLoader instance tracks it internally and it's fetched later.
 
