@@ -682,7 +682,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_90k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_110k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,

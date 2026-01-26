@@ -444,6 +444,7 @@ class Trainer:
         tokenizer: Any = None,
         model_name: Optional[str] = None,
         resume_checkpoint: Optional[str] = None,
+        load_checkpoint: Optional[str] = None,
     ):
         self.config = config
         self.model_config = config.model
@@ -452,6 +453,7 @@ class Trainer:
         self.tokenizer = tokenizer
         self.model_name = model_name or config.name
         self.resume_checkpoint = resume_checkpoint
+        self.load_checkpoint = load_checkpoint
         self._wandb = None
 
         # Will be initialized in setup()
@@ -690,23 +692,44 @@ class Trainer:
                 f"(per-device batch size = {self.per_device_batch})."
             )
 
-        # Resume from checkpoint if provided
-        if self.resume_checkpoint:
-            if os.path.exists(self.resume_checkpoint):
-                (
-                    ckpt_params,
-                    _,
-                    ckpt_step,
-                    ckpt_opt_state,
-                ) = load_checkpoint(self.resume_checkpoint)
+        # Checkpoint Loading Logic (Single-host file support via Broadcast)
+        from jax.experimental import multihost_utils
+
+        ckpt_path = self.load_checkpoint or self.resume_checkpoint
+        if ckpt_path:
+            # Step 1: Process 0 loads the file (if it exists)
+            ckpt_data = None
+            if jax.process_index() == 0:
+                if os.path.exists(ckpt_path):
+                    print(f"[Process 0] Loading checkpoint from {ckpt_path}...")
+                    try:
+                        ckpt_data = load_checkpoint(ckpt_path)
+                    except Exception as e:
+                        print(f"[Process 0] Error loading checkpoint: {e}")
+                else:
+                    print(f"[Process 0] Warning: Checkpoint {ckpt_path} not found.")
+
+            # Step 2: Broadcast loaded data to all processes
+            # We broadcast the tuple: (params, config, step, opt_state) or None
+            # Note: broadcasting huge params via host-to-host might be slow but safe
+            ckpt_data = multihost_utils.broadcast_one_to_all(ckpt_data)
+
+            # Step 3: Apply loaded data (if valid)
+            if ckpt_data is not None:
+                (ckpt_params, _, ckpt_step, ckpt_opt_state) = ckpt_data
+                
+                # Update params
                 self.params = ckpt_params
-                if ckpt_opt_state is not None:
-                    self.opt_state = ckpt_opt_state
-                self.start_step = ckpt_step or 0
-                print(
-                    f"Resumed from checkpoint {self.resume_checkpoint} "
-                    f"(step {self.start_step})"
-                )
+                print("Weights loaded from checkpoint.")
+
+                # If Resuming (not just loading weights), restore training state
+                if self.resume_checkpoint and not self.load_checkpoint:
+                    if ckpt_opt_state is not None:
+                        self.opt_state = ckpt_opt_state
+                    self.start_step = ckpt_step or 0
+                    print(f"Resumed training state (step {self.start_step}).")
+                else:
+                    print("Starting training from scratch (ignoring checkpoint step/opt_state).")
 
                 # Validate parameter shapes
                 try:
@@ -725,10 +748,10 @@ class Trainer:
                 except KeyError:
                     pass
             else:
-                print(
-                    f"Warning: checkpoint {self.resume_checkpoint} not found. "
-                    "Starting from scratch."
-                )
+                 # If we are here, it means Process 0 couldn't load the file
+                 if self.load_checkpoint:
+                     raise FileNotFoundError(f"Could not load required checkpoint: {self.load_checkpoint}")
+                 print("Starting from scratch (random init).")
 
         if self.use_pmap:
             self.params = self._replicate_tree(self.params)
@@ -1243,6 +1266,7 @@ def train(
     model_name: Optional[str] = None,
     seed: int = 42,
     resume_checkpoint: Optional[str] = None,
+    load_checkpoint: Optional[str] = None,
 ) -> Any:
     """
     High-level training function.
@@ -1263,6 +1287,7 @@ def train(
         tokenizer=tokenizer,
         model_name=model_name,
         resume_checkpoint=resume_checkpoint,
+        load_checkpoint=load_checkpoint,
     )
     trainer.setup(seed=seed)
     return trainer.train()
