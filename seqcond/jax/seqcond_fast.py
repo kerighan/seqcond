@@ -92,24 +92,15 @@ class SeqCondAttention(nn.Module):
         dim_swiglu_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_head
 
-        # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
-        dim_skip = dim_swiglu_total
         # ======================================================================
         # 1. FUSED INPUT PROJECTION (Mamba-style single projection + conv)
         # ======================================================================
-        # All inputs in one projection: conv_branch (mem + query) + skip
+        # Only project conv_branch (mem + query), gate comes from x directly
         dim_mem_total = dim_memory + self.K  # k_val + s_raw
-        dim_conv_total = (
-            dim_mem_total + dim_query_total
-        )  # Everything that goes through conv
-        dim_total = dim_conv_total + dim_skip  # No gate needed
+        dim_conv_total = dim_mem_total + dim_query_total
 
-        z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x)
-        z_all = z_all.astype(self.compute_dtype)
-
-        # Split: conv_branch vs skip
-        z_conv = z_all[..., :dim_conv_total]
-        y_skip_raw = z_all[..., dim_conv_total:]
+        z_conv = nn.Dense(dim_conv_total, use_bias=False, name="in_proj")(x)
+        z_conv = z_conv.astype(self.compute_dtype)
 
         # Single fused conv on mem+query (Mamba style)
         z_conv = nn.Conv(
@@ -348,46 +339,20 @@ class SeqCondAttention(nn.Module):
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
-        # 5. FUSION FINALE with GatedRMSNorm
+        # 5. FUSION FINALE with GatedRMSNorm (gate from x)
         # ======================================================================
-        W_readout = self.param(
-            "W_readout",
-            nn.initializers.glorot_uniform(),
-            (self.K, 2 * H, dim_swiglu_head),
+        out_complex_flat = out_complex.reshape(B, L, -1)
+
+        # Gate projection from x (no new skip params needed)
+        gate_for_norm = nn.Dense(
+            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
+        )(x)
+        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+            out_complex_flat, gate_for_norm
         )
 
-        out_complex_flat = out_complex.reshape(B, L, -1).astype(jnp.float32)
-        variance = jnp.mean(out_complex_flat**2, axis=-1, keepdims=True)
-        out_complex_flat = out_complex_flat * jax.lax.rsqrt(variance + 1e-4)
-        complex_weight = self.param(
-            "complex_weight",
-            nn.initializers.ones,
-            (out_complex_flat.shape[-1],),
-        )
-        out_complex_flat = (0.001 * out_complex_flat * complex_weight).astype(
-            self.compute_dtype
-        )
-        out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
-
-        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
-
-        # Skip connection
-        y_skip = y_skip_raw.reshape(B, L, self.K, dim_swiglu_head)
-
-        y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        highway_scale = self.param(
-            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
-        )
-
-        y_val = y_spec_val + (y_skip_val * highway_scale)
-        y_gate = y_spec_gate + (y_skip_gate * highway_scale)
-
-        y_act = y_val * jax.nn.sigmoid(y_gate)
-
-        y_flat = y_act.reshape(B, L, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Direct output projection (no swiglu, no skip)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(out_normed)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
@@ -426,9 +391,6 @@ class SeqCondAttention(nn.Module):
         dim_swiglu_head = dim_expand * 2
         dim_swiglu_total = self.K * dim_swiglu_head
 
-        # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
-        dim_skip = dim_swiglu_total
-
         # Unpack state (now with single fused conv buffer)
         den_acc, re_acc, im_acc, pos, conv_buffer = state
 
@@ -437,14 +399,9 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         dim_mem_total = dim_memory + self.K
         dim_conv_total = dim_mem_total + dim_query_total
-        dim_total = dim_conv_total + dim_skip  # No gate needed
 
-        z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x_t)
-        z_all = z_all.astype(self.compute_dtype)
-
-        # Split: conv_branch vs skip
-        z_conv = z_all[..., :dim_conv_total]
-        c_skip = z_all[..., dim_conv_total:]
+        z_conv = nn.Dense(dim_conv_total, use_bias=False, name="in_proj")(x_t)
+        z_conv = z_conv.astype(self.compute_dtype)
 
         # Single fused conv with buffer
         z_conv_expanded = z_conv[:, None, :]
@@ -659,41 +616,17 @@ class SeqCondAttention(nn.Module):
         # Concatenate (not stack!) to match __call__
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)  # (B, K, 2*H)
 
-        # Simple RMSNorm (states already normalized before readout)
+        # GatedRMSNorm with gate from x_t (matches __call__)
         out_complex_flat = out_complex.reshape(B, -1)
-        out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
-            out_complex_flat
+        gate_for_norm = nn.Dense(
+            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
+        )(x_t)
+        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+            out_complex_flat, gate_for_norm
         )
-        out_complex = out_complex_flat.reshape(B, self.K, 2 * H)
 
-        # Readout
-        W_readout = self.param(
-            "W_readout",
-            nn.initializers.glorot_uniform(),
-            (self.K, 2 * H, dim_swiglu_head),
-        )
-        y_spec_raw = jnp.einsum("bkf,kfn->bkn", out_complex, W_readout)
-
-        # Skip connection
-        y_skip_raw = c_skip
-        y_skip = y_skip_raw.reshape(B, self.K, dim_swiglu_head)
-
-        y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
-        y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
-
-        highway_scale = self.param(
-            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
-        )
-        highway_scale_step = highway_scale[0, 0]  # (K, 1)
-
-        y_val = y_spec_val + (y_skip_val * highway_scale_step)
-        y_gate = y_spec_gate + (y_skip_gate * highway_scale_step)
-
-        y_act = y_val * jax.nn.sigmoid(y_gate)
-
-        # Output
-        y_flat = y_act.reshape(B, -1)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
+        # Direct output projection (no swiglu, no skip)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(out_normed)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
