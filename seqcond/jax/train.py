@@ -945,6 +945,7 @@ class Trainer:
 
     def train(self):
         """Run training loop."""
+        print("[DEBUG Trainer.train()] Entered train method", flush=True)
         tc = self.train_config
         grad_accum_steps = tc.grad_accum_steps
 
@@ -967,7 +968,12 @@ class Trainer:
             last_tokens_seen = 0
             using_tf_data = True
         else:
+            print(
+                "[DEBUG Trainer.train()] Creating data iterator from DataLoader...",
+                flush=True,
+            )
             data_iterator = iter(self.data_loader)
+            print("[DEBUG Trainer.train()] Data iterator created", flush=True)
             using_tf_data = False
 
         # Training state
