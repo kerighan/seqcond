@@ -115,7 +115,7 @@ class ModelConfig:
             num_layers=24,
             num_heads=16,
             seqcond_heads=16,
-            seqcond_query_heads=16,
+            num_query_heads=16,
             num_kv_heads=4,
         )
         defaults.update(kwargs)
