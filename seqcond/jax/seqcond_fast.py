@@ -28,8 +28,8 @@ class GatedRMSNorm(nn.Module):
         x = x.astype(jnp.float32)
         res = residual.astype(jnp.float32)
 
-        # Gate with sigmoid (bounded, stable)
-        x = x * jax.nn.sigmoid(res)
+        # Gate with silu
+        x = x * jax.nn.silu(res)
 
         # RMSNorm
         variance = jnp.mean(x**2, axis=-1, keepdims=True)
@@ -131,7 +131,7 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         if mask is not None:
@@ -140,7 +140,7 @@ class SeqCondAttention(nn.Module):
             k_val = k_val * m
 
         # Process query branch
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
