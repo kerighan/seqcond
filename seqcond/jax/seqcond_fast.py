@@ -128,7 +128,7 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
-        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         if mask is not None:
@@ -137,7 +137,7 @@ class SeqCondAttention(nn.Module):
             k_val = k_val * m
 
         # Process query branch
-        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -361,17 +361,10 @@ class SeqCondAttention(nn.Module):
             (self.K, 2 * H, dim_swiglu_head),
         )
 
-        # Simple RMSNorm (states already normalized before readout)
-        # complex_scale = self.param(
-        #     "complex_scale", nn.initializers.constant(0.001), (1,)
-        # )
-        # out_complex_flat = complex_scale * out_complex.reshape(B, L, -1)
-        # out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
-        #     out_complex_flat
-        # )
-        variance = jnp.mean(out_complex**2, axis=-1, keepdims=True)
-        out_complex = out_complex * jax.lax.rsqrt(variance + 1e-4)
-        # out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
+        out_complex_flat = out_complex.reshape(B, L, -1)
+        variance = jnp.mean(out_complex_flat**2, axis=-1, keepdims=True)
+        out_complex_flat = out_complex_flat * jax.lax.rsqrt(variance + 1e-4)
+        out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
