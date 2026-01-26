@@ -210,6 +210,7 @@ class SeqCondAttention(nn.Module):
             "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
         )
         w_int = jax.nn.softplus(w_int_raw).astype(jnp.float32)
+        w_int /= jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6
 
         # ======================================================================
         # 3. MODULATION & SCAN UNIFIÉ (MATRIX vs LINEAR)
@@ -275,20 +276,13 @@ class SeqCondAttention(nn.Module):
         # use_square_matrix = L <= self.matrix_threshold
         if self.use_square_matrix:
             # PATH 1: O(L^2) Matrix Multiply (Tensor Core Optimized)
-            # Causal Mask (L, L)
-            # trues below diagonal
+            # Causal Mask (L, L) - use fp32 to avoid bf16 accumulation issues
             mask_idx = jnp.arange(L)[:, None] >= jnp.arange(L)[None, :]
-            causal_mask = mask_idx.astype(self.compute_dtype)
+            causal_mask = mask_idx.astype(jnp.float32)
 
-            # Einsum Accumulation
-            # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            # den_acc = jnp.einsum(
-            #     "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
-            # )
-
-            # Stack RE/IM for single einsum
+            # Stack RE/IM for single einsum - accumulate in fp32
             # (B, L, K, H, M, 2)
-            stack_ri = jnp.stack([re, im], axis=-1).astype(self.compute_dtype)
+            stack_ri = jnp.stack([re, im], axis=-1).astype(jnp.float32)
             # acc_ri: (B, L, K, H, M, 2)
             acc_ri = jnp.einsum("ts,bskhmc->btkhmc", causal_mask, stack_ri)
 
@@ -297,12 +291,12 @@ class SeqCondAttention(nn.Module):
 
         else:
             # PATH 2: O(L) Linear Scan (Memory Optimized)
+            # Use fp32 for accumulation to avoid precision issues
             flat_size = self.K * H * self.M
-            re_flat = re.reshape(B, L, flat_size)
-            im_flat = im.reshape(B, L, flat_size)
-            # den_flat = p_w  # (B, L, K)
+            re_flat = re.reshape(B, L, flat_size).astype(jnp.float32)
+            im_flat = im.reshape(B, L, flat_size).astype(jnp.float32)
 
-            # Stack & Scan
+            # Stack & Scan in fp32
             stack = jnp.concatenate([re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
 
