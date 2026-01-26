@@ -388,10 +388,12 @@ def get_config(args) -> Config:
 
 
 def main():
+    print("[DEBUG] Entering main()", flush=True)
     initialise_tracking()
-    print("JAX SMI tracking enabled")
+    print("[DEBUG] JAX SMI tracking enabled", flush=True)
 
     config = get_config(args)
+    print(f"[DEBUG] Config created: {config.name}", flush=True)
 
     # Resume Logic
     resume_ckpt = args.resume_checkpoint
@@ -418,6 +420,7 @@ def main():
             max_synth=args.max_synth,
         )
 
+        print("[DEBUG] Creating DataLoader...", flush=True)
         data_loader = DataLoader(
             batch_size=tc.batch_size,
             max_steps=micro_steps,
@@ -428,7 +431,9 @@ def main():
             log_every_n_steps=tc.log_every_n_steps,
             drop_last=True,
         )
+        print("[DEBUG] DataLoader created", flush=True)
 
+    print("[DEBUG] Calling train()...", flush=True)
     train(
         config=config,
         data_loader=data_loader,
