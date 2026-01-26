@@ -997,6 +997,9 @@ class Trainer:
             if step > tc.total_steps * grad_accum_steps:
                 break
 
+            if step <= 15:
+                print(f"[DEBUG] Step {step}: fetching batch...", flush=True)
+
             try:
                 if step == 1:
                     print(
