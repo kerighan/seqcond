@@ -999,25 +999,35 @@ class Trainer:
                 break
 
             if step <= 15:
-                print(f"[DEBUG] Step {step}: fetching batch...", flush=True)
+                print(
+                    f"[DEBUG] Step {step}: fetching batch (process {jax.process_index()})...",
+                    flush=True,
+                )
 
             try:
                 # Only process 0 loads data from HuggingFace, then broadcasts to all
                 if jax.process_index() == 0:
+                    if step <= 15:
+                        print(f"[DEBUG] Process 0 loading batch {step}...", flush=True)
                     if using_tf_data:
                         x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
                         tokens_seen += real_tokens_in_batch
                     else:
                         x_batch, y_batch = next(data_iterator)
-                    if step == 1:
+                    if step <= 15:
                         print(
-                            f"[DEBUG] Process 0 fetched batch: x_batch.shape={x_batch.shape}",
+                            f"[DEBUG] Process 0 loaded batch {step}: x_batch.shape={x_batch.shape}",
                             flush=True,
                         )
                     # Signal that data is valid (not exhausted)
                     data_valid = np.array([1], dtype=np.int32)
                 else:
-                    # Other processes create placeholder arrays
+                    # Other processes create placeholder arrays and wait for broadcast
+                    if step <= 15:
+                        print(
+                            f"[DEBUG] Process {jax.process_index()} waiting for broadcast...",
+                            flush=True,
+                        )
                     x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
                     y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
                     data_valid = np.array([0], dtype=np.int32)
