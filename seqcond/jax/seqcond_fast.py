@@ -109,7 +109,7 @@ class SeqCondAttention(nn.Module):
 
         # Split: conv_branch vs skip
         z_conv = z_all[..., :dim_conv_total]
-        c_skip = z_all[..., dim_conv_total:]
+        y_skip_raw = z_all[..., dim_conv_total:]
 
         # Single fused conv on mem+query (Mamba style)
         z_conv = nn.Conv(
@@ -362,24 +362,20 @@ class SeqCondAttention(nn.Module):
         )
 
         # Simple RMSNorm (states already normalized before readout)
-        complex_scale = self.param(
-            "complex_scale", nn.initializers.constant(0.001), (1,)
-        )
-        out_complex_flat = complex_scale * out_complex.reshape(B, L, -1)
+        # complex_scale = self.param(
+        #     "complex_scale", nn.initializers.constant(0.001), (1,)
+        # )
+        # out_complex_flat = complex_scale * out_complex.reshape(B, L, -1)
         # out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
         #     out_complex_flat
         # )
-        out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
+        variance = jnp.mean(out_complex**2, axis=-1, keepdims=True)
+        out_complex = out_complex * jax.lax.rsqrt(variance + 1e-4)
+        # out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
-        # Skip connection: low-rank or full
-        if self.skip_low_rank:
-            y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(
-                c_skip
-            )
-        else:
-            y_skip_raw = c_skip  # Already dim_swiglu_total
+        # Skip connection
         y_skip = y_skip_raw.reshape(B, L, self.K, dim_swiglu_head)
 
         y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
