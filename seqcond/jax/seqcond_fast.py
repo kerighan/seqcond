@@ -436,11 +436,11 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, self.K, H)
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         # Process query branch (matches __call__)
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]  # (B, K_q, 1, H, M)
 
@@ -590,10 +590,6 @@ class SeqCondAttention(nn.Module):
         state_re = re_acc_new
         state_im = im_acc_new
 
-        # RMSNorm on states (must match __call__)
-        state_re = nn.RMSNorm(dtype=self.compute_dtype, name="state_re_norm")(state_re)
-        state_im = nn.RMSNorm(dtype=self.compute_dtype, name="state_im_norm")(state_im)
-
         # Group state for GQA: (B, K, H, M) -> (B, K_q, n_rep, H, M)
         state_re_grouped = state_re.reshape(B, self.K_q, self.n_rep, H, self.M)
         state_im_grouped = state_im.reshape(B, self.K_q, self.n_rep, H, self.M)
@@ -602,15 +598,16 @@ class SeqCondAttention(nn.Module):
         w_int_raw = self.param(
             "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
         )
-        w_int = jax.nn.softplus(w_int_raw).astype(jnp.float32)
+        w_int = jnp.exp(w_int_raw).astype(jnp.float32)
+        w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
 
         # Remove batch/seq dims from w_int for step
         w_int_step = w_int[0, 0]  # (K_q, n_rep, H, M)
 
-        # Compute complex multiplication (matching) with 1/H scale
+        # Compute complex multiplication (matching) with 1/sqrt(H) scale
         # q_re, q_im: (B, K_q, 1, H, M) from reshape at line 461
         # state_re_grouped, state_im_grouped: (B, K_q, n_rep, H, M)
-        scale = 1.0 / jnp.array(H, dtype=jnp.float32)  # = 1/H
+        scale = jax.lax.rsqrt(jnp.array(H, dtype=jnp.float32))  # = 1/sqrt(H)
         match_re = (state_re_grouped * q_re + state_im_grouped * q_im) * scale
         match_im = (state_im_grouped * q_re - state_re_grouped * q_im) * scale
 
