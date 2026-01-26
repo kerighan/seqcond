@@ -246,6 +246,9 @@ class SeqCondModel(nn.Module):
                 if block_type == "seqcond":
                     pos = state[3]  # pos is 4th element in SeqCond state
                     break
+            # If still None (pure transformer model), initialize to 0
+            if pos is None:
+                pos = torch.zeros(B, device=token_id.device, dtype=torch.long)
 
         x = self.embedding(token_id).squeeze(1)  # (B, D)
 
@@ -266,8 +269,13 @@ class SeqCondModel(nn.Module):
         ):
             if block_type == "transformer":
                 x, new_state = block.step(x, state, pos, cos_t, sin_t, seq_len=seq_len)
+                # Update pos for next iteration (transformer doesn't update it)
+                if pos is not None:
+                    pos = pos + 1
             else:
                 x, new_state = block.step(x, state, use_triton=use_triton)
+                # SeqCond updates pos in its state, extract it
+                pos = new_state[3]
             new_states.append(new_state)
 
         x = self.final_norm(x)

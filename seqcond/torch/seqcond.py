@@ -238,8 +238,8 @@ class SeqCondAttention(nn.Module):
 
         y_spec_val, y_spec_gate = y_spec_raw.chunk(2, dim=-1)
         y_skip_val, y_skip_gate = y_skip.chunk(2, dim=-1)
-        y_val = y_spec_val + y_skip_val * self.highway_scale
-        y_gate = y_spec_gate + y_skip_gate * self.highway_scale
+        y_val = y_spec_val + y_skip_val
+        y_gate = y_spec_gate + y_skip_gate
         y_act = y_val * torch.sigmoid(y_gate)
 
         output = self.out_proj(y_act.reshape(B, L, -1))
@@ -309,10 +309,10 @@ class SeqCondAttention(nn.Module):
         z_mem = z_conv_act[..., : self.dim_mem_total]
         q_raw = z_conv_act[..., self.dim_mem_total :]
         k_val = z_mem[..., : self.dim_memory].reshape(B, self.K, self.H)
-        k_val = self.k_norm(k_val)
+        # k_val = self.k_norm(k_val)
         s_raw = z_mem[..., self.dim_memory :]
 
-        q_raw = self.q_norm(q_raw)
+        # q_raw = self.q_norm(q_raw)
         q_raw = q_raw.reshape(B, self.K_q, 1, self.H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -389,7 +389,10 @@ class SeqCondAttention(nn.Module):
         else:
             # Standard PyTorch path
             score_raw = self._score_scale_b * s_raw.float() + self._score_bias_b
-            p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(
+            # p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(
+            #     1e-6, 1000.0
+            # )
+            p_w = (F.softplus(score_raw) * torch.exp(log_time_weight)).clamp(
                 1e-6, 1000.0
             )
 
@@ -416,9 +419,10 @@ class SeqCondAttention(nn.Module):
             out_im = out_im_g.reshape(B, self.K, self.H).to(x_t.dtype)
             out_complex = torch.cat([out_re, out_im], dim=-1)
 
-        out_flat = out_complex.reshape(B, -1)
-        gate_for_norm = self.gate_proj(gate_logits)
-        out_normed = self.gated_norm(out_flat, gate_for_norm)
+        # out_flat = out_complex.reshape(B, -1)
+        # gate_for_norm = self.gate_proj(gate_logits)
+        # out_normed = self.gated_norm(out_flat, gate_for_norm)
+        out_normed = out_complex.reshape(B, -1)
         out_complex = out_normed.reshape(B, self.K, 2 * self.H)
 
         y_spec_raw = torch.einsum(

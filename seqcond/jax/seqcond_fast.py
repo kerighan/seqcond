@@ -94,7 +94,6 @@ class SeqCondAttention(nn.Module):
 
         # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
         dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
-        dim_gate = self.K
 
         # ======================================================================
         # 1. FUSED INPUT PROJECTION (Mamba-style single projection + conv)
@@ -104,7 +103,7 @@ class SeqCondAttention(nn.Module):
         dim_conv_total = (
             dim_mem_total + dim_query_total
         )  # Everything that goes through conv
-        dim_total = dim_conv_total + dim_skip + dim_gate
+        dim_total = dim_conv_total + dim_skip
 
         z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x)
         z_all = z_all.astype(self.compute_dtype)
@@ -112,7 +111,6 @@ class SeqCondAttention(nn.Module):
         # Split: conv_branch vs non-conv branches
         z_conv = z_all[..., :dim_conv_total]
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
-        gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
         # Single fused conv on mem+query (Mamba style)
         z_conv = nn.Conv(
@@ -131,7 +129,7 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         if mask is not None:
@@ -140,7 +138,7 @@ class SeqCondAttention(nn.Module):
             k_val = k_val * m
 
         # Process query branch
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -271,8 +269,7 @@ class SeqCondAttention(nn.Module):
         )
 
         # Softplus instead of exp for stability (Mamba-like)
-        # p_w_content = jax.nn.softplus(score_raw)
-        p_w_content = jax.nn.relu(score_raw) ** 2
+        p_w_content = jax.nn.softplus(score_raw)
 
         # Temporal weight with exp
         temporal_weight = jnp.exp(log_time_weight)
@@ -324,7 +321,6 @@ class SeqCondAttention(nn.Module):
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-            # den_flat = p_w  # (B, L, K)
 
             # Stack & Scan
             stack = jnp.concatenate([re_flat, im_flat], axis=-1)
@@ -359,7 +355,6 @@ class SeqCondAttention(nn.Module):
 
         out_re = out_re_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
-
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
@@ -370,18 +365,6 @@ class SeqCondAttention(nn.Module):
             nn.initializers.glorot_uniform(),
             (self.K, 2 * H, dim_swiglu_head),
         )
-
-        # Apply GatedRMSNorm to spectral output (Mamba2 style)
-        # gate_logits acts as the residual gate
-        out_complex_flat = out_complex.reshape(B, L, -1)
-        gate_for_norm = nn.Dense(
-            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
-        )(gate_logits)
-        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
-            out_complex_flat, gate_for_norm
-        )
-        out_complex = out_normed.reshape(B, L, self.K, 2 * H)
-
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
         # Skip connection: low-rank or full
@@ -396,12 +379,8 @@ class SeqCondAttention(nn.Module):
         y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
 
-        highway_scale = self.param(
-            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
-        )
-
-        y_val = y_spec_val + (y_skip_val * highway_scale)
-        y_gate = y_spec_gate + (y_skip_gate * highway_scale)
+        y_val = y_spec_val + y_skip_val
+        y_gate = y_spec_gate + y_skip_gate
 
         y_act = y_val * jax.nn.sigmoid(y_gate)
 
@@ -502,11 +481,11 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, self.K, H)
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         # Process query branch (matches __call__)
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]  # (B, K_q, 1, H, M)
 
@@ -626,7 +605,8 @@ class SeqCondAttention(nn.Module):
         # score_raw = jnp.clip(score_raw, -20.0, 20.0)
 
         # ReLU^2 (matches __call__)
-        p_w_content = jax.nn.relu(score_raw) ** 2
+        # p_w_content = jax.nn.relu(score_raw) ** 2
+        p_w_content = jax.nn.softplus(score_raw)
         temporal_weight = jnp.exp(log_time_weight)
         p_w = p_w_content * temporal_weight
         p_w = jnp.clip(p_w, 1e-6, 1000.0)

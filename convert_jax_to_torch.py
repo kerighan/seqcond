@@ -47,16 +47,22 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
     # Final norm is initialized with ones, no weights to copy
 
     # Blocks
+    model_type = get_config_value(config, "model_type", "seqcond")
     seqcond_ratio = get_config_value(config, "seqcond_ratio", 3)
+    if model_type == "transformer":
+        seqcond_ratio = 0
     transformer_idx = 0
     seqcond_idx = 0
 
     for i in range(get_config_value(config, "num_layers")):
         torch_prefix = f"blocks.{i}."
 
-        if (i + 1) % (seqcond_ratio + 1) == 0:
+        if model_type == "transformer" or (i + 1) % (seqcond_ratio + 1) == 0:
             # Transformer block
-            jax_key = f"transformer_block_{transformer_idx}"
+            if model_type == "transformer":
+                jax_key = f"transformer_block_{i}"
+            else:
+                jax_key = f"transformer_block_{transformer_idx}"
             jax_block = jax_params[jax_key]
             attn = jax_block["attn"]
 
@@ -196,8 +202,11 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
 
     # Detect skip_low_rank from checkpoint dimensions
     # If skip_up exists in first seqcond block, skip_low_rank=True
-    first_seqcond = jax_params["seqcond_block_0"]["SeqCondAttention_0"]
-    skip_low_rank = "skip_up" in first_seqcond
+    if model_type == "transformer":
+        skip_low_rank = False
+    else:
+        first_seqcond = jax_params["seqcond_block_0"]["SeqCondAttention_0"]
+        skip_low_rank = "skip_up" in first_seqcond
 
     # Create model config
     model_config = {
@@ -216,7 +225,7 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
         "conv_kernel_size": get_config_value(config, "conv_kernel_size", 4),
         "expand_factor": get_config_value(config, "expand_factor", 1),
         "out_expand_factor": get_config_value(config, "out_expand_factor", 3),
-        "seqcond_ratio": get_config_value(config, "seqcond_ratio", 3),
+        "seqcond_ratio": seqcond_ratio,
         "skip_low_rank": skip_low_rank,
         "num_anchor_heads": get_config_value(config, "num_anchor_heads", 0),
     }

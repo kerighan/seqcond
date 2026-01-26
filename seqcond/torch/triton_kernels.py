@@ -119,8 +119,10 @@ if TRITON_AVAILABLE:
         phase_scale = tl.load(phase_scale_ptr + k)
 
         score = score_scale * s_raw + score_bias
-        score_relu = tl.where(score > 0, score, 0.0)
-        p_w = score_relu * score_relu * tl.exp(log_tw)
+        score = tl.minimum(tl.maximum(score, -20.0), 20.0)
+        # Softplus: log(1 + exp(x)) - more stable than ReLU^2
+        p_w_content = tl.log(1.0 + tl.exp(score))
+        p_w = p_w_content * tl.exp(log_tw)
         p_w = tl.minimum(tl.maximum(p_w, 1e-6), 1000.0)
 
         # Update den_acc (only once per (b, k) - use h_block == 0)

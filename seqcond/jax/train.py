@@ -697,27 +697,59 @@ class Trainer:
 
         ckpt_path = self.load_checkpoint or self.resume_checkpoint
         if ckpt_path:
-            # Step 1: Process 0 loads the file (if it exists)
-            ckpt_data = None
-            if jax.process_index() == 0:
-                if os.path.exists(ckpt_path):
-                    print(f"[Process 0] Loading checkpoint from {ckpt_path}...")
-                    try:
-                        ckpt_data = load_checkpoint(ckpt_path)
-                    except Exception as e:
-                        print(f"[Process 0] Error loading checkpoint: {e}")
-                else:
-                    print(f"[Process 0] Warning: Checkpoint {ckpt_path} not found.")
+            # Detect where the checkpoint is visible (local filesystem differs per TPU worker)
+            local_exists = os.path.exists(ckpt_path)
+            try:
+                exists_flags = multihost_utils.process_allgather(
+                    jnp.asarray(int(local_exists), dtype=jnp.int32)
+                )
+                exists_flags_host = np.array(exists_flags)
+            except Exception:
+                exists_flags_host = None
 
-            # Step 2: Broadcast loaded data to all processes
-            # We broadcast the tuple: (params, config, step, opt_state) or None
-            # Note: broadcasting huge params via host-to-host might be slow but safe
-            ckpt_data = multihost_utils.broadcast_one_to_all(ckpt_data)
+            # Find which process has the checkpoint
+            loader_process = None
+            if exists_flags_host is not None and exists_flags_host.sum() > 0:
+                # Use the first process that has the file
+                loader_process = int(np.where(exists_flags_host == 1)[0][0])
+                if jax.process_index() == 0:
+                    print(f"Checkpoint found on process {loader_process}")
+            elif jax.process_index() == 0:
+                print(f"Warning: Checkpoint {ckpt_path} not found on any process")
+
+            # Step 1: The process that has the file loads it
+            ckpt_data = None
+            if loader_process is not None and jax.process_index() == loader_process:
+                abs_ckpt_path = os.path.abspath(ckpt_path)
+                print(
+                    f"[Process {loader_process}] Loading checkpoint from {ckpt_path}..."
+                )
+                print(f"[Process {loader_process}] Absolute path: {abs_ckpt_path}")
+                print(
+                    f"[Process {loader_process}] Current working directory: {os.getcwd()}"
+                )
+                try:
+                    ckpt_data = load_checkpoint(ckpt_path)
+                    print(f"[Process {loader_process}] Successfully loaded checkpoint")
+                except Exception as e:
+                    print(f"[Process {loader_process}] Error loading checkpoint: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+
+            # Step 2: Broadcast loaded data from loader_process to all processes
+            if loader_process is not None:
+                ckpt_data = multihost_utils.broadcast_one_to_all(
+                    ckpt_data, is_source=jax.process_index() == loader_process
+                )
+            else:
+                # No process has the file, broadcast None from process 0
+                ckpt_data = multihost_utils.broadcast_one_to_all(None)
 
             # Step 3: Apply loaded data (if valid)
             if ckpt_data is not None:
                 (ckpt_params, _, ckpt_step, ckpt_opt_state) = ckpt_data
-                
+
                 # Update params
                 self.params = ckpt_params
                 print("Weights loaded from checkpoint.")
@@ -729,7 +761,9 @@ class Trainer:
                     self.start_step = ckpt_step or 0
                     print(f"Resumed training state (step {self.start_step}).")
                 else:
-                    print("Starting training from scratch (ignoring checkpoint step/opt_state).")
+                    print(
+                        "Starting training from scratch (ignoring checkpoint step/opt_state)."
+                    )
 
                 # Validate parameter shapes
                 try:
@@ -748,10 +782,12 @@ class Trainer:
                 except KeyError:
                     pass
             else:
-                 # If we are here, it means Process 0 couldn't load the file
-                 if self.load_checkpoint:
-                     raise FileNotFoundError(f"Could not load required checkpoint: {self.load_checkpoint}")
-                 print("Starting from scratch (random init).")
+                # If we are here, it means Process 0 couldn't load the file
+                if self.load_checkpoint:
+                    raise FileNotFoundError(
+                        f"Could not load required checkpoint: {self.load_checkpoint}"
+                    )
+                print("Starting from scratch (random init).")
 
         if self.use_pmap:
             self.params = self._replicate_tree(self.params)

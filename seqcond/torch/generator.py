@@ -145,7 +145,12 @@ class TorchGenerator:
         verbose: bool = True,
         use_cuda_graph: bool = False,
         use_triton: bool = False,
+        use_synth_template: bool = True,
     ) -> str:
+
+        if use_synth_template:
+            prompt = "<|im_start|>user\n" + prompt + "\n<|im_end|>"
+            prompt += "<|im_start|>assistant\n<|think_start|>"
         tokens = self.tokenizer([prompt])[0]
 
         # Flag to indicate new generation (need to copy prefill states)
