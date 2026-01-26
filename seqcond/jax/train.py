@@ -1317,6 +1317,7 @@ def train(
     Returns:
         Trained model parameters
     """
+    print(f"[DEBUG train()] Creating Trainer...", flush=True)
     trainer = Trainer(
         config=config,
         data_loader=data_loader,
@@ -1325,5 +1326,7 @@ def train(
         resume_checkpoint=resume_checkpoint,
         load_checkpoint=load_checkpoint,
     )
+    print(f"[DEBUG train()] Calling trainer.setup()...", flush=True)
     trainer.setup(seed=seed)
+    print(f"[DEBUG train()] Calling trainer.train()...", flush=True)
     return trainer.train()
