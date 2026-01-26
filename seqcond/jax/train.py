@@ -1025,8 +1025,15 @@ class Trainer:
             if self.use_fsdp:
                 # In multi-host setup, each process has its own data shard
                 # Convert to jax arrays on local devices
+                if step == 1:
+                    print("[DEBUG] Converting batch to jnp arrays...", flush=True)
                 x = jnp.array(x_batch, dtype=jnp.int32)
                 y = jnp.array(y_batch, dtype=jnp.int32)
+                if step == 1:
+                    print(
+                        f"[DEBUG] Arrays created: x.shape={x.shape}, y.shape={y.shape}",
+                        flush=True,
+                    )
 
                 if grad_accum_steps > 1:
                     with self.mesh:
@@ -1057,6 +1064,8 @@ class Trainer:
                         accum_count = 0
                         macro_step += 1
                 else:
+                    if step == 1:
+                        print("[DEBUG] Calling _fsdp_train_step...", flush=True)
                     with self.mesh:
                         (
                             self.params,
@@ -1066,6 +1075,8 @@ class Trainer:
                         ) = self._fsdp_train_step(
                             self.params, self.opt_state, x, y, self._grad_mask
                         )
+                    if step == 1:
+                        print("[DEBUG] _fsdp_train_step completed", flush=True)
                     macro_step += 1
 
             elif self.use_pmap:
