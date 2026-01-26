@@ -321,16 +321,16 @@ class SeqCondAttention(nn.Module):
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-
-            # Accumulate denominator
-            den_acc = jnp.cumsum(p_w, axis=1)
+            den_flat = p_w  # (B, L, K)
 
             # Stack & Scan
-            stack = jnp.concatenate([re_flat, im_flat], axis=-1)
+            stack = jnp.concatenate([den_flat, re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
 
             # Unpack
-            re_acc_flat, im_acc_flat = jnp.split(cumsum, [flat_size], axis=-1)
+            den_acc, re_acc_flat, im_acc_flat = jnp.split(
+                cumsum, [self.K, self.K + flat_size], axis=-1
+            )
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
@@ -636,7 +636,7 @@ class SeqCondAttention(nn.Module):
         re_acc_new = re_acc + re
         im_acc_new = im_acc + im
 
-        # Normalization (matches __call__)
+        # Normalize
         inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
         inv_den = inv_den[..., None, None]
 
