@@ -946,7 +946,6 @@ class Trainer:
 
     def train(self):
         """Run training loop."""
-        print("[DEBUG Trainer.train()] Entered train method", flush=True)
         tc = self.train_config
         grad_accum_steps = tc.grad_accum_steps
 
@@ -969,12 +968,7 @@ class Trainer:
             last_tokens_seen = 0
             using_tf_data = True
         else:
-            print(
-                "[DEBUG Trainer.train()] Creating data iterator from DataLoader...",
-                flush=True,
-            )
             data_iterator = iter(self.data_loader)
-            print("[DEBUG Trainer.train()] Data iterator created", flush=True)
             using_tf_data = False
 
         # Training state
@@ -998,66 +992,16 @@ class Trainer:
             if step > tc.total_steps * grad_accum_steps:
                 break
 
-            if step <= 15:
-                print(
-                    f"[DEBUG] Step {step}: fetching batch (process {jax.process_index()})...",
-                    flush=True,
-                )
-
             try:
-                # Only process 0 loads data from HuggingFace, then broadcasts to all
-                if jax.process_index() == 0:
-                    if step <= 15:
-                        print(f"[DEBUG] Process 0 loading batch {step}...", flush=True)
-                    if using_tf_data:
-                        x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
-                        tokens_seen += real_tokens_in_batch
-                    else:
-                        x_batch, y_batch = next(data_iterator)
-                    if step <= 15:
-                        print(
-                            f"[DEBUG] Process 0 loaded batch {step}: x_batch.shape={x_batch.shape}",
-                            flush=True,
-                        )
-                    # Signal that data is valid (not exhausted)
-                    data_valid = np.array([1], dtype=np.int32)
+                if using_tf_data:
+                    x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
+                    tokens_seen += real_tokens_in_batch
                 else:
-                    # Other processes create placeholder arrays and wait for broadcast
-                    if step <= 15:
-                        print(
-                            f"[DEBUG] Process {jax.process_index()} waiting for broadcast...",
-                            flush=True,
-                        )
-                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-                    data_valid = np.array([0], dtype=np.int32)
-
-                # Broadcast from process 0 to all processes
-                x_batch = multihost_utils.broadcast_one_to_all(x_batch)
-                y_batch = multihost_utils.broadcast_one_to_all(y_batch)
-                data_valid = multihost_utils.broadcast_one_to_all(data_valid)
-
-                if step == 1:
-                    print(
-                        f"[DEBUG] After broadcast: x_batch.shape={x_batch.shape}",
-                        flush=True,
-                    )
+                    x_batch, y_batch = next(data_iterator)
 
             except StopIteration:
-                # Process 0 signals exhaustion
-                if jax.process_index() == 0:
-                    data_valid = np.array([0], dtype=np.int32)
-                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-                else:
-                    data_valid = np.array([0], dtype=np.int32)
-                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
-
-                data_valid = multihost_utils.broadcast_one_to_all(data_valid)
-                if data_valid[0] == 0:
-                    print("Data loader exhausted.")
-                    break
+                print("Data loader exhausted.")
+                break
 
             metrics_batch = None
             grad_norm_value = None
@@ -1065,15 +1009,8 @@ class Trainer:
             if self.use_fsdp:
                 # In multi-host setup, each process has its own data shard
                 # Convert to jax arrays on local devices
-                if step == 1:
-                    print("[DEBUG] Converting batch to jnp arrays...", flush=True)
                 x = jnp.array(x_batch, dtype=jnp.int32)
                 y = jnp.array(y_batch, dtype=jnp.int32)
-                if step == 1:
-                    print(
-                        f"[DEBUG] Arrays created: x.shape={x.shape}, y.shape={y.shape}",
-                        flush=True,
-                    )
 
                 if grad_accum_steps > 1:
                     with self.mesh:
@@ -1104,8 +1041,6 @@ class Trainer:
                         accum_count = 0
                         macro_step += 1
                 else:
-                    if step == 1:
-                        print("[DEBUG] Calling _fsdp_train_step...", flush=True)
                     with self.mesh:
                         (
                             self.params,
@@ -1114,11 +1049,6 @@ class Trainer:
                             grad_norm_value,
                         ) = self._fsdp_train_step(
                             self.params, self.opt_state, x, y, self._grad_mask
-                        )
-                    if step <= 5:
-                        print(
-                            f"[DEBUG] _fsdp_train_step completed, macro_step={macro_step+1}",
-                            flush=True,
                         )
                     macro_step += 1
 
@@ -1386,7 +1316,6 @@ def train(
     Returns:
         Trained model parameters
     """
-    print(f"[DEBUG train()] Creating Trainer...", flush=True)
     trainer = Trainer(
         config=config,
         data_loader=data_loader,
@@ -1395,7 +1324,5 @@ def train(
         resume_checkpoint=resume_checkpoint,
         load_checkpoint=load_checkpoint,
     )
-    print(f"[DEBUG train()] Calling trainer.setup()...", flush=True)
     trainer.setup(seed=seed)
-    print(f"[DEBUG train()] Calling trainer.train()...", flush=True)
     return trainer.train()
