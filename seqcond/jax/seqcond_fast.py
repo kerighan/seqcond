@@ -291,9 +291,9 @@ class SeqCondAttention(nn.Module):
 
             # Einsum Accumulation
             # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            den_acc = jnp.einsum(
-                "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
-            )
+            # den_acc = jnp.einsum(
+            #     "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
+            # )
 
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
@@ -309,25 +309,23 @@ class SeqCondAttention(nn.Module):
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-            den_flat = p_w  # (B, L, K)
+            # den_flat = p_w  # (B, L, K)
 
             # Stack & Scan
-            stack = jnp.concatenate([den_flat, re_flat, im_flat], axis=-1)
+            stack = jnp.concatenate([re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
 
             # Unpack
-            den_acc, re_acc_flat, im_acc_flat = jnp.split(
-                cumsum, [self.K, self.K + flat_size], axis=-1
-            )
+            re_acc_flat, im_acc_flat = jnp.split(cumsum, [flat_size], axis=-1)
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
         # Normalisation removed to preserve energy
-        inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
-        inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
+        # inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
+        # inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
 
-        state_re = re_acc * inv_den
-        state_im = im_acc * inv_den
+        state_re = re_acc
+        state_im = im_acc
 
         # ======================================================================
         # 4. READOUT & GQA & INTEGRATION
@@ -337,11 +335,8 @@ class SeqCondAttention(nn.Module):
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
-        # scale = 1 / jnp.array(H, dtype=jnp.float32)  # = 1/H
-        scale = 1
-
-        match_re = (state_re_g * q_re + state_im_g * q_im) * scale
-        match_im = (state_im_g * q_re - state_re_g * q_im) * scale
+        match_re = state_re_g * q_re + state_im_g * q_im
+        match_im = state_im_g * q_re - state_re_g * q_im
 
         out_re_g = jnp.sum(match_re * w_int, axis=-1)
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
@@ -361,7 +356,7 @@ class SeqCondAttention(nn.Module):
             (self.K, 2 * H, dim_swiglu_head),
         )
 
-        out_complex_flat = out_complex.reshape(B, L, -1)
+        out_complex_flat = out_complex.reshape(B, L, -1).astype(jnp.float32)
         variance = jnp.mean(out_complex_flat**2, axis=-1, keepdims=True)
         out_complex_flat = out_complex_flat * jax.lax.rsqrt(variance + 1e-4)
         complex_weight = self.param(
@@ -623,11 +618,11 @@ class SeqCondAttention(nn.Module):
         im_acc_new = im_acc + im
 
         # Normalize by denominator
-        inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
-        inv_den = inv_den[..., None, None]  # (B, K, 1, 1)
+        # inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
+        # inv_den = inv_den[..., None, None]  # (B, K, 1, 1)
 
-        state_re = re_acc_new * inv_den
-        state_im = im_acc_new * inv_den
+        state_re = re_acc_new
+        state_im = im_acc_new
 
         # RMSNorm on states (must match __call__)
         state_re = nn.RMSNorm(dtype=self.compute_dtype, name="state_re_norm")(state_re)
