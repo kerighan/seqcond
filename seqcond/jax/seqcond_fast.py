@@ -360,8 +360,11 @@ class SeqCondAttention(nn.Module):
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
+        # Normalize spectral output for stability
+        out_complex = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(out_complex)
+
         # ======================================================================
-        # 5. FUSION FINALE with GatedRMSNorm
+        # 5. FUSION FINALE
         # ======================================================================
         W_readout = self.param(
             "W_readout",
@@ -683,6 +686,9 @@ class SeqCondAttention(nn.Module):
 
         # Concatenate (not stack!) to match __call__
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)  # (B, K, 2*H)
+
+        # Normalize spectral output for stability (matches __call__)
+        out_complex = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(out_complex)
 
         # Readout
         W_readout = self.param(
