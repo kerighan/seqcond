@@ -93,7 +93,7 @@ class SeqCondAttention(nn.Module):
         dim_swiglu_total = self.K * dim_swiglu_head
 
         # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
-        dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
+        dim_skip = dim_swiglu_total
         # ======================================================================
         # 1. FUSED INPUT PROJECTION (Mamba-style single projection + conv)
         # ======================================================================
@@ -364,6 +364,14 @@ class SeqCondAttention(nn.Module):
         out_complex_flat = out_complex.reshape(B, L, -1)
         variance = jnp.mean(out_complex_flat**2, axis=-1, keepdims=True)
         out_complex_flat = out_complex_flat * jax.lax.rsqrt(variance + 1e-4)
+        complex_weight = self.param(
+            "complex_weight",
+            nn.initializers.ones,
+            (out_complex_flat.shape[-1],),
+        )
+        out_complex_flat = (out_complex_flat * complex_weight).astype(
+            self.compute_dtype
+        )
         out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
@@ -424,7 +432,7 @@ class SeqCondAttention(nn.Module):
         dim_swiglu_total = self.K * dim_swiglu_head
 
         # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
-        dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
+        dim_skip = dim_swiglu_total
 
         # Unpack state (now with single fused conv buffer)
         den_acc, re_acc, im_acc, pos, conv_buffer = state
@@ -672,12 +680,7 @@ class SeqCondAttention(nn.Module):
         y_spec_raw = jnp.einsum("bkf,kfn->bkn", out_complex, W_readout)
 
         # Skip connection
-        if self.skip_low_rank:
-            y_skip_raw = nn.Dense(dim_swiglu_total, use_bias=False, name="skip_up")(
-                c_skip
-            )
-        else:
-            y_skip_raw = c_skip
+        y_skip_raw = c_skip
         y_skip = y_skip_raw.reshape(B, self.K, dim_swiglu_head)
 
         y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
