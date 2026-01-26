@@ -191,13 +191,6 @@ class SeqCondAttention(nn.Module):
                 (1, 1, self.K, H, 1),
             )
             theta = 0.001 + 2.999 * jax.nn.sigmoid(theta_raw).astype(jnp.float32)
-
-            # Poids d'intégration appris (initialisés à 1)
-            w_int_raw = self.param(
-                "w_int_raw", nn.initializers.zeros, (1, 1, self.K_q, self.n_rep, H, 1)
-            )
-            w_int_raw_clipped = jnp.clip(w_int_raw, -5.0, 5.0)  # Prevent exp overflow
-            w_int = jnp.exp(w_int_raw_clipped).astype(jnp.float32)  # Toujours positif
         else:
             # Use lambda with shape to avoid closure capture
             theta_d_raw = self.param(
@@ -224,15 +217,11 @@ class SeqCondAttention(nn.Module):
             total_sum = theta_accum[..., -1:]
             theta = 0.001 + (theta_accum / total_sum) * scale_range
 
-            dtheta_raw = theta_accum[..., 1:] - theta_accum[..., :-1]
-            dtheta = dtheta_raw * (scale_range / total_sum)
-
-            w0 = dtheta[..., :1] * 0.5
-            w_mid = 0.5 * (dtheta[..., :-1] + dtheta[..., 1:])
-            wL = dtheta[..., -1:] * 0.5
-
-            w_int = jnp.concatenate([w0, w_mid, wL], axis=-1)
-            w_int = w_int.reshape(1, 1, self.K_q, self.n_rep, H, self.M)
+        # Learnable integration weights (independent of theta)
+        w_int_raw = self.param(
+            "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
+        )
+        w_int = jax.nn.softplus(w_int_raw).astype(jnp.float32)
 
         # ======================================================================
         # 3. MODULATION & SCAN UNIFIÉ (MATRIX vs LINEAR)
@@ -647,15 +636,10 @@ class SeqCondAttention(nn.Module):
         state_im_grouped = state_im.reshape(B, self.K_q, self.n_rep, H, self.M)
 
         # w_int for integration (must match __call__)
-        if self.M == 1:
-            w_int_raw = self.param(
-                "w_int_raw", nn.initializers.zeros, (1, 1, self.K_q, self.n_rep, H, 1)
-            )
-            w_int_raw_clipped = jnp.clip(w_int_raw, -5.0, 5.0)
-            w_int = jnp.exp(w_int_raw_clipped).astype(jnp.float32)
-        else:
-            # w_int_m was computed above in the theta block
-            w_int = w_int_m
+        w_int_raw = self.param(
+            "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
+        )
+        w_int = jax.nn.softplus(w_int_raw).astype(jnp.float32)
 
         # Remove batch/seq dims from w_int for step
         w_int_step = w_int[0, 0]  # (K_q, n_rep, H, M)
