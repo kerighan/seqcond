@@ -1075,8 +1075,11 @@ class Trainer:
                         ) = self._fsdp_train_step(
                             self.params, self.opt_state, x, y, self._grad_mask
                         )
-                    if step == 1:
-                        print("[DEBUG] _fsdp_train_step completed", flush=True)
+                    if step <= 5:
+                        print(
+                            f"[DEBUG] _fsdp_train_step completed, macro_step={macro_step+1}",
+                            flush=True,
+                        )
                     macro_step += 1
 
             elif self.use_pmap:
