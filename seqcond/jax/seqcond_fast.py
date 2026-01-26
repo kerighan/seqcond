@@ -364,7 +364,7 @@ class SeqCondAttention(nn.Module):
             nn.initializers.ones,
             (out_complex_flat.shape[-1],),
         )
-        out_complex_flat = (out_complex_flat * complex_weight).astype(
+        out_complex_flat = (0.001 * out_complex_flat * complex_weight).astype(
             self.compute_dtype
         )
         out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
