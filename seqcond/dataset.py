@@ -323,10 +323,21 @@ def _iterate_fineweb_docs(
     docs_processed = 0
 
     for item in dataset:
-
         text = item.get("text", "")
+
+        # Debug: print first few docs
+        if docs_processed < 3:
+            print(
+                f"[FineWeb doc {docs_processed}] len={len(text)}, preview: {text[:200]!r}...",
+                flush=True,
+            )
+
         tokens = tok.encode(text)
         docs_processed += 1
+
+        if docs_processed % 1000 == 0:
+            print(f"[FineWeb] Processed {docs_processed:,} docs", flush=True)
+
         yield tokens
 
     print(f"[dataset] FineWeb document stream exhausted after {docs_processed:,} docs")
