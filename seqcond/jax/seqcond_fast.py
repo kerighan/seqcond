@@ -119,7 +119,7 @@ class SeqCondAttention(nn.Module):
 
         # Process memory branch
         k_val = z_mem[..., :dim_memory].reshape(B, L, self.K, H)
-        k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
+        # k_val = nn.RMSNorm(dtype=self.compute_dtype, name="k_norm")(k_val)
         s_raw = z_mem[..., dim_memory:]
 
         if mask is not None:
@@ -128,7 +128,7 @@ class SeqCondAttention(nn.Module):
             k_val = k_val * m
 
         # Process query branch
-        q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
+        # q_raw = nn.RMSNorm(dtype=self.compute_dtype, name="q_norm")(q_raw)
         q_raw = q_raw.reshape(B, L, self.K_q, 1, H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -320,8 +320,9 @@ class SeqCondAttention(nn.Module):
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
-        match_re = state_re_g * q_re + state_im_g * q_im
-        match_im = state_im_g * q_re - state_re_g * q_im
+        scale = jax.lax.rsqrt(jnp.array(H, dtype=jnp.float32))
+        match_re = (state_re_g * q_re + state_im_g * q_im) * scale
+        match_im = (state_im_g * q_re - state_re_g * q_im) * scale
 
         out_re_g = jnp.sum(match_re * w_int, axis=-1)
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
