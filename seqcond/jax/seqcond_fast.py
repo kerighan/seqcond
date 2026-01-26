@@ -209,7 +209,7 @@ class SeqCondAttention(nn.Module):
         w_int_raw = self.param(
             "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
         )
-        w_int = jax.nn.softplus(w_int_raw).astype(jnp.float32)
+        w_int = jnp.exp(w_int_raw).astype(jnp.float32)
         w_int /= jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6
 
         # ======================================================================
@@ -333,20 +333,34 @@ class SeqCondAttention(nn.Module):
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)
 
         # ======================================================================
-        # 5. FUSION FINALE with GatedRMSNorm (gate from x)
+        # 5. FUSION FINALE with GatedRMSNorm + SwiGLU (no skip)
         # ======================================================================
         out_complex_flat = out_complex.reshape(B, L, -1)
 
-        # Gate projection from x (no new skip params needed)
+        # GatedRMSNorm with gate from x
         gate_for_norm = nn.Dense(
             out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
         )(x)
         out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
             out_complex_flat, gate_for_norm
         )
+        out_complex = out_normed.reshape(B, L, self.K, 2 * H)
 
-        # Direct output projection (no swiglu, no skip)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(out_normed)
+        # Readout to SwiGLU dimension
+        W_readout = self.param(
+            "W_readout",
+            nn.initializers.glorot_uniform(),
+            (self.K, 2 * H, dim_swiglu_head),
+        )
+        y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
+
+        # SwiGLU activation (no skip/highway)
+        y_val, y_gate = jnp.split(y_spec_raw, 2, axis=-1)
+        y_act = y_val * jax.nn.sigmoid(y_gate)
+
+        # Output projection
+        y_flat = y_act.reshape(B, L, -1)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
@@ -618,9 +632,23 @@ class SeqCondAttention(nn.Module):
         out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
             out_complex_flat, gate_for_norm
         )
+        out_complex = out_normed.reshape(B, self.K, 2 * H)
 
-        # Direct output projection (no swiglu, no skip)
-        out = nn.Dense(D, use_bias=False, name="out_proj")(out_normed)
+        # Readout to SwiGLU dimension (matches __call__)
+        W_readout = self.param(
+            "W_readout",
+            nn.initializers.glorot_uniform(),
+            (self.K, 2 * H, dim_swiglu_head),
+        )
+        y_spec_raw = jnp.einsum("bkf,kfn->bkn", out_complex, W_readout)
+
+        # SwiGLU activation (no skip/highway)
+        y_val, y_gate = jnp.split(y_spec_raw, 2, axis=-1)
+        y_act = y_val * jax.nn.sigmoid(y_gate)
+
+        # Output projection
+        y_flat = y_act.reshape(B, -1)
+        out = nn.Dense(D, use_bias=False, name="out_proj")(y_flat)
 
         if self.dropout > 0:
             out = nn.Dropout(self.dropout)(out, deterministic=deterministic)
