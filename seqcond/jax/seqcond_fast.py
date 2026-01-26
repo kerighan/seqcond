@@ -334,9 +334,6 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
 
         # Normalize states before readout to prevent explosion
-        state_re = nn.RMSNorm(dtype=self.compute_dtype, name="state_re_norm")(state_re)
-        state_im = nn.RMSNorm(dtype=self.compute_dtype, name="state_im_norm")(state_im)
-
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
@@ -347,6 +344,10 @@ class SeqCondAttention(nn.Module):
 
         out_re_g = jnp.sum(match_re * w_int, axis=-1)
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
+
+        # Normalize before fusion
+        out_re_g = nn.RMSNorm(dtype=self.compute_dtype, name="out_re_g_norm")(out_re_g)
+        out_im_g = nn.RMSNorm(dtype=self.compute_dtype, name="out_im_g_norm")(out_im_g)
 
         out_re = out_re_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
         out_im = out_im_g.reshape(B, L, self.K, H).astype(self.compute_dtype)
