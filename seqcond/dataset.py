@@ -260,8 +260,7 @@ def iterate_fineweb(
     if tok is None:
         tok = tokenizer
 
-    # NOTE: No document-level sharding for FineWeb - all hosts see all documents.
-    # Sharding happens at batch level in DataLoader/training loop.
+    # Document-level sharding: each process takes every Nth document
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         name="sample-100BT",
@@ -284,7 +283,7 @@ def iterate_fineweb(
     chunks_yielded = 0
     total_tokens_from_docs = 0
 
-    for doc_tokens in _iterate_fineweb_docs(dataset, tok=tok):
+    for doc_tokens in _iterate_fineweb_docs(dataset, tok=tok, shard_data=shard_data):
         if not doc_tokens:
             continue
 
@@ -313,16 +312,28 @@ def iterate_fineweb(
 def _iterate_fineweb_docs(
     dataset: Iterable,
     tok: Optional[Tokenizer] = None,
+    shard_data: bool = True,
 ) -> Iterator[List[int]]:
     """Iterate over FineWeb documents.
 
     Yields tokenized documents until the dataset is exhausted.
-    Sharded across processes.
+    Sharded across processes when shard_data=True.
     """
     tok = tok or tokenizer
     docs_processed = 0
 
+    # Get process info for sharding
+    process_index, process_count = _maybe_init_jax_process_info(shard_data)
+    dataset_idx = 0
+
     for item in dataset:
+        # Shard data: each process takes every Nth document
+        current_idx = dataset_idx
+        dataset_idx += 1
+
+        if current_idx % process_count != process_index:
+            continue
+
         text = item.get("text", "")
 
         try:
@@ -338,7 +349,9 @@ def _iterate_fineweb_docs(
                 )
             continue
 
-    print(f"[dataset] FineWeb document stream exhausted after {docs_processed:,} docs")
+    print(
+        f"[dataset] FineWeb document stream exhausted after {docs_processed:,} docs (process {process_index}/{process_count})"
+    )
 
 
 def fineweb_data_generator(
