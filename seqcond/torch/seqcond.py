@@ -199,14 +199,27 @@ class SeqCondAttention(nn.Module):
         re = kvw * torch.cos(phi)
         im = kvw * torch.sin(phi)
 
-        stack = torch.cat([re.reshape(B, L, -1), im.reshape(B, L, -1)], dim=-1)
-        cumsum = torch.cumsum(stack, dim=1)
+        # Accumulate with denominator
         flat_size = self.K * self.H * self.M
-        re_acc = cumsum[..., :flat_size].reshape(B, L, self.K, self.H, self.M)
-        im_acc = cumsum[..., flat_size:].reshape(B, L, self.K, self.H, self.M)
+        den_flat = p_w.float()  # (B, L, K)
+        stack = torch.cat(
+            [den_flat, re.reshape(B, L, -1), im.reshape(B, L, -1)], dim=-1
+        )
+        cumsum = torch.cumsum(stack, dim=1)
+        den_acc = cumsum[..., : self.K]
+        re_acc = cumsum[..., self.K : self.K + flat_size].reshape(
+            B, L, self.K, self.H, self.M
+        )
+        im_acc = cumsum[..., self.K + flat_size :].reshape(B, L, self.K, self.H, self.M)
 
-        state_re_g = re_acc.reshape(B, L, self.K_q, self.n_rep, self.H, self.M)
-        state_im_g = im_acc.reshape(B, L, self.K_q, self.n_rep, self.H, self.M)
+        # Normalize by accumulated denominator
+        inv_den = 1.0 / torch.clamp(den_acc, min=1e-4)
+        inv_den = inv_den.unsqueeze(-1).unsqueeze(-1)  # (B, L, K, 1, 1)
+        state_re = re_acc * inv_den
+        state_im = im_acc * inv_den
+
+        state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, self.H, self.M)
+        state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, self.H, self.M)
 
         # Scale by 1/sqrt(H) (matches JAX)
         scale = 1.0 / (self.H**0.5)
@@ -384,8 +397,14 @@ class SeqCondAttention(nn.Module):
             re_acc.add_(re)
             im_acc.add_(im)
 
-            state_re_g = re_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
-            state_im_g = im_acc.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+            # Normalize by accumulated denominator
+            inv_den = 1.0 / torch.clamp(den_acc, min=1e-4)
+            inv_den = inv_den.unsqueeze(-1).unsqueeze(-1)  # (B, K, 1, 1)
+            state_re = re_acc * inv_den
+            state_im = im_acc * inv_den
+
+            state_re_g = state_re.reshape(B, self.K_q, self.n_rep, self.H, self.M)
+            state_im_g = state_im.reshape(B, self.K_q, self.n_rep, self.H, self.M)
             # Scale by 1/sqrt(H) (matches JAX)
             scale = 1.0 / (self.H**0.5)
             match_re = ((state_re_g * q_re + state_im_g * q_im) * scale).float()

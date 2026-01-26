@@ -280,6 +280,9 @@ class SeqCondAttention(nn.Module):
             mask_idx = jnp.arange(L)[:, None] >= jnp.arange(L)[None, :]
             causal_mask = mask_idx.astype(jnp.float32)
 
+            # Accumulate denominator
+            den_acc = jnp.einsum("ts,bsk->btk", causal_mask, p_w.astype(jnp.float32))
+
             # Stack RE/IM for single einsum - accumulate in fp32
             # (B, L, K, H, M, 2)
             stack_ri = jnp.stack([re, im], axis=-1).astype(jnp.float32)
@@ -288,29 +291,31 @@ class SeqCondAttention(nn.Module):
 
             re_acc = acc_ri[..., 0]
             im_acc = acc_ri[..., 1]
-
         else:
             # PATH 2: O(L) Linear Scan (Memory Optimized)
             # Use fp32 for accumulation to avoid precision issues
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size).astype(jnp.float32)
             im_flat = im.reshape(B, L, flat_size).astype(jnp.float32)
+            den_flat = p_w.astype(jnp.float32)  # (B, L, K)
 
             # Stack & Scan in fp32
-            stack = jnp.concatenate([re_flat, im_flat], axis=-1)
+            stack = jnp.concatenate([den_flat, re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
 
             # Unpack
-            re_acc_flat, im_acc_flat = jnp.split(cumsum, [flat_size], axis=-1)
+            den_acc, re_acc_flat, im_acc_flat = jnp.split(
+                cumsum, [self.K, self.K + flat_size], axis=-1
+            )
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
-        # Normalisation removed to preserve energy
-        # inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
-        # inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
+        # Normalize by accumulated denominator
+        inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
+        inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
 
-        state_re = re_acc
-        state_im = im_acc
+        state_re = re_acc * inv_den
+        state_im = im_acc * inv_den
 
         # ======================================================================
         # 4. READOUT & GQA & INTEGRATION
@@ -583,12 +588,12 @@ class SeqCondAttention(nn.Module):
         re_acc_new = re_acc + re
         im_acc_new = im_acc + im
 
-        # Normalize by denominator
-        # inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
-        # inv_den = inv_den[..., None, None]  # (B, K, 1, 1)
+        # Normalize by accumulated denominator
+        inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
+        inv_den = inv_den[..., None, None]  # (B, K, 1, 1)
 
-        state_re = re_acc_new
-        state_im = im_acc_new
+        state_re = re_acc_new * inv_den
+        state_im = im_acc_new * inv_den
 
         # Group state for GQA: (B, K, H, M) -> (B, K_q, n_rep, H, M)
         state_re_grouped = state_re.reshape(B, self.K_q, self.n_rep, H, self.M)
@@ -598,8 +603,9 @@ class SeqCondAttention(nn.Module):
         w_int_raw = self.param(
             "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
         )
-        w_int = jnp.exp(w_int_raw).astype(jnp.float32)
-        w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
+        # w_int = jnp.exp(w_int_raw).astype(jnp.float32)
+        # w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
+        w_int = jax.nn.softmax(w_int_raw.astype(jnp.float32), axis=-1)
 
         # Remove batch/seq dims from w_int for step
         w_int_step = w_int[0, 0]  # (K_q, n_rep, H, M)
