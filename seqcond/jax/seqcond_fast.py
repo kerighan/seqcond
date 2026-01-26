@@ -268,7 +268,7 @@ class SeqCondAttention(nn.Module):
             + score_bias[None, None, :]
         )
 
-        # Softplus instead of exp for stability (Mamba-like)
+        # Softplus instead of ReLU^2 for stability (Mamba-like)
         p_w_content = jax.nn.softplus(score_raw)
 
         # Temporal weight with exp

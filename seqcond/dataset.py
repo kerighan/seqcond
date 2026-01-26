@@ -325,20 +325,18 @@ def _iterate_fineweb_docs(
     for item in dataset:
         text = item.get("text", "")
 
-        # Debug: print first few docs
-        if docs_processed < 3:
-            print(
-                f"[FineWeb doc {docs_processed}] len={len(text)}, preview: {text[:200]!r}...",
-                flush=True,
-            )
-
-        tokens = tok.encode(text)
-        docs_processed += 1
-
-        if docs_processed % 1000 == 0:
-            print(f"[FineWeb] Processed {docs_processed:,} docs", flush=True)
-
-        yield tokens
+        try:
+            tokens = tok.encode(text)
+            docs_processed += 1
+            yield tokens
+        except Exception as e:
+            # Skip corrupt documents (e.g., encoding errors, disallowed tokens)
+            if docs_processed % 1000 == 0:
+                print(
+                    f"[FineWeb] Warning: Skipping corrupt document (error: {e})",
+                    flush=True,
+                )
+            continue
 
     print(f"[dataset] FineWeb document stream exhausted after {docs_processed:,} docs")
 

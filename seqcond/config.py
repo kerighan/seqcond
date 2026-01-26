@@ -114,7 +114,8 @@ class ModelConfig:
             d_ff=int(8 * 1024 / 3),
             num_layers=24,
             num_heads=16,
-            seqcond_heads=32,
+            seqcond_heads=16,
+            seqcond_query_heads=16,
             num_kv_heads=4,
         )
         defaults.update(kwargs)
