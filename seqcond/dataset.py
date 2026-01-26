@@ -264,7 +264,7 @@ def iterate_fineweb(
     # Sharding happens at batch level in DataLoader/training loop.
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
-        name="sample-350BT",
+        name="sample-100BT",
         split="train",
         streaming=True,
     )
