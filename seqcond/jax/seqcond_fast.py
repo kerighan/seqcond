@@ -104,7 +104,7 @@ class SeqCondAttention(nn.Module):
         dim_conv_total = (
             dim_mem_total + dim_query_total
         )  # Everything that goes through conv
-        dim_total = dim_conv_total + dim_skip + dim_gate
+        dim_total = dim_conv_total + dim_skip
 
         z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x)
         z_all = z_all.astype(self.compute_dtype)
@@ -112,7 +112,7 @@ class SeqCondAttention(nn.Module):
         # Split: conv_branch vs non-conv branches
         z_conv = z_all[..., :dim_conv_total]
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
-        gate_logits = z_all[..., dim_conv_total + dim_skip :]
+        # gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
         # Single fused conv on mem+query (Mamba style)
         z_conv = nn.Conv(
@@ -294,9 +294,9 @@ class SeqCondAttention(nn.Module):
 
             # Einsum Accumulation
             # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            # den_acc = jnp.einsum(
-            #    "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
-            # )
+            den_acc = jnp.einsum(
+                "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
+            )
 
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
@@ -312,23 +312,25 @@ class SeqCondAttention(nn.Module):
             flat_size = self.K * H * self.M
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
-            # den_flat = p_w  # (B, L, K)
+            den_flat = p_w  # (B, L, K)
 
             # Stack & Scan
-            stack = jnp.concatenate([re_flat, im_flat], axis=-1)
+            stack = jnp.concatenate([den_flat, re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
 
             # Unpack
-            re_acc_flat, im_acc_flat = jnp.split(cumsum, [flat_size], axis=-1)
+            den_acc, re_acc_flat, im_acc_flat = jnp.split(
+                cumsum, [self.K, self.K + flat_size], axis=-1
+            )
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
         # Normalisation removed to preserve energy
-        # inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
-        # inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
+        inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
+        inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
 
-        state_re = re_acc
-        state_im = im_acc
+        state_re = re_acc * inv_den
+        state_im = im_acc * inv_den
 
         # ======================================================================
         # 4. READOUT & GQA & INTEGRATION
@@ -337,8 +339,10 @@ class SeqCondAttention(nn.Module):
         state_re_g = state_re.reshape(B, L, self.K_q, self.n_rep, H, self.M)
         state_im_g = state_im.reshape(B, L, self.K_q, self.n_rep, H, self.M)
 
-        match_re = state_re_g * q_re + state_im_g * q_im
-        match_im = state_im_g * q_re - state_re_g * q_im
+        scale = jax.lax.rsqrt(jnp.array(H, dtype=jnp.float32))  # = 1/sqrt(H)
+
+        match_re = (state_re_g * q_re + state_im_g * q_im) * scale
+        match_im = (state_im_g * q_re - state_re_g * q_im) * scale
 
         out_re_g = jnp.sum(match_re * w_int, axis=-1)
         out_im_g = jnp.sum(match_im * w_int, axis=-1)
@@ -360,13 +364,16 @@ class SeqCondAttention(nn.Module):
         # Apply GatedRMSNorm to spectral output (Mamba2 style)
         # gate_logits acts as the residual gate
         out_complex_flat = out_complex.reshape(B, L, -1)
-        gate_for_norm = nn.Dense(
-            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
-        )(gate_logits)
-        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
-            out_complex_flat, gate_for_norm
+        out_complex_flat = RMSNorm(dtype=self.compute_dtype, name="out_norm")(
+            out_complex_flat
         )
-        out_complex = out_normed.reshape(B, L, self.K, 2 * H)
+        # gate_for_norm = nn.Dense(
+        #     out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
+        # )(gate_logits)
+        # out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+        #     out_complex_flat, gate_for_norm
+        # )
+        out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
