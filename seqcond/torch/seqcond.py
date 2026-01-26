@@ -58,10 +58,9 @@ class SeqCondAttention(nn.Module):
         self.dim_swiglu_head = self.dim_expand * 2
         self.dim_swiglu_total = self.K * self.dim_swiglu_head
         self.dim_skip = d_model // 4 if skip_low_rank else self.dim_swiglu_total
-        self.dim_gate = self.K
         self.dim_mem_total = self.dim_memory + self.K
         self.dim_conv_total = self.dim_mem_total + self.dim_query_total
-        self.dim_total = self.dim_conv_total + self.dim_skip + self.dim_gate
+        self.dim_total = self.dim_conv_total + self.dim_skip
 
         self.in_proj = nn.Linear(d_model, self.dim_total, bias=False)
         # Depthwise conv (matches JAX nn.Conv with feature_group_count)
@@ -78,8 +77,9 @@ class SeqCondAttention(nn.Module):
         self.register_buffer("_phase_scale_b", None)
         self.register_buffer("_score_scale_b", None)
         self.register_buffer("_score_bias_b", None)
-        self.k_norm = RMSNorm(self.H)
-        self.q_norm = RMSNorm(self.dim_query_total)
+        # k_norm and q_norm removed (not needed after simplification)
+        # self.k_norm = RMSNorm(self.H)
+        # self.q_norm = RMSNorm(self.dim_query_total)
 
         if self.M == 1:
             init_theta = np.geomspace(0.001, 3.0, self.K).reshape(1, 1, self.K, 1, 1)
@@ -125,11 +125,8 @@ class SeqCondAttention(nn.Module):
             torch.empty(self.K, 2 * self.H, self.dim_swiglu_head)
         )
         nn.init.xavier_uniform_(self.W_readout)
-        self.gate_proj = nn.Linear(self.dim_gate, self.K * 2 * self.H, bias=False)
-        self.gated_norm = GatedRMSNorm(self.K * 2 * self.H)
         if skip_low_rank:
             self.skip_up = nn.Linear(self.dim_skip, self.dim_swiglu_total, bias=False)
-        self.highway_scale = nn.Parameter(torch.ones(1, 1, self.K, 1))
         self.out_proj = nn.Linear(self.dim_swiglu_total // 2, d_model, bias=False)
 
     def forward(
@@ -141,8 +138,7 @@ class SeqCondAttention(nn.Module):
         B, L, D = x.shape
         z_all = self.in_proj(x)
         z_conv_raw = z_all[..., : self.dim_conv_total]
-        c_skip = z_all[..., self.dim_conv_total : self.dim_conv_total + self.dim_skip]
-        gate_logits = z_all[..., self.dim_conv_total + self.dim_skip :]
+        c_skip = z_all[..., self.dim_conv_total :]
 
         z_conv_t = z_conv_raw.transpose(1, 2)
         z_conv_t = F.pad(z_conv_t, (self.conv_kernel_size - 1, 0))
@@ -152,10 +148,10 @@ class SeqCondAttention(nn.Module):
         z_mem = z_conv[..., : self.dim_mem_total]
         q_raw = z_conv[..., self.dim_mem_total :]
         k_val = z_mem[..., : self.dim_memory].reshape(B, L, self.K, self.H)
-        k_val = self.k_norm(k_val)
+        # k_val = self.k_norm(k_val)  # Removed
         s_raw = z_mem[..., self.dim_memory :]
 
-        q_raw = self.q_norm(q_raw)
+        # q_raw = self.q_norm(q_raw)  # Removed
         q_raw = q_raw.reshape(B, L, self.K_q, 1, self.H, self.M, 2)
         q_re, q_im = q_raw[..., 0], q_raw[..., 1]
 
@@ -197,7 +193,7 @@ class SeqCondAttention(nn.Module):
         score_raw = self.score_scale.view(
             1, 1, -1
         ) * s_raw.float() + self.score_bias.view(1, 1, -1)
-        p_w_content = F.relu(score_raw) ** 2
+        p_w_content = F.softplus(score_raw)
         p_w = (p_w_content * torch.exp(log_time_weight)).clamp(1e-6, 1000.0)
 
         k_f32 = k_val.float().unsqueeze(-1)
@@ -224,11 +220,6 @@ class SeqCondAttention(nn.Module):
         out_re = out_re_g.reshape(B, L, self.K, self.H).to(x.dtype)
         out_im = out_im_g.reshape(B, L, self.K, self.H).to(x.dtype)
         out_complex = torch.cat([out_re, out_im], dim=-1)
-
-        out_flat = out_complex.reshape(B, L, -1)
-        gate_for_norm = self.gate_proj(gate_logits)
-        out_normed = self.gated_norm(out_flat, gate_for_norm)
-        out_complex = out_normed.reshape(B, L, self.K, 2 * self.H)
 
         y_spec_raw = torch.einsum(
             "blkf,kfn->blkn", out_complex, self.W_readout.to(out_complex.dtype)
@@ -288,8 +279,7 @@ class SeqCondAttention(nn.Module):
 
         z_all = self.in_proj(x_t)
         z_conv = z_all[..., : self.dim_conv_total]
-        c_skip = z_all[..., self.dim_conv_total : self.dim_conv_total + self.dim_skip]
-        gate_logits = z_all[..., self.dim_conv_total + self.dim_skip :]
+        c_skip = z_all[..., self.dim_conv_total :]
 
         # Cache transposed kernel on first call
         if self._conv_kernel_t is None or self._conv_kernel_t.device != z_conv.device:
@@ -419,11 +409,7 @@ class SeqCondAttention(nn.Module):
             out_im = out_im_g.reshape(B, self.K, self.H).to(x_t.dtype)
             out_complex = torch.cat([out_re, out_im], dim=-1)
 
-        # out_flat = out_complex.reshape(B, -1)
-        # gate_for_norm = self.gate_proj(gate_logits)
-        # out_normed = self.gated_norm(out_flat, gate_for_norm)
-        out_normed = out_complex.reshape(B, -1)
-        out_complex = out_normed.reshape(B, self.K, 2 * self.H)
+        out_complex = out_complex.reshape(B, self.K, 2 * self.H)
 
         y_spec_raw = torch.einsum(
             "bkf,kfn->bkn", out_complex, self.W_readout.to(out_complex.dtype)
@@ -433,9 +419,8 @@ class SeqCondAttention(nn.Module):
 
         y_spec_val, y_spec_gate = y_spec_raw.chunk(2, dim=-1)
         y_skip_val, y_skip_gate = y_skip.chunk(2, dim=-1)
-        h_scale = self.highway_scale[0, 0]
-        y_val = y_spec_val + y_skip_val * h_scale
-        y_gate = y_spec_gate + y_skip_gate * h_scale
+        y_val = y_spec_val + y_skip_val
+        y_gate = y_spec_gate + y_skip_gate
         y_act = y_val * torch.sigmoid(y_gate)
 
         out = self.out_proj(y_act.reshape(B, -1))

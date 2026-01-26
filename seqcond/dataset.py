@@ -102,8 +102,14 @@ def iterate_synth(
     samples_yielded = 0
 
     # Loop indefinitely if max_samples is None
+    epoch = 0
     while True:
+        if epoch > 0:
+            print(
+                f"[Process {process_index}] SYNTH dataset reloading (epoch {epoch})..."
+            )
         dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+        epoch += 1
 
         # Track iteration index for sharding logic
         dataset_idx = 0

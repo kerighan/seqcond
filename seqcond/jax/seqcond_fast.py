@@ -426,7 +426,6 @@ class SeqCondAttention(nn.Module):
 
         # Skip dimension: low-rank (D//4) or full (dim_swiglu_total)
         dim_skip = D // 4 if self.skip_low_rank else dim_swiglu_total
-        dim_gate = self.K
 
         # Unpack state (now with single fused conv buffer)
         den_acc, re_acc, im_acc, pos, conv_buffer = state
@@ -436,15 +435,14 @@ class SeqCondAttention(nn.Module):
         # ======================================================================
         dim_mem_total = dim_memory + self.K
         dim_conv_total = dim_mem_total + dim_query_total
-        dim_total = dim_conv_total + dim_skip + dim_gate
+        dim_total = dim_conv_total + dim_skip
 
         z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x_t)
         z_all = z_all.astype(self.compute_dtype)
 
         # Split: conv_branch vs non-conv branches
         z_conv = z_all[..., :dim_conv_total]
-        c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
-        gate_logits = z_all[..., dim_conv_total + dim_skip :]
+        c_skip = z_all[..., dim_conv_total:]
 
         # Single fused conv with buffer
         z_conv_expanded = z_conv[:, None, :]  # (B, 1, dim_conv_total)
@@ -677,19 +675,6 @@ class SeqCondAttention(nn.Module):
         # Concatenate (not stack!) to match __call__
         out_complex = jnp.concatenate([out_re, out_im], axis=-1)  # (B, K, 2*H)
 
-        # Flatten and apply GatedRMSNorm
-        out_complex_flat = out_complex.reshape(B, -1)
-        out_complex_flat = out_complex_flat.astype(self.compute_dtype)
-
-        # GatedRMSNorm (matches __call__)
-        gate_for_norm = nn.Dense(
-            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
-        )(gate_logits)
-        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
-            out_complex_flat, gate_for_norm
-        )
-        out_complex = out_normed.reshape(B, self.K, 2 * H)
-
         # Readout
         W_readout = self.param(
             "W_readout",
@@ -710,13 +695,8 @@ class SeqCondAttention(nn.Module):
         y_spec_val, y_spec_gate = jnp.split(y_spec_raw, 2, axis=-1)
         y_skip_val, y_skip_gate = jnp.split(y_skip, 2, axis=-1)
 
-        highway_scale = self.param(
-            "highway_scale", nn.initializers.constant(1.0), (1, 1, self.K, 1)
-        )
-        highway_scale_step = highway_scale[0, 0]  # (K, 1)
-
-        y_val = y_spec_val + (y_skip_val * highway_scale_step)
-        y_gate = y_spec_gate + (y_skip_gate * highway_scale_step)
+        y_val = y_spec_val + y_skip_val
+        y_gate = y_spec_gate + y_skip_gate
 
         y_act = y_val * jax.nn.sigmoid(y_gate)
 

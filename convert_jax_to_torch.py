@@ -125,13 +125,7 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
                 conv_kernel.transpose(2, 1, 0)
             )
 
-            # Norms
-            state_dict[torch_prefix + "attn.k_norm.scale"] = torch.from_numpy(
-                np.array(attn["k_norm"]["scale"])
-            )
-            state_dict[torch_prefix + "attn.q_norm.scale"] = torch.from_numpy(
-                np.array(attn["q_norm"]["scale"])
-            )
+            # k_norm and q_norm removed (not needed after simplification)
 
             # Theta parameters
             if "theta_raw" in attn:
@@ -174,13 +168,7 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
                 np.array(attn["W_readout"])
             )
 
-            # Gated norm
-            state_dict[torch_prefix + "attn.gate_proj.weight"] = torch.from_numpy(
-                np.array(attn["gate_proj"]["kernel"])
-            ).t()
-            state_dict[torch_prefix + "attn.gated_norm.weight"] = torch.from_numpy(
-                np.array(attn["gated_norm"]["weight"])
-            )
+            # gated_norm and gate_proj removed (not needed after simplification)
 
             # Skip projection
             if "skip_up" in attn:
@@ -188,10 +176,7 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
                     np.array(attn["skip_up"]["kernel"])
                 ).t()
 
-            # Highway scale
-            state_dict[torch_prefix + "attn.highway_scale"] = torch.from_numpy(
-                np.array(attn["highway_scale"])
-            )
+            # highway_scale removed (not needed after simplification)
 
             # Output projection
             state_dict[torch_prefix + "attn.out_proj.weight"] = torch.from_numpy(
