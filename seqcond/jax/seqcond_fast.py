@@ -303,9 +303,9 @@ class SeqCondAttention(nn.Module):
 
             # Einsum Accumulation
             # p_w: (B, L, K) -> den_acc: (B, L, K) via mask (L, L)
-            # den_acc = jnp.einsum(
-            #    "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
-            # )
+            den_acc = jnp.einsum(
+                "ts,bsk->btk", causal_mask, p_w.astype(self.compute_dtype)
+            )
 
             # Stack RE/IM for single einsum
             # (B, L, K, H, M, 2)
@@ -322,6 +322,9 @@ class SeqCondAttention(nn.Module):
             re_flat = re.reshape(B, L, flat_size)
             im_flat = im.reshape(B, L, flat_size)
 
+            # Accumulate denominator
+            den_acc = jnp.cumsum(p_w, axis=1)
+
             # Stack & Scan
             stack = jnp.concatenate([re_flat, im_flat], axis=-1)
             cumsum = jnp.cumsum(stack, axis=1)
@@ -331,12 +334,12 @@ class SeqCondAttention(nn.Module):
             re_acc = re_acc_flat.reshape(B, L, self.K, H, self.M)
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
-        # Normalisation removed to preserve energy
-        # inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
-        # inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
+        # Normalisation
+        inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
+        inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
 
-        state_re = re_acc
-        state_im = im_acc
+        state_re = re_acc * inv_den
+        state_im = im_acc * inv_den
 
         # ======================================================================
         # 4. READOUT & GQA & INTEGRATION
@@ -633,12 +636,12 @@ class SeqCondAttention(nn.Module):
         re_acc_new = re_acc + re
         im_acc_new = im_acc + im
 
-        # Normalize removed
-        # inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
-        # inv_den = inv_den[..., None, None]
+        # Normalization (matches __call__)
+        inv_den = 1.0 / jnp.maximum(den_acc_new, 1e-4)
+        inv_den = inv_den[..., None, None]
 
-        state_re = re_acc_new
-        state_im = im_acc_new
+        state_re = re_acc_new * inv_den
+        state_im = im_acc_new * inv_den
 
         # Group state for GQA: (B, K, H, M) -> (B, K_q, n_rep, H, M)
         state_re_grouped = state_re.reshape(B, self.K_q, self.n_rep, H, self.M)
