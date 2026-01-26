@@ -104,7 +104,7 @@ class SeqCondAttention(nn.Module):
         dim_conv_total = (
             dim_mem_total + dim_query_total
         )  # Everything that goes through conv
-        dim_total = dim_conv_total + dim_skip
+        dim_total = dim_conv_total + dim_skip + dim_gate
 
         z_all = nn.Dense(dim_total, use_bias=False, name="in_proj")(x)
         z_all = z_all.astype(self.compute_dtype)
@@ -112,7 +112,7 @@ class SeqCondAttention(nn.Module):
         # Split: conv_branch vs non-conv branches
         z_conv = z_all[..., :dim_conv_total]
         c_skip = z_all[..., dim_conv_total : dim_conv_total + dim_skip]
-        # gate_logits = z_all[..., dim_conv_total + dim_skip :]
+        gate_logits = z_all[..., dim_conv_total + dim_skip :]
 
         # Single fused conv on mem+query (Mamba style)
         z_conv = nn.Conv(
@@ -364,16 +364,16 @@ class SeqCondAttention(nn.Module):
         # Apply GatedRMSNorm to spectral output (Mamba2 style)
         # gate_logits acts as the residual gate
         out_complex_flat = out_complex.reshape(B, L, -1)
-        out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype, name="out_norm")(
-            out_complex_flat
-        )
-        # gate_for_norm = nn.Dense(
-        #     out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
-        # )(gate_logits)
-        # out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
-        #     out_complex_flat, gate_for_norm
+        # out_complex_flat = nn.RMSNorm(dtype=self.compute_dtype,name="out_norm")(
+        #     out_complex_flat
         # )
-        out_complex = out_complex_flat.reshape(B, L, self.K, 2 * H)
+        gate_for_norm = nn.Dense(
+            out_complex_flat.shape[-1], use_bias=False, name="gate_proj"
+        )(gate_logits)
+        out_normed = GatedRMSNorm(dtype=self.compute_dtype, name="gated_norm")(
+            out_complex_flat, gate_for_norm
+        )
+        out_complex = out_normed.reshape(B, L, self.K, 2 * H)
 
         y_spec_raw = jnp.einsum("blkf,kfn->blkn", out_complex, W_readout)
 
