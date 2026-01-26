@@ -15,6 +15,7 @@ import numpy as np
 from flax.core import FrozenDict
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental.pjit import pjit
+from jax.experimental import multihost_utils
 
 
 from .model import (
@@ -1001,26 +1002,52 @@ class Trainer:
                 print(f"[DEBUG] Step {step}: fetching batch...", flush=True)
 
             try:
-                if step == 1:
-                    print(
-                        "[DEBUG] Fetching first batch from data iterator...", flush=True
-                    )
-                if using_tf_data:
-                    x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
-                    tokens_seen += real_tokens_in_batch
+                # Only process 0 loads data from HuggingFace, then broadcasts to all
+                if jax.process_index() == 0:
+                    if using_tf_data:
+                        x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
+                        tokens_seen += real_tokens_in_batch
+                    else:
+                        x_batch, y_batch = next(data_iterator)
+                    if step == 1:
+                        print(
+                            f"[DEBUG] Process 0 fetched batch: x_batch.shape={x_batch.shape}",
+                            flush=True,
+                        )
+                    # Signal that data is valid (not exhausted)
+                    data_valid = np.array([1], dtype=np.int32)
                 else:
-                    x_batch, y_batch = next(data_iterator)
+                    # Other processes create placeholder arrays
+                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+                    data_valid = np.array([0], dtype=np.int32)
+
+                # Broadcast from process 0 to all processes
+                x_batch = multihost_utils.broadcast_one_to_all(x_batch)
+                y_batch = multihost_utils.broadcast_one_to_all(y_batch)
+                data_valid = multihost_utils.broadcast_one_to_all(data_valid)
+
                 if step == 1:
                     print(
-                        f"[DEBUG] First batch fetched: x_batch.shape={x_batch.shape}",
+                        f"[DEBUG] After broadcast: x_batch.shape={x_batch.shape}",
                         flush=True,
                     )
-                    # When not using tf.data, tokens_seen is not used here.
-                    # The DataLoader instance tracks it internally and it's fetched later.
 
             except StopIteration:
-                print("Data loader exhausted.")
-                break
+                # Process 0 signals exhaustion
+                if jax.process_index() == 0:
+                    data_valid = np.array([0], dtype=np.int32)
+                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+                else:
+                    data_valid = np.array([0], dtype=np.int32)
+                    x_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+                    y_batch = np.zeros((tc.batch_size, tc.maxlen), dtype=np.int32)
+
+                data_valid = multihost_utils.broadcast_one_to_all(data_valid)
+                if data_valid[0] == 0:
+                    print("Data loader exhausted.")
+                    break
 
             metrics_batch = None
             grad_norm_value = None
