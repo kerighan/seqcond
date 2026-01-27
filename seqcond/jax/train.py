@@ -60,6 +60,10 @@ def _theta_trainable_mask(params, train_thetas: bool):
 
 
 def _create_grad_mask(params, train_thetas: bool):
+    # If training all params, no mask needed - saves memory
+    if train_thetas:
+        return None
+
     bool_mask = _theta_trainable_mask(params, train_thetas)
 
     def to_array(keep, p):
@@ -428,7 +432,9 @@ def save_checkpoint(
         pickle.dump(data, f)
 
 
-def load_checkpoint(path: str) -> Tuple[Any, Dict, Optional[int], Optional[Any]]:
+def load_checkpoint(
+    path: str, load_opt_state: bool = True
+) -> Tuple[Any, Dict, Optional[int], Optional[Any]]:
     """Load model checkpoint. Returns (params, config_dict, step, opt_state)."""
     with open(path, "rb") as f:
         try:
@@ -439,7 +445,13 @@ def load_checkpoint(path: str) -> Tuple[Any, Dict, Optional[int], Optional[Any]]
             )
             f.seek(0)
             data = pickle.load(f, encoding="latin1")
-    return data["params"], data["config"], data.get("step"), data.get("opt_state")
+
+    # Immediately delete opt_state from memory if not needed
+    opt_state = data.get("opt_state") if load_opt_state else None
+    if not load_opt_state and "opt_state" in data:
+        del data["opt_state"]
+
+    return data["params"], data["config"], data.get("step"), opt_state
 
 
 class Trainer:
@@ -710,8 +722,15 @@ class Trainer:
                     f"[Process {jax.process_index()}] Loading checkpoint from {ckpt_path}..."
                 )
                 try:
-                    ckpt_params, _, ckpt_step, ckpt_opt_state = load_checkpoint(
-                        ckpt_path
+                    # Delete random params first to free memory before loading checkpoint
+                    del self.params
+                    import gc
+
+                    gc.collect()
+
+                    # Don't load opt_state to save memory
+                    ckpt_params, _, ckpt_step, _ = load_checkpoint(
+                        ckpt_path, load_opt_state=False
                     )
                     print(
                         f"[Process {jax.process_index()}] Successfully loaded checkpoint (step {ckpt_step})"
@@ -735,15 +754,9 @@ class Trainer:
             if ckpt_params is not None:
 
                 # Convert numpy arrays to JAX arrays (pickle loads as numpy)
-                ckpt_params = jax.tree_util.tree_map(jnp.asarray, ckpt_params)
-                if ckpt_opt_state is not None:
-                    ckpt_opt_state = jax.tree_util.tree_map(
-                        lambda x: jnp.asarray(x) if hasattr(x, "dtype") else x,
-                        ckpt_opt_state,
-                    )
-
-                # Update params
-                self.params = ckpt_params
+                self.params = jax.tree_util.tree_map(jnp.asarray, ckpt_params)
+                del ckpt_params  # Free numpy arrays
+                gc.collect()
                 print("Weights loaded from checkpoint.")
 
                 # If Resuming (not just loading weights), restore training state
