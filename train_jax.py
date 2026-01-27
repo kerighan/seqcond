@@ -392,8 +392,20 @@ def main():
             max_synth=args.max_synth,
         )
 
+        # Calculate local batch size for this process
+        num_processes = jax.process_count()
+        if tc.batch_size % num_processes != 0:
+            raise ValueError(
+                f"Batch size {tc.batch_size} must be divisible by process count {num_processes}"
+            )
+        local_batch_size = tc.batch_size // num_processes
+        if jax.process_index() == 0:
+            print(
+                f"Global batch size: {tc.batch_size}, Local batch size: {local_batch_size} (across {num_processes} processes)"
+            )
+
         data_loader = DataLoader(
-            batch_size=tc.batch_size,
+            batch_size=local_batch_size,
             max_steps=micro_steps,
             maxlen=tc.maxlen,
             tok=tokenizer,
