@@ -748,10 +748,11 @@ class Trainer:
 
                 # If Resuming (not just loading weights), restore training state
                 if self.resume_checkpoint and not self.load_checkpoint:
-                    if ckpt_opt_state is not None:
-                        self.opt_state = ckpt_opt_state
+                    # Skip optimizer state to save memory - fresh optimizer with loaded weights
                     self.start_step = ckpt_step or 0
-                    print(f"Resumed training state (step {self.start_step}).")
+                    print(
+                        f"Resumed training state (step {self.start_step}, fresh optimizer)."
+                    )
                 else:
                     print(
                         "Starting training from scratch (ignoring checkpoint step/opt_state)."
