@@ -779,7 +779,10 @@ class Trainer:
 
         # Create grad_mask after checkpoint loading (uses final params structure)
         grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
-        self._grad_mask = grad_mask or None
+        # Ensure grad_mask is JAX arrays (not numpy) for FSDP sharding
+        if grad_mask is not None:
+            grad_mask = jax.tree_util.tree_map(jnp.asarray, grad_mask)
+        self._grad_mask = grad_mask
 
         # Create JIT-compiled steps
         if self.use_fsdp:
