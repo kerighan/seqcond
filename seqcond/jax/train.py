@@ -431,7 +431,14 @@ def save_checkpoint(
 def load_checkpoint(path: str) -> Tuple[Any, Dict, Optional[int], Optional[Any]]:
     """Load model checkpoint. Returns (params, config_dict, step, opt_state)."""
     with open(path, "rb") as f:
-        data = pickle.load(f)
+        try:
+            data = pickle.load(f)
+        except (UnicodeDecodeError, ValueError) as e:
+            print(
+                f"Warning: Standard pickle load failed ({e}), trying with encoding='latin1'"
+            )
+            f.seek(0)
+            data = pickle.load(f, encoding="latin1")
     return data["params"], data["config"], data.get("step"), data.get("opt_state")
 
 
