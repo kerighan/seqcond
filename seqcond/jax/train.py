@@ -755,7 +755,9 @@ class Trainer:
                 # We must provide a structure matching the data on all hosts.
                 # Use self.params/self.opt_state as the structure template for receivers.
                 params_structure = (
-                    ckpt_params if jax.process_index() == loader_process else self.params
+                    ckpt_params
+                    if jax.process_index() == loader_process
+                    else self.params
                 )
                 ckpt_params = multihost_utils.broadcast_one_to_all(
                     params_structure, is_source=jax.process_index() == loader_process
@@ -1037,8 +1039,12 @@ class Trainer:
 
         print("\nStarting training...", flush=True)
 
-        for step in itertools.count(start=1):
-            if step > tc.total_steps * grad_accum_steps:
+        # Calculate the starting micro-step based on resume point
+        start_micro_step = self.start_step * grad_accum_steps + 1
+        total_micro_steps = tc.total_steps * grad_accum_steps
+
+        for step in itertools.count(start=start_micro_step):
+            if step > total_micro_steps:
                 break
 
             try:
