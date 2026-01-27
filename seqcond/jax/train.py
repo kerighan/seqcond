@@ -688,9 +688,6 @@ class Trainer:
         print(f"Model type: {self.model_config.model_type}")
         print(f"Parameters: {num_params:,}")
 
-        grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
-        self._grad_mask = grad_mask or None
-
         if not self.use_fsdp:
             self.opt_state = self.optimizer.init(self.params)
 
@@ -779,6 +776,10 @@ class Trainer:
         if self.use_pmap:
             self.params = self._replicate_tree(self.params)
             self.opt_state = self._replicate_tree(self.opt_state)
+
+        # Create grad_mask after checkpoint loading (uses final params structure)
+        grad_mask = _create_grad_mask(self.params, self.train_config.train_thetas)
+        self._grad_mask = grad_mask or None
 
         # Create JIT-compiled steps
         if self.use_fsdp:
