@@ -474,6 +474,7 @@ class DataLoader:
         iterator_kwargs: Optional[dict] = None,
         log_every_n_steps: int = 0,
         drop_last: bool = False,
+        start_step: int = 0,
     ):
         self.batch_size = batch_size
         self.max_steps = max_steps
@@ -483,10 +484,11 @@ class DataLoader:
         self.iterator_kwargs = iterator_kwargs or {}
         self.log_every_n_steps = log_every_n_steps
         self.drop_last = drop_last
+        self.start_step = start_step
 
         # Tracking state
         self.tokens_seen = 0
-        self.steps_done = 0
+        self.steps_done = start_step
         self._last_tokens_seen = 0
 
     def __iter__(self):
@@ -497,6 +499,17 @@ class DataLoader:
         iterator = self.iterator_fn(**iterator_kwargs)
 
         X_batch, y_batch = [], []
+        
+        # Fast-forward if needed
+        if self.start_step > 0:
+            items_to_skip = self.start_step * self.batch_size
+            print(f"[dataset] Skipping {items_to_skip} items to resume training at step {self.start_step}...")
+            skipped = 0
+            for _ in iterator:
+                skipped += 1
+                if skipped >= items_to_skip:
+                    break
+            print(f"[dataset] Finished skipping {skipped} items.")
 
         for tokens in iterator:
             if not tokens:
