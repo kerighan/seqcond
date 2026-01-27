@@ -401,7 +401,8 @@ def main():
             iterator_kwargs=iterator_kwargs,
             log_every_n_steps=tc.log_every_n_steps,
             drop_last=True,
-            start_step=args.resume_step if args.resume_step else 0,
+            # Don't skip dataset items on resume - causes HuggingFace API timeouts
+            # Model will see different data on resume, which is fine for training
         )
 
     train(
