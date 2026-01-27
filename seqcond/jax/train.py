@@ -726,7 +726,9 @@ class Trainer:
                 print(f"Warning: Checkpoint {ckpt_path} not found on any process")
 
             # Step 1: The process that has the file loads it
-            ckpt_data = None
+            ckpt_params = None
+            ckpt_opt_state = None
+            ckpt_step = None
             if loader_process is not None and jax.process_index() == loader_process:
                 abs_ckpt_path = os.path.abspath(ckpt_path)
                 print(
@@ -737,7 +739,9 @@ class Trainer:
                     f"[Process {loader_process}] Current working directory: {os.getcwd()}"
                 )
                 try:
-                    ckpt_data = load_checkpoint(ckpt_path)
+                    ckpt_params, _, ckpt_step, ckpt_opt_state = load_checkpoint(
+                        ckpt_path
+                    )
                     print(f"[Process {loader_process}] Successfully loaded checkpoint")
                 except Exception as e:
                     print(f"[Process {loader_process}] Error loading checkpoint: {e}")
@@ -746,17 +750,30 @@ class Trainer:
                     traceback.print_exc()
 
             # Step 2: Broadcast loaded data from loader_process to all processes
+            # Broadcast params and opt_state (JAX arrays) separately from step (Python int)
             if loader_process is not None:
-                ckpt_data = multihost_utils.broadcast_one_to_all(
-                    ckpt_data, is_source=jax.process_index() == loader_process
+                ckpt_params = multihost_utils.broadcast_one_to_all(
+                    ckpt_params, is_source=jax.process_index() == loader_process
                 )
+                ckpt_opt_state = multihost_utils.broadcast_one_to_all(
+                    ckpt_opt_state, is_source=jax.process_index() == loader_process
+                )
+                # Broadcast step as a JAX array to avoid string dtype issues
+                step_array = jnp.array(
+                    ckpt_step if ckpt_step is not None else 0, dtype=jnp.int32
+                )
+                step_array = multihost_utils.broadcast_one_to_all(
+                    step_array, is_source=jax.process_index() == loader_process
+                )
+                ckpt_step = int(step_array) if step_array is not None else None
             else:
                 # No process has the file, broadcast None from process 0
-                ckpt_data = multihost_utils.broadcast_one_to_all(None)
+                ckpt_params = multihost_utils.broadcast_one_to_all(None)
+                ckpt_opt_state = multihost_utils.broadcast_one_to_all(None)
+                ckpt_step = None
 
             # Step 3: Apply loaded data (if valid)
-            if ckpt_data is not None:
-                (ckpt_params, _, ckpt_step, ckpt_opt_state) = ckpt_data
+            if ckpt_params is not None:
 
                 # Update params
                 self.params = ckpt_params
