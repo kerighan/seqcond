@@ -752,12 +752,37 @@ class Trainer:
             # Step 2: Broadcast loaded data from loader_process to all processes
             # Broadcast params and opt_state (JAX arrays) separately from step (Python int)
             if loader_process is not None:
+                # We must provide a structure matching the data on all hosts.
+                # Use self.params/self.opt_state as the structure template for receivers.
+                params_structure = (
+                    ckpt_params if jax.process_index() == loader_process else self.params
+                )
                 ckpt_params = multihost_utils.broadcast_one_to_all(
-                    ckpt_params, is_source=jax.process_index() == loader_process
+                    params_structure, is_source=jax.process_index() == loader_process
                 )
-                ckpt_opt_state = multihost_utils.broadcast_one_to_all(
-                    ckpt_opt_state, is_source=jax.process_index() == loader_process
+
+                # Broadcast opt_state only if it exists in the checkpoint
+                # First broadcast existence flag
+                local_has_opt = ckpt_opt_state is not None
+                has_opt_array = jnp.array(local_has_opt, dtype=jnp.bool_)
+                has_opt_array = multihost_utils.broadcast_one_to_all(
+                    has_opt_array, is_source=jax.process_index() == loader_process
                 )
+                global_has_opt = bool(has_opt_array)
+
+                if global_has_opt:
+                    opt_state_structure = (
+                        ckpt_opt_state
+                        if jax.process_index() == loader_process
+                        else self.opt_state
+                    )
+                    ckpt_opt_state = multihost_utils.broadcast_one_to_all(
+                        opt_state_structure,
+                        is_source=jax.process_index() == loader_process,
+                    )
+                else:
+                    ckpt_opt_state = None
+
                 # Broadcast step as a JAX array to avoid string dtype issues
                 step_array = jnp.array(
                     ckpt_step if ckpt_step is not None else 0, dtype=jnp.int32
