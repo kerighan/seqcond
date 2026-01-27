@@ -11,6 +11,7 @@ TPU_NAME="${2:-node-v4-64}"
 ZONE="${3:-us-central2-b}"
 REMOTE_DIR="/home/maixent/seqcond/checkpoints"
 SOURCE_WORKER=1
+LOCAL_TMP="/tmp/$CHECKPOINT"
 
 if [ -z "$CHECKPOINT" ]; then
     echo "Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]"
@@ -28,19 +29,45 @@ echo "Checkpoint: $CHECKPOINT"
 echo "Source worker: $SOURCE_WORKER"
 echo ""
 
-# Get the IP of worker 1 (source)
-echo "--- Getting source worker IP ---"
-SOURCE_IP=$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" \
-    --format="value(networkEndpoints[$SOURCE_WORKER].ipAddress)")
-echo "Source worker $SOURCE_WORKER IP: $SOURCE_IP"
+# Step 1: Download from source worker to local machine (skip if already exists)
+if [ -f "$LOCAL_TMP" ]; then
+    echo "--- Local copy already exists: $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}')) ---"
+else
+    echo "--- Downloading from worker $SOURCE_WORKER to local machine ---"
+    gcloud compute tpus tpu-vm scp "$TPU_NAME:$REMOTE_DIR/$CHECKPOINT" "$LOCAL_TMP" \
+        --zone="$ZONE" --worker=$SOURCE_WORKER
 
-# Copy from worker 1 to all other workers using scp
+    if [ ! -f "$LOCAL_TMP" ]; then
+        echo "ERROR: Failed to download checkpoint"
+        exit 1
+    fi
+    echo "Downloaded to $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}'))"
+fi
+
+# Step 2: Upload to all workers that don't have it
 for i in 0 2 3 4 5 6 7; do
     echo ""
-    echo "--- Copying to worker $i ---"
+    echo "--- Checking worker $i ---"
+    
+    # Check if file already exists on this worker
+    EXISTS=$(gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$i \
+        --command "[ -f $REMOTE_DIR/$CHECKPOINT ] && echo 'yes' || echo 'no'" 2>/dev/null | tail -1)
+    
+    if [ "$EXISTS" = "yes" ]; then
+        echo "Worker $i: Already has checkpoint, skipping"
+        continue
+    fi
+    
+    echo "Worker $i: Uploading..."
+    # Ensure checkpoints directory exists
     gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$i \
-        --command "scp -o StrictHostKeyChecking=no maixent@$SOURCE_IP:$REMOTE_DIR/$CHECKPOINT $REMOTE_DIR/$CHECKPOINT"
+        --command "mkdir -p $REMOTE_DIR"
+    gcloud compute tpus tpu-vm scp "$LOCAL_TMP" "$TPU_NAME:$REMOTE_DIR/$CHECKPOINT" \
+        --zone="$ZONE" --worker=$i
 done
+
+echo ""
+echo "(Local temp file kept at $LOCAL_TMP - delete manually if needed)"
 
 echo ""
 echo "--- Verifying checkpoint on all workers ---"
