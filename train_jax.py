@@ -373,12 +373,10 @@ def main():
     resume_ckpt = args.resume_checkpoint
     if resume_ckpt is None and args.resume_step is not None:
         ckpt_name = f"{config.name}_step{args.resume_step}.pkl"
-        candidate = os.path.join(config.training.checkpoint_dir, ckpt_name)
-        if os.path.exists(candidate):
-            resume_ckpt = candidate
-            print(f"Resuming from {resume_ckpt}")
-        else:
-            print(f"Checkpoint for step {args.resume_step} not found at {candidate}")
+        resume_ckpt = os.path.join(config.training.checkpoint_dir, ckpt_name)
+        print(
+            f"Will attempt to resume from {resume_ckpt} (multihost broadcast will find it)"
+        )
 
     # Start Training
     data_loader = None
