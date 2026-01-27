@@ -734,6 +734,14 @@ class Trainer:
             # Apply loaded data (if valid)
             if ckpt_params is not None:
 
+                # Convert numpy arrays to JAX arrays (pickle loads as numpy)
+                ckpt_params = jax.tree_util.tree_map(jnp.asarray, ckpt_params)
+                if ckpt_opt_state is not None:
+                    ckpt_opt_state = jax.tree_util.tree_map(
+                        lambda x: jnp.asarray(x) if hasattr(x, "dtype") else x,
+                        ckpt_opt_state,
+                    )
+
                 # Update params
                 self.params = ckpt_params
                 print("Weights loaded from checkpoint.")
