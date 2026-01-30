@@ -109,19 +109,18 @@ def iterate_synth(
                 f"[Process {process_index}] SYNTH dataset reloading (epoch {epoch})..."
             )
         dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+
+        # Use native HuggingFace sharding - each process only iterates its shard
+        if process_count > 1:
+            from datasets.distributed import split_dataset_by_node
+
+            dataset = split_dataset_by_node(
+                dataset, rank=process_index, world_size=process_count
+            )
+
         epoch += 1
 
-        # Track iteration index for sharding logic
-        dataset_idx = 0
-
         for item in dataset:
-            # Shard data: each process takes every Nth sample
-            current_idx = dataset_idx
-            dataset_idx += 1
-
-            if current_idx % process_count != process_index:
-                continue
-
             if max_samples is not None and samples_yielded >= max_samples:
                 return
 
@@ -263,7 +262,7 @@ def iterate_fineweb(
     # Document-level sharding: each process takes every Nth document
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
-        name="sample-350BT",
+        name="sample-100BT",
         split="train",
         streaming=True,
     )
@@ -317,23 +316,23 @@ def _iterate_fineweb_docs(
     """Iterate over FineWeb documents.
 
     Yields tokenized documents until the dataset is exhausted.
-    Sharded across processes when shard_data=True.
+    Sharded across processes when shard_data=True using native HuggingFace sharding.
     """
     tok = tok or tokenizer
     docs_processed = 0
 
     # Get process info for sharding
     process_index, process_count = _maybe_init_jax_process_info(shard_data)
-    dataset_idx = 0
+
+    # Use native HuggingFace sharding - each process only iterates its shard
+    if process_count > 1:
+        from datasets.distributed import split_dataset_by_node
+
+        dataset = split_dataset_by_node(
+            dataset, rank=process_index, world_size=process_count
+        )
 
     for item in dataset:
-        # Shard data: each process takes every Nth document
-        current_idx = dataset_idx
-        dataset_idx += 1
-
-        if current_idx % process_count != process_index:
-            continue
-
         text = item.get("text", "")
 
         try:
@@ -499,11 +498,13 @@ class DataLoader:
         iterator = self.iterator_fn(**iterator_kwargs)
 
         X_batch, y_batch = [], []
-        
+
         # Fast-forward if needed
         if self.start_step > 0:
             items_to_skip = self.start_step * self.batch_size
-            print(f"[dataset] Skipping {items_to_skip} items to resume training at step {self.start_step}...")
+            print(
+                f"[dataset] Skipping {items_to_skip} items to resume training at step {self.start_step}..."
+            )
             skipped = 0
             for _ in iterator:
                 skipped += 1

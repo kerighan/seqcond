@@ -3,6 +3,7 @@
 import time
 import torch
 from datasets import load_dataset
+import os
 
 # from huggingface_hub import login
 from seqcond.torch.generator import TorchGenerator
@@ -678,11 +679,15 @@ def evaluate_hotpotqa(gen, dataset, max_samples=None):
     return accuracy
 
 
+# 40k = 38.36%
+# 60k = 39.12%
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_110k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_50k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -703,6 +708,11 @@ def main():
         default=None,
         help="HuggingFace token for gated datasets",
     )
+    parser.add_argument(
+        "--use_triton",
+        action="store_true",
+        help="Use Triton kernels for faster inference",
+    )
     args = parser.parse_args()
 
     # # Login to HuggingFace if token provided or use cached credentials
@@ -717,6 +727,10 @@ def main():
 
     print("Loading model...")
     gen = TorchGenerator(args.checkpoint)
+
+    # Pre-capture CUDA graphs with Triton if requested
+    if args.use_triton:
+        gen.precompute(max_seq_len=1024, use_triton=True)
 
     if args.benchmark == "hellaswag":
         print(f"\nLoading HellaSwag dataset (split={args.split})...")

@@ -247,9 +247,16 @@ if TRITON_AVAILABLE:
                 other=0.0,
             )
 
-            # Complex multiplication: (BLOCK_H, BLOCK_M)
-            match_re = new_re * q_re_vals + new_im * q_im_vals
-            match_im = new_im * q_re_vals - new_re * q_im_vals
+            # Normalize by accumulated denominator (load updated den_acc)
+            new_den = tl.load(den_acc_ptr + b * K + k)
+            inv_den = 1.0 / tl.maximum(new_den, 1e-4)
+            state_re = new_re * inv_den
+            state_im = new_im * inv_den
+
+            # Complex multiplication with 1/sqrt(H) scaling: (BLOCK_H, BLOCK_M)
+            scale = 1.0 / tl.sqrt(float(H))
+            match_re = (state_re * q_re_vals + state_im * q_im_vals) * scale
+            match_im = (state_im * q_re_vals - state_re * q_im_vals) * scale
 
             # Sum over M dimension: (BLOCK_H,)
             sum_re += tl.sum(match_re * w_vals, axis=1)

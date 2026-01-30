@@ -7,6 +7,11 @@ import tqdm
 from seqcond.dataset import iterate_synth, tokenizer
 
 
+def _format_int(value: int) -> str:
+    """Format integers with thin spaces for readability."""
+    return f"{value:,}".replace(",", " ")
+
+
 def extract_long_samples(
     threshold=1024, output_file="/media/maixent/2To/corpus/long_synth_samples.jsonl"
 ):
@@ -25,6 +30,7 @@ def extract_long_samples(
 
     count_long = 0
     count_total = 0
+    total_training_tokens = 0
 
     # Open file in append mode just in case of resume,
     # but for a fresh run you might want to delete it first.
@@ -39,6 +45,7 @@ def extract_long_samples(
             for tokens in iterator:
                 count_total += 1
                 length = len(tokens)
+                total_training_tokens += min(length, threshold)
 
                 if length > threshold:
                     count_long += 1
@@ -48,7 +55,12 @@ def extract_long_samples(
                     f.write(json.dumps(entry) + "\n")
 
                     if count_long % 100 == 0:
-                        pbar.set_description(f"Found {count_long} long samples")
+                        pbar.set_description(
+                            "Found {} long samples, {} training tokens".format(
+                                _format_int(count_long),
+                                _format_int(total_training_tokens),
+                            )
+                        )
 
                 pbar.update(1)
 
@@ -60,7 +72,52 @@ def extract_long_samples(
         print(f"\nExtraction complete.")
         print(f"Total samples scanned: {count_total}")
         print(f"Long samples saved: {count_long}")
+        print(f"Total training tokens: {total_training_tokens}")
+
+
+def count_tokens(threshold=1024):
+    """
+    Iterates through the SYNTH dataset, tokenizes samples,
+    """
+    print(f"Counting SYNTH samples capped by {threshold} tokens...")
+
+    # We use shard_data=False to ensure we see the whole dataset
+    # We use streaming=True (default in iterate_synth)
+    iterator = iterate_synth(
+        max_samples=None, tokenize=True, tok=tokenizer, shard_data=False
+    )
+
+    count_long = 0
+    count_total = 0
+    total_training_tokens = 0
+
+    try:
+        # We don't know the total size for tqdm because it's streaming,
+        # but we can estimate or just show progress.
+        pbar = tqdm.tqdm(unit=" samples")
+        for tokens in iterator:
+            count_total += 1
+            length = len(tokens)
+            total_training_tokens += min(length, threshold)
+
+            if count_total % 1000 == 0:
+                pbar.set_description(
+                    f"Processed {_format_int(count_total)} samples, {_format_int(total_training_tokens)} training tokens"
+                )
+
+            pbar.update(1)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Saving progress...")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+    finally:
+        print(f"\nExtraction complete.")
+        print(f"Total samples scanned: {count_total}")
+        print(f"Long samples saved: {count_long}")
+        print(f"Total training tokens: {total_training_tokens}")
 
 
 if __name__ == "__main__":
-    extract_long_samples()
+    # extract_long_samples()
+    count_tokens()

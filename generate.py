@@ -11,8 +11,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        # default="checkpoints/seqcond_torch_120k.pt",
-        default="checkpoints/thin_torch.pt",
+        default="checkpoints/seqcond_torch_70k.pt",
+        # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
     )
@@ -73,12 +73,22 @@ def main():
         choices=["float32", "float16", "bfloat16"],
         help="Model dtype (float32, float16, bfloat16)",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU inference (disables CUDA graphs)",
+    )
 
     args = parser.parse_args()
 
-    print(f"Loading model from {args.checkpoint}...")
+    # CPU mode implies no CUDA graphs
+    if args.cpu:
+        args.no_cuda_graph = True
+
+    device = "cpu" if args.cpu else "cuda"
+    print(f"Loading model from {args.checkpoint} (device={device})...")
     try:
-        gen = TorchGenerator(args.checkpoint, dtype=args.dtype)
+        gen = TorchGenerator(args.checkpoint, device=device, dtype=args.dtype)
     except FileNotFoundError:
         print(f"Error: Checkpoint not found at {args.checkpoint}")
         return
@@ -87,7 +97,7 @@ def main():
     print(f"Generating {args.max_tokens} tokens (temp={args.temp})...\n")
 
     # Reset memory stats before generation
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not args.cpu:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
@@ -110,11 +120,13 @@ def main():
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
         use_triton=args.use_triton,
+        use_synth_template=True,
     )
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available() and not args.cpu:
+        torch.cuda.synchronize()
     duration = time.time() - start
-
+    print()
     print("-" * 60)
     if args.quiet:
         print(output)
@@ -129,7 +141,7 @@ def main():
     print(f"  Latency: {duration*1000/args.max_tokens:.2f} ms/token")
 
     # Memory stats
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not args.cpu:
         peak_mem = torch.cuda.max_memory_allocated() / 1024**3  # GB
         current_mem = torch.cuda.memory_allocated() / 1024**3  # GB
         reserved_mem = torch.cuda.memory_reserved() / 1024**3  # GB

@@ -12,7 +12,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch2_60k.pt",
+        default="checkpoints/seqcond_torch_40k.pt",
         help="Path to PyTorch checkpoint",
     )
     parser.add_argument(
@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
     parser.add_argument(
-        "--rep_penalty", type=float, default=1.0, help="Repetition penalty"
+        "--rep_penalty", type=float, default=1.2, help="Repetition penalty"
     )
     parser.add_argument(
         "--freq_penalty", type=float, default=0.0, help="Frequency penalty"
@@ -90,6 +90,7 @@ def main():
                 no_repeat_ngram_size=args.no_repeat_ngram,
                 verbose=False,
                 use_cuda_graph=not args.no_cuda_graph,
+                use_synth_template=False,
             )
 
             # Stop at STOP token (user will replace STOP)

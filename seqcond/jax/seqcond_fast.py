@@ -603,9 +603,8 @@ class SeqCondAttention(nn.Module):
         w_int_raw = self.param(
             "w_int_raw", nn.initializers.ones, (1, 1, self.K_q, self.n_rep, H, self.M)
         )
-        # w_int = jnp.exp(w_int_raw).astype(jnp.float32)
-        # w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
-        w_int = jax.nn.softmax(w_int_raw.astype(jnp.float32), axis=-1)
+        w_int = jnp.exp(w_int_raw).astype(jnp.float32)
+        w_int = w_int / (jnp.sum(w_int, axis=-1, keepdims=True) + 1e-6)
 
         # Remove batch/seq dims from w_int for step
         w_int_step = w_int[0, 0]  # (K_q, n_rep, H, M)

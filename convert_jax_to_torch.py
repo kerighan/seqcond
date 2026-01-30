@@ -132,12 +132,15 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
                 state_dict[torch_prefix + "attn.theta_raw"] = torch.from_numpy(
                     np.array(attn["theta_raw"])
                 )
-                state_dict[torch_prefix + "attn.w_int_raw"] = torch.from_numpy(
-                    np.array(attn["w_int_raw"])
-                )
             elif "theta_d_raw" in attn:
                 state_dict[torch_prefix + "attn.theta_d_raw"] = torch.from_numpy(
                     np.array(attn["theta_d_raw"])
+                )
+
+            # w_int_raw (always present, independent of theta type)
+            if "w_int_raw" in attn:
+                state_dict[torch_prefix + "attn.w_int_raw"] = torch.from_numpy(
+                    np.array(attn["w_int_raw"])
                 )
 
             # Decay/anchor slopes
@@ -168,7 +171,15 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
                 np.array(attn["W_readout"])
             )
 
-            # gated_norm and gate_proj removed (not needed after simplification)
+            # GatedRMSNorm gate projection and norm weight
+            if "gate_proj" in attn:
+                state_dict[torch_prefix + "attn.gate_proj.weight"] = torch.from_numpy(
+                    np.array(attn["gate_proj"]["kernel"])
+                ).t()
+            if "gated_norm" in attn:
+                state_dict[torch_prefix + "attn.gated_norm.weight"] = torch.from_numpy(
+                    np.array(attn["gated_norm"]["weight"])
+                )
 
             # Skip projection
             if "skip_up" in attn:
