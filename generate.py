@@ -11,7 +11,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_70k.pt",
+        default="checkpoints/seqcond_torch_80k.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
@@ -120,7 +120,7 @@ def main():
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
         use_triton=args.use_triton,
-        use_synth_template=True,
+        use_synth_template=False,
     )
 
     if torch.cuda.is_available() and not args.cpu:

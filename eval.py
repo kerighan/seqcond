@@ -681,13 +681,14 @@ def evaluate_hotpotqa(gen, dataset, max_samples=None):
 
 # 40k = 38.36%
 # 60k = 39.12%
+# 80k = 39.74%
 
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_50k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_80k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,

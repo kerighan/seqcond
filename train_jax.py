@@ -392,8 +392,22 @@ def main():
             max_synth=args.max_synth,
         )
 
+        batch_size = tc.batch_size
+        process_count = jax.process_count()
+        if process_count > 1:
+            if batch_size % process_count != 0:
+                raise ValueError(
+                    f"Global batch_size={batch_size} must be divisible by process_count={process_count}"
+                )
+            batch_size = batch_size // process_count
+
+        if jax.process_index() == 0:
+            print(
+                f"[dataset] DataLoader batch: global={tc.batch_size} per_process={batch_size} (process_count={process_count})"
+            )
+
         data_loader = DataLoader(
-            batch_size=tc.batch_size,
+            batch_size=batch_size,
             max_steps=micro_steps,
             maxlen=tc.maxlen,
             tok=tokenizer,
