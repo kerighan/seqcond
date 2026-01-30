@@ -1155,8 +1155,11 @@ class Trainer:
                         last_tokens_seen = tokens_seen
                         current_tokens_seen = tokens_seen
                     else:
-                        tokens_delta = self.data_loader.tokens_since_last_check()
-                        current_tokens_seen = self.data_loader.tokens_seen
+                        tokens_delta_local = self.data_loader.tokens_since_last_check()
+                        current_tokens_seen_local = self.data_loader.tokens_seen
+                        process_count = jax.process_count()
+                        tokens_delta = tokens_delta_local * process_count
+                        current_tokens_seen = current_tokens_seen_local * process_count
 
                     last_log_time = self._log_progress(
                         macro_step,
