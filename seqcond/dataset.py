@@ -98,6 +98,10 @@ def iterate_synth(
 
     process_index, process_count = _maybe_init_jax_process_info(shard_data)
 
+    # Import sharding function once outside the loop
+    if process_count > 1:
+        from datasets.distributed import split_dataset_by_node
+
     # Counter for total samples yielded by this process
     samples_yielded = 0
 
@@ -112,8 +116,6 @@ def iterate_synth(
 
         # Use native HuggingFace sharding - each process only iterates its shard
         if process_count > 1:
-            from datasets.distributed import split_dataset_by_node
-
             dataset = split_dataset_by_node(
                 dataset, rank=process_index, world_size=process_count
             )
@@ -135,7 +137,7 @@ def iterate_synth(
                     if "disallowed special token" in str(e):
                         if samples_yielded % 10000 == 0:
                             print(
-                                f"[WARNING] Skipping sample (stream_idx={current_idx}) with disallowed special token"
+                                f"[WARNING] Skipping SYNTH sample with disallowed special token"
                             )
                         continue
                     else:
