@@ -1025,8 +1025,18 @@ class Trainer:
             if self.use_fsdp:
                 # In multi-host setup, each process has its own data shard
                 # Convert to jax arrays on local devices
-                x = jnp.array(x_batch, dtype=jnp.int32)
-                y = jnp.array(y_batch, dtype=jnp.int32)
+                x_local = np.asarray(x_batch, dtype=np.int32)
+                y_local = np.asarray(y_batch, dtype=np.int32)
+                x = jax.make_array_from_process_local_data(
+                    self.data_sharding,
+                    x_local,
+                    global_shape=(self.train_config.batch_size, x_local.shape[1]),
+                )
+                y = jax.make_array_from_process_local_data(
+                    self.data_sharding,
+                    y_local,
+                    global_shape=(self.train_config.batch_size, y_local.shape[1]),
+                )
 
                 if grad_accum_steps > 1:
                     with self.mesh:
