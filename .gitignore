@@ -10,6 +10,8 @@ archive_tests/
 eval_*
 *.jsonl
 
+predict.py
+
 # C extensions
 *.so
 

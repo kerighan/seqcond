@@ -4,9 +4,45 @@ import time
 import torch
 from datasets import load_dataset
 import os
+import random
 
 # from huggingface_hub import login
 from seqcond.torch.generator import TorchGenerator
+
+
+def _common_prefix_len(a, b):
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len):
+    if len(full_tokens) < 2:
+        return float("-inf")
+
+    input_ids = torch.tensor([full_tokens], device=gen.device)
+    with torch.no_grad():
+        logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
+
+    log_probs = torch.log_softmax(logits[0], dim=-1)
+    target_tokens = input_ids[0, 1:]
+
+    seq_len = min(target_tokens.shape[0], log_probs.shape[0])
+    start_idx = max(int(prompt_prefix_len) - 1, 0)
+    if start_idx >= seq_len:
+        return float("-inf")
+
+    relevant_log_probs = log_probs[start_idx:seq_len]
+    relevant_targets = target_tokens[start_idx:seq_len]
+    if relevant_targets.numel() == 0:
+        return float("-inf")
+
+    token_log_probs = relevant_log_probs[
+        torch.arange(relevant_targets.shape[0], device=gen.device), relevant_targets
+    ]
+    return token_log_probs.mean().item()
 
 
 def evaluate_hellaswag(gen, dataset, max_samples=None):
@@ -25,26 +61,18 @@ def evaluate_hellaswag(gen, dataset, max_samples=None):
         endings = example["endings"]
         label = int(example["label"])
 
+        prompt_text = f"{ctx} "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         # Compute average log prob for each choice
         scores = []
         for ending in endings:
-            choice_text = f"{ctx} {ending}"
-            tokens = gen.tokenizer([choice_text])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            # Compute sum of log probs for next token prediction
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + ending
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         # Best choice is highest score
         best_choice = max(range(4), key=lambda i: scores[i])
@@ -73,8 +101,8 @@ def evaluate_hellaswag(gen, dataset, max_samples=None):
     return accuracy
 
 
-def evaluate_gpqa(gen, dataset, max_samples=None):
-    """Evaluate on GPQA using log probabilities for multiple choice."""
+def evaluate_openbookqa(gen, dataset, max_samples=None):
+    """Evaluate on OpenBookQA using log probabilities for multiple choice."""
     correct = 0
     total = 0
 
@@ -85,38 +113,123 @@ def evaluate_gpqa(gen, dataset, max_samples=None):
     start_time = time.time()
 
     for idx, example in enumerate(dataset):
+        # OpenBookQA schema is typically:
+        # question_stem: str
+        # choices: {text: [...], label: [...]}  (labels are A/B/C/D)
+        # answerKey: 'A'/'B'/'C'/'D'
+        question = example.get("question_stem")
+        if question is None and isinstance(example.get("question"), dict):
+            question = example["question"].get("stem")
+        if question is None:
+            question = ""
+
+        choices_obj = example.get("choices")
+        if isinstance(choices_obj, dict):
+            choices = choices_obj.get("text") or []
+            labels = choices_obj.get("label") or []
+        else:
+            choices = []
+            labels = []
+
+        answer_key = example.get("answerKey")
+        if answer_key is None:
+            answer_key = example.get("answer")
+
+        if answer_key is None:
+            label_idx = None
+        else:
+            answer_key = str(answer_key)
+            if answer_key.isdigit():
+                label_idx = int(answer_key) - 1
+            else:
+                answer_key = answer_key.strip().upper()
+                if labels and answer_key in labels:
+                    label_idx = labels.index(answer_key)
+                else:
+                    label_idx = ord(answer_key) - ord("A")
+
+        prompt_text = f"Question: {question}\nAnswer: "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
+        scores = []
+        for choice in choices:
+            full_text = prompt_text + choice
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
+
+        if scores and label_idx is not None and 0 <= label_idx < len(scores):
+            best_choice = max(range(len(scores)), key=lambda i: scores[i])
+            if best_choice == label_idx:
+                correct += 1
+        total += 1
+
+        if (idx + 1) % 100 == 0:
+            elapsed = time.time() - start_time
+            speed = (idx + 1) / elapsed
+            acc = (correct / total * 100) if total > 0 else 0.0
+            print(
+                f"  {idx + 1}/{len(dataset)} | Acc: {acc:.1f}% | Speed: {speed:.1f} samples/s"
+            )
+
+    elapsed = time.time() - start_time
+    accuracy = (correct / total * 100) if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
+def evaluate_gpqa(gen, dataset, max_samples=None):
+    """Evaluate on GPQA using log probabilities for multiple choice."""
+    correct = 0
+    total = 0
+
+    rng = random.Random(0)
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    print(f"Evaluating on {len(dataset)} samples...")
+    start_time = time.time()
+
+    for idx, example in enumerate(dataset):
         question = example["Question"]
-        choices = [
-            example["Correct Answer"],
-            example["Incorrect Answer 1"],
-            example["Incorrect Answer 2"],
-            example["Incorrect Answer 3"],
+        choices_with_label = [
+            (example["Correct Answer"], True),
+            (example["Incorrect Answer 1"], False),
+            (example["Incorrect Answer 2"], False),
+            (example["Incorrect Answer 3"], False),
         ]
+        rng.shuffle(choices_with_label)
+        choices = [c for c, _ in choices_with_label]
+        label_idx = next(
+            i for i, (_, is_correct) in enumerate(choices_with_label) if is_correct
+        )
+
+        prompt_text = f"{question}\nAnswer: "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
 
         # Compute average log prob for each choice
         scores = []
         for choice in choices:
-            choice_text = f"{question}\nAnswer: {choice}"
-            tokens = gen.tokenizer([choice_text])[0]
+            full_text = prompt_text + choice
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            # Compute sum of log probs for next token prediction
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
-
-        # Best choice is highest score, correct answer is always index 0
+        # Best choice is highest score
         best_choice = max(range(4), key=lambda i: scores[i])
-        if best_choice == 0:
+        if best_choice == label_idx:
             correct += 1
         total += 1
 
@@ -157,26 +270,18 @@ def evaluate_mmlu(gen, dataset, max_samples=None):
         choices = example["choices"]
         label = example["answer"]  # Index of correct answer (0-3)
 
+        prompt_text = f"{question}\nAnswer: "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         # Compute average log prob for each choice
         scores = []
         for choice in choices:
-            choice_text = f"{question}\nAnswer: {choice}"
-            tokens = gen.tokenizer([choice_text])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            # Compute sum of log probs for next token prediction
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + choice
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         # Best choice is highest score
         best_choice = max(range(len(choices)), key=lambda i: scores[i])
@@ -221,6 +326,9 @@ def evaluate_arc(gen, dataset, max_samples=None):
         choices = example["choices"]["text"]
         label = example["answerKey"]
 
+        prompt_text = f"{question}\nAnswer: "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         # Convert label (A, B, C, D, etc.) to index
         if label.isdigit():
             label_idx = int(label) - 1
@@ -230,22 +338,12 @@ def evaluate_arc(gen, dataset, max_samples=None):
         # Compute average log prob for each choice
         scores = []
         for choice in choices:
-            choice_text = f"{question}\nAnswer: {choice}"
-            tokens = gen.tokenizer([choice_text])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + choice
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         best_choice = max(range(len(choices)), key=lambda i: scores[i])
         if best_choice == label_idx:
@@ -290,25 +388,18 @@ def evaluate_piqa(gen, dataset, max_samples=None):
         sol2 = example["sol2"]
         label = example["label"]
 
+        prompt_text = f"{goal}\n"
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         # Compute log prob for each solution
         scores = []
         for solution in [sol1, sol2]:
-            choice_text = f"{goal}\n{solution}"
-            tokens = gen.tokenizer([choice_text])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + solution
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         best_choice = max(range(2), key=lambda i: scores[i])
         if best_choice == label:
@@ -353,28 +444,22 @@ def evaluate_winogrande(gen, dataset, max_samples=None):
         option2 = example["option2"]
         answer = example["answer"]
 
+        prefix, sep, suffix = sentence.partition("_")
+        prompt_text = prefix
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         # answer is "1" or "2"
         label = int(answer) - 1
 
         # Replace _ with each option
         scores = []
         for option in [option1, option2]:
-            choice_text = sentence.replace("_", option)
-            tokens = gen.tokenizer([choice_text])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + option + suffix
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         best_choice = max(range(2), key=lambda i: scores[i])
         if best_choice == label:
@@ -500,28 +585,21 @@ def evaluate_commonsenseqa(gen, dataset, max_samples=None):
         labels = example["choices"]["label"]
         answer_key = example["answerKey"]
 
+        prompt_text = f"Question: {question}\nAnswer: "
+        prompt_tokens = gen.tokenizer([prompt_text])[0]
+
         if (idx + 1) % 50 == 0:
             print(f"Progress: {idx + 1}/{len(dataset)}")
 
         # Compute log probability for each choice
         scores = []
         for choice in choices:
-            prompt = f"Question: {question}\nAnswer: {choice}"
-            tokens = gen.tokenizer([prompt])[0]
-
-            if len(tokens) < 2:
-                scores.append(float("-inf"))
-                continue
-
-            input_ids = torch.tensor([tokens], device=gen.device)
-            with torch.no_grad():
-                logits, _ = gen.model.prefill(input_ids, return_all_logits=True)
-
-            log_probs = torch.log_softmax(logits[0], dim=-1)
-            target_tokens = torch.tensor(tokens[1:], device=gen.device)
-            seq_len = min(len(tokens) - 1, log_probs.shape[0])
-            token_log_probs = log_probs[torch.arange(seq_len), target_tokens[:seq_len]]
-            scores.append(token_log_probs.mean().item())
+            full_text = prompt_text + choice
+            full_tokens = gen.tokenizer([full_text])[0]
+            prompt_prefix_len = _common_prefix_len(prompt_tokens, full_tokens)
+            scores.append(
+                _score_continuation_from_tokens(gen, full_tokens, prompt_prefix_len)
+            )
 
         best_choice_idx = max(range(len(choices)), key=lambda i: scores[i])
         predicted_label = labels[best_choice_idx]
@@ -682,13 +760,17 @@ def evaluate_hotpotqa(gen, dataset, max_samples=None):
 # 40k = 38.36%
 # 60k = 39.12%
 # 80k = 39.74%
+# 150k = 41.27%
+# 170k = 41.87%
+# 180k = 42.25%
+# 190k = 41.87%
 
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_80k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_190k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -792,25 +874,21 @@ def main():
                     choices = example["choices"]
                     label = example["answer"]
 
+                    prompt_text = f"{question}\nAnswer: "
+                    prompt_tokens = gen.tokenizer([prompt_text])[0]
+
                     scores = []
                     for choice in choices:
-                        choice_text = f"{question}\nAnswer: {choice}"
-                        tokens = gen.tokenizer([choice_text])[0]
-                        if len(tokens) < 2:
-                            scores.append(float("-inf"))
-                            continue
-                        input_ids = torch.tensor([tokens], device=gen.device)
-                        with torch.no_grad():
-                            logits, _ = gen.model.prefill(
-                                input_ids, return_all_logits=True
+                        full_text = prompt_text + choice
+                        full_tokens = gen.tokenizer([full_text])[0]
+                        prompt_prefix_len = _common_prefix_len(
+                            prompt_tokens, full_tokens
+                        )
+                        scores.append(
+                            _score_continuation_from_tokens(
+                                gen, full_tokens, prompt_prefix_len
                             )
-                        log_probs = torch.log_softmax(logits[0], dim=-1)
-                        target_tokens = torch.tensor(tokens[1:], device=gen.device)
-                        seq_len = min(len(tokens) - 1, log_probs.shape[0])
-                        token_log_probs = log_probs[
-                            torch.arange(seq_len), target_tokens[:seq_len]
-                        ]
-                        scores.append(token_log_probs.mean().item())
+                        )
 
                     best_choice = max(range(len(choices)), key=lambda i: scores[i])
                     if best_choice == label:
@@ -880,6 +958,12 @@ def main():
         dataset = load_dataset("commonsense_qa", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_commonsenseqa(gen, dataset, max_samples=args.max_samples)
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+    elif args.benchmark == "openbookqa":
+        print(f"\nLoading OpenBookQA dataset (split={args.split})...")
+        dataset = load_dataset("openbookqa", "main", split=args.split)
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_openbookqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
     elif args.benchmark == "triviaqa":
         print(f"\nLoading TriviaQA dataset (split={args.split})...")
