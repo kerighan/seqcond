@@ -932,8 +932,14 @@ def create_optimizer(
     clipnorm: float = 1.0,
     beta_1: float = 0.9,
     beta_2: float = 0.999,
+    optimizer_type: str = "adamw",
 ) -> optax.GradientTransformation:
-    """Create an AdamW optimizer with warmup + cosine decay schedule."""
+    """Create an optimizer with warmup + cosine decay schedule.
+
+    Args:
+        optimizer_type: 'adamw' or 'muon'. Muon applies Newton-Schulz orthogonalization
+            to 2D weight matrices and AdamW to everything else (embeddings, biases, norms).
+    """
     lr_schedule = warmup_cosine_decay_schedule(
         base_lr=base_lr,
         warmup_steps=warmup_steps,
@@ -941,17 +947,30 @@ def create_optimizer(
         alpha=1e-5,
     )
 
-    return optax.chain(
-        optax.clip_by_global_norm(clipnorm),
-        optax.adamw(
-            learning_rate=lr_schedule,
-            b1=beta_1,
-            b2=beta_2,
-            eps=1e-7,
-            mu_dtype=jnp.float32,
-            weight_decay=weight_decay,
-        ),
-    )
+    if optimizer_type == "muon":
+        return optax.chain(
+            optax.clip_by_global_norm(clipnorm),
+            optax.contrib.muon(
+                learning_rate=lr_schedule,
+                beta=beta_1,
+                weight_decay=weight_decay,
+                adam_b1=beta_1,
+                adam_b2=beta_2,
+                adam_weight_decay=weight_decay,
+            ),
+        )
+    else:
+        return optax.chain(
+            optax.clip_by_global_norm(clipnorm),
+            optax.adamw(
+                learning_rate=lr_schedule,
+                b1=beta_1,
+                b2=beta_2,
+                eps=1e-7,
+                mu_dtype=jnp.float32,
+                weight_decay=weight_decay,
+            ),
+        )
 
 
 def sparse_categorical_crossentropy_loss(

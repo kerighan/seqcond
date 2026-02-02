@@ -215,6 +215,13 @@ def parse_args():
         help="Learning rate (supports scientific notation like 1e-3, 6e-4)",
     )
     grp_train.add_argument(
+        "--optimizer",
+        choices=["adamw", "muon"],
+        default="adamw",
+        dest="optimizer_type",
+        help="Optimizer: adamw (default) or muon (Newton-Schulz for 2D weights + AdamW for rest)",
+    )
+    grp_train.add_argument(
         "--no-remat",
         action="store_true",
         help="Disable gradient checkpointing (rematerialization)",
@@ -355,6 +362,7 @@ def get_config(args) -> Config:
         "base_lr",
         "generate_every_n_steps",
         "grad_accum_steps",
+        "optimizer_type",
     ]
     for field in train_fields:
         val = getattr(args, field)

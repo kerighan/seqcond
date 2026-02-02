@@ -547,6 +547,7 @@ class Trainer:
         self.model = create_model_from_config(self.model_config)
 
         # Create optimizer
+        optimizer_type = getattr(self.train_config, "optimizer_type", "adamw")
         self._base_optimizer = create_optimizer(
             base_lr=self.train_config.base_lr,
             warmup_steps=self.train_config.warmup_steps,
@@ -555,7 +556,9 @@ class Trainer:
             clipnorm=self.train_config.clipnorm,
             beta_1=self.train_config.beta_1,
             beta_2=self.train_config.beta_2,
+            optimizer_type=optimizer_type,
         )
+        print(f"Optimizer: {optimizer_type}")
         self.optimizer = self._base_optimizer
 
         # Store LR schedule for logging

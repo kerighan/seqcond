@@ -145,6 +145,7 @@ class TrainingConfig:
     maxlen: int = 768
 
     # Optimizer
+    optimizer_type: Literal["adamw", "muon"] = "adamw"
     base_lr: float = 1e-3
     warmup_steps: int = 100
     total_steps: int = 100000
