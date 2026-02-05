@@ -264,7 +264,7 @@ def iterate_fineweb(
     # Document-level sharding: each process takes every Nth document
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
-        name="sample-350BT",
+        name="sample-100BT",
         split="train",
         streaming=True,
     )

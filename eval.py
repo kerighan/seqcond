@@ -5,9 +5,23 @@ import torch
 from datasets import load_dataset
 import os
 import random
+import subprocess
 
 # from huggingface_hub import login
 from seqcond.torch.generator import TorchGenerator
+
+
+def _send_notification(title: str, message: str):
+    """Send a Linux desktop notification."""
+    try:
+        subprocess.run(
+            ["notify-send", title, message],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
 
 
 def _common_prefix_len(a, b):
@@ -770,7 +784,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_190k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_320k.pt")
+    # parser.add_argument("--checkpoint", default="checkpoints/seqcond_opt_5_torch.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -821,6 +836,7 @@ def main():
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_hellaswag(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"HellaSwag: {accuracy:.2f}%")
     elif args.benchmark == "gpqa:diamond":
         print(f"\nLoading GPQA Diamond dataset...")
         # Pass token explicitly to load_dataset
@@ -831,6 +847,7 @@ def main():
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_gpqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"GPQA Diamond: {accuracy:.2f}%")
     elif args.benchmark.startswith("mmlu"):
         # Support mmlu:all or mmlu:subset_name
         parts = args.benchmark.split(":")
@@ -841,6 +858,7 @@ def main():
             print(f"Dataset loaded: {len(dataset)} examples\n")
             accuracy = evaluate_mmlu(gen, dataset, max_samples=args.max_samples)
             print(f"\nFinal Accuracy: {accuracy:.2f}%")
+            _send_notification("Évaluation terminée", f"MMLU {subset}: {accuracy:.2f}%")
         else:
             # Evaluate on all MMLU subsets
             print(f"\nLoading all MMLU subsets (split={args.split})...")
@@ -906,6 +924,7 @@ def main():
                 f"Overall MMLU Accuracy: {overall_acc:.2f}% ({all_correct}/{all_total})"
             )
             print(f"{'='*60}")
+            _send_notification("Évaluation terminée", f"MMLU (all): {overall_acc:.2f}%")
     elif args.benchmark.startswith("arc"):
         # Support arc:easy, arc:challenge, or arc (both)
         parts = args.benchmark.split(":")
@@ -918,8 +937,10 @@ def main():
             print(f"Dataset loaded: {len(dataset)} examples\n")
             accuracy = evaluate_arc(gen, dataset, max_samples=args.max_samples)
             print(f"\nFinal Accuracy: {accuracy:.2f}%")
+            _send_notification("Évaluation terminée", f"ARC-{subset}: {accuracy:.2f}%")
         else:
             # Evaluate both easy and challenge
+            accuracies = {}
             for subset in ["Easy", "Challenge"]:
                 print(f"\n--- ARC-{subset} ---")
                 dataset = load_dataset(
@@ -927,7 +948,15 @@ def main():
                 )
                 print(f"Dataset loaded: {len(dataset)} examples\n")
                 accuracy = evaluate_arc(gen, dataset, max_samples=args.max_samples)
+                accuracies[subset] = accuracy
                 print(f"ARC-{subset} Accuracy: {accuracy:.2f}%")
+
+            # Calculate and display average
+            avg_accuracy = sum(accuracies.values()) / len(accuracies)
+            print(f"\n{'='*60}")
+            print(f"ARC (average): {avg_accuracy:.2f}%")
+            print(f"{'='*60}")
+            _send_notification("Évaluation terminée", f"ARC (avg): {avg_accuracy:.2f}%")
     elif args.benchmark == "piqa":
         print(f"\nLoading PIQA dataset (split={args.split})...")
         dataset = load_dataset(
@@ -936,6 +965,7 @@ def main():
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_piqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"PIQA: {accuracy:.2f}%")
     elif args.benchmark.startswith("winogrande"):
         # Support winogrande:xl, winogrande:l, etc.
         parts = args.benchmark.split(":")
@@ -947,36 +977,42 @@ def main():
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_winogrande(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"Winogrande: {accuracy:.2f}%")
     elif args.benchmark == "gsm8k":
         print(f"\nLoading GSM8K dataset (split={args.split})...")
         dataset = load_dataset("openai/gsm8k", "main", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_gsm8k(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"GSM8K: {accuracy:.2f}%")
     elif args.benchmark == "commonsenseqa":
         print(f"\nLoading CommonsenseQA dataset (split={args.split})...")
         dataset = load_dataset("commonsense_qa", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_commonsenseqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"CommonsenseQA: {accuracy:.2f}%")
     elif args.benchmark == "openbookqa":
         print(f"\nLoading OpenBookQA dataset (split={args.split})...")
         dataset = load_dataset("openbookqa", "main", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_openbookqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"OpenBookQA: {accuracy:.2f}%")
     elif args.benchmark == "triviaqa":
         print(f"\nLoading TriviaQA dataset (split={args.split})...")
         dataset = load_dataset("trivia_qa", "unfiltered.nocontext", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_triviaqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"TriviaQA: {accuracy:.2f}%")
     elif args.benchmark == "hotpotqa":
         print(f"\nLoading HotpotQA dataset (split={args.split})...")
         dataset = load_dataset("hotpot_qa", "distractor", split=args.split)
         print(f"Dataset loaded: {len(dataset)} examples\n")
         accuracy = evaluate_hotpotqa(gen, dataset, max_samples=args.max_samples)
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"HotpotQA: {accuracy:.2f}%")
     else:
         print(f"Benchmark {args.benchmark} not implemented yet")
 

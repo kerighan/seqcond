@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]
-# Example: ./copy_checkpoint.sh seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step80000.pkl
+# Example: ./copy_checkpoint.sh seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step320000.pkl
 
 # Set correct GCloud project
 gcloud config set project seqcond --quiet
