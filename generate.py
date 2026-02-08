@@ -11,7 +11,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_opt_torch.pt",
+        # default="checkpoints/seqcond_opt_torch.pt",
+        default="checkpoints/seqcond_torch_330k.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",

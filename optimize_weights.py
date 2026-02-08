@@ -5,6 +5,8 @@ import numpy as np
 from scipy.optimize import minimize
 from itertools import combinations
 import argparse
+import subprocess
+import os
 
 
 # Example benchmark data: rows are checkpoints, columns are benchmarks
@@ -140,6 +142,42 @@ def objective_hybrid(
 
     # Combine: rank (units) + score penalty (decimals)
     return avg_rank + score_component
+
+
+def topn_softmax_weights(
+    scores: np.ndarray,
+    n: int,
+    temperature: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Select top N checkpoints by mean score and weight them using softmax.
+
+    Args:
+        scores: (n_checkpoints, n_benchmarks) array of scores
+        n: Number of top checkpoints to select
+        temperature: Softmax temperature (lower = sharper distribution)
+
+    Returns:
+        indices: Indices of selected checkpoints
+        weights: Softmax weights based on mean scores
+    """
+    means = np.nanmean(scores, axis=1)
+
+    # Get top N indices by mean score
+    top_indices = np.argsort(means)[-n:][::-1]  # Descending order
+    top_means = means[top_indices]
+
+    # Softmax weighting
+    # Shift for numerical stability
+    shifted = (top_means - top_means.max()) / temperature
+    exp_scores = np.exp(shifted)
+    weights = exp_scores / exp_scores.sum()
+
+    print(f"Top {n} checkpoints by mean score:")
+    for idx, (i, m, w) in enumerate(zip(top_indices, top_means, weights)):
+        print(f"  {idx+1}. Index {i}: mean={m:.2f}, weight={w:.4f}")
+
+    return top_indices, weights
 
 
 def optimize_weights(
@@ -298,6 +336,25 @@ Example:
         default="hybrid",
         help="Optimization method: 'total' (max score), 'rank' (best avg rank), or 'hybrid' (balanced)",
     )
+    parser.add_argument(
+        "--generate",
+        "-g",
+        action="store_true",
+        help="Generate the averaged checkpoint (runs average_checkpoints.py and convert_jax_to_torch.py)",
+    )
+    parser.add_argument(
+        "--topn",
+        type=int,
+        default=None,
+        help="Use top N checkpoints by mean score with softmax weighting (alternative to optimization)",
+    )
+    parser.add_argument(
+        "--temperature",
+        "-t",
+        type=float,
+        default=1.0,
+        help="Temperature for softmax weighting with --topn (lower = sharper, default=1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -323,12 +380,20 @@ Example:
         mean = np.nanmean(row)
         print(f"{step:>6} | {mean:>8.2f} | {row}")
 
-    # Optimize
-    print(f"\n--- Optimizing with method='{args.method}', n={args.n or 'all'} ---")
-
-    best_indices, best_weights, best_obj = optimize_weights(
-        scores, n_checkpoints=args.n, method=args.method
-    )
+    # Optimize or use top-N with softmax
+    if args.topn:
+        print(
+            f"\n--- Using top {args.topn} checkpoints with softmax weighting (T={args.temperature}) ---"
+        )
+        best_indices, best_weights = topn_softmax_weights(
+            scores, n=args.topn, temperature=args.temperature
+        )
+        best_obj = None
+    else:
+        print(f"\n--- Optimizing with method='{args.method}', n={args.n or 'all'} ---")
+        best_indices, best_weights, best_obj = optimize_weights(
+            scores, n_checkpoints=args.n, method=args.method
+        )
 
     # Show results
     print("\n" + "=" * 60)
@@ -354,15 +419,49 @@ Example:
     )
 
     # Generate command for average_checkpoints.py
-    print("\n--- Command to create averaged checkpoint ---")
-    cmd_parts = ["python average_checkpoints.py"]
+    n_label = args.topn if args.topn else args.n
+    output_pkl = f"checkpoints/seqcond_opt_{n_label}.pkl"
+    output_torch = f"checkpoints/seqcond_opt_{n_label}_torch.pt"
+
+    cmd_avg_parts = ["python", "average_checkpoints.py"]
     for step, weight in zip(selected_steps, best_weights):
         if weight > 0.001:
-            cmd_parts.append(f"{int(step * 1000)},{weight:.4f}")
-    cmd_parts.append(f"-o checkpoints/seqcond_opt_{args.n}.pkl")
-    # python convert_jax_to_torch.py checkpoints/seqcond_opt.pkl --torch_path checkpoints/seqcond_opt_torch.pt
-    cmd_py = f"python convert_jax_to_torch.py checkpoints/seqcond_opt_{args.n}.pkl --torch_path checkpoints/seqcond_opt_{args.n}_torch.pt"
-    print(" ".join(cmd_parts) + ";" + cmd_py)
+            cmd_avg_parts.append(f"{int(step * 1000)},{weight:.4f}")
+    cmd_avg_parts.extend(["-o", output_pkl])
+
+    cmd_convert_parts = [
+        "python",
+        "convert_jax_to_torch.py",
+        output_pkl,
+        "--torch_path",
+        output_torch,
+    ]
+
+    print("\n--- Command to create averaged checkpoint ---")
+    print(" ".join(cmd_avg_parts))
+    print(" ".join(cmd_convert_parts))
+
+    if args.generate:
+        print("\n--- Generating averaged checkpoint ---")
+        print(f"Running: {' '.join(cmd_avg_parts)}")
+        result = subprocess.run(
+            cmd_avg_parts, cwd=os.path.dirname(os.path.abspath(__file__)) or "."
+        )
+        if result.returncode != 0:
+            print(f"Error: average_checkpoints.py failed with code {result.returncode}")
+            return
+
+        print(f"\nRunning: {' '.join(cmd_convert_parts)}")
+        result = subprocess.run(
+            cmd_convert_parts, cwd=os.path.dirname(os.path.abspath(__file__)) or "."
+        )
+        if result.returncode != 0:
+            print(
+                f"Error: convert_jax_to_torch.py failed with code {result.returncode}"
+            )
+            return
+
+        print(f"\n✓ Generated: {output_torch}")
 
 
 if __name__ == "__main__":
