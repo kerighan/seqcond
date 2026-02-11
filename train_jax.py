@@ -329,7 +329,7 @@ def get_config(args) -> Config:
         weight_decay=1e-2,
         clipnorm=1.0,
         beta_1=0.9,
-        beta_2=0.95,
+        beta_2=0.99,
         grad_accum_steps=1,
         mixed_precision="bfloat16",
         keep_weights_fp32=True,
