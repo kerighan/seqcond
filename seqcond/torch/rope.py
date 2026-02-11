@@ -199,10 +199,12 @@ class RotarySelfAttention(nn.Module):
         # Update KV cache
         k_cache, v_cache = kv_cache
 
-        # Use index_copy_ for CUDA graph compatibility (no dynamic slicing)
-        pos_idx = pos[0:1].long()
-        k_cache.index_copy_(1, pos_idx, k_new.to(k_cache.dtype))
-        v_cache.index_copy_(1, pos_idx, v_new.to(v_cache.dtype))
+        # Per-sample KV cache write using scatter_ (supports different positions per batch element)
+        pos_idx = (
+            pos.long().view(b, 1, 1, 1).expand(-1, 1, k_new.size(2), k_new.size(3))
+        )
+        k_cache.scatter_(1, pos_idx, k_new.to(k_cache.dtype))
+        v_cache.scatter_(1, pos_idx, v_new.to(v_cache.dtype))
 
         # Use seq_len slice if provided (power-of-2 optimization), else full cache
         if seq_len is not None:
@@ -219,7 +221,7 @@ class RotarySelfAttention(nn.Module):
 
         # Create mask for positions > current pos within the slice
         all_pos = torch.arange(L, device=k_cache.device)
-        mask = all_pos.view(1, 1, 1, L) > pos[0:1].view(b, 1, 1, 1)
+        mask = all_pos.view(1, 1, 1, L) > pos.long().view(b, 1, 1, 1)
 
         # Attention with masking
         scale = 1.0 / math.sqrt(self.head_dim)

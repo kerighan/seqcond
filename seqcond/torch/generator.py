@@ -23,6 +23,9 @@ class TorchGenerator:
         self.device = device
         self.config = checkpoint["config"]
         self.tokenizer = Tokenizer()
+        self.eos_token_id = self.tokenizer.encode("<|im_end|>")[0]
+        self.think_start_id = self.tokenizer.encode("<|think_start|>")[0]
+        self.think_end_id = self.tokenizer.encode("<|think_end|>")[0]
         self.compile = compile
 
         # Set dtype
@@ -60,7 +63,7 @@ class TorchGenerator:
 
     def _capture_graph_for_seq_len(self, seq_len: int):
         """Capture CUDA graph for a specific seq_len, preserving states."""
-        print(f"Capturing graph for seq_len={seq_len}...")
+        # print(f"Capturing graph for seq_len={seq_len}...")
 
         # Save current states (deep copy of tensor values)
         saved = self.model.init_state(1, device=self.device)
@@ -146,6 +149,7 @@ class TorchGenerator:
         use_cuda_graph: bool = False,
         use_triton: bool = False,
         use_synth_template: bool = True,
+        max_thinking_tokens: Optional[int] = None,
     ) -> str:
 
         if use_synth_template:
@@ -170,9 +174,14 @@ class TorchGenerator:
         for t in tokens:
             token_counts[t] = token_counts.get(t, 0) + 1
 
+        # Track thinking tokens for budget
+        in_thinking = use_synth_template  # We start inside <|think_start|>
+        thinking_tokens = 0
+        think_end_injected = False
+
         # Generate
-        if verbose:
-            print(prompt, end="", flush=True)
+        # if verbose:
+        #     print(prompt, end="", flush=True)
         for _ in range(max_new_tokens):
             # Apply temperature
             if temperature > 0:
@@ -226,15 +235,40 @@ class TorchGenerator:
                 probs = F.softmax(logits_scaled, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).item()
 
+            # Track thinking state
+            if next_token == self.think_end_id:
+                in_thinking = False
+            elif next_token == self.think_start_id:
+                in_thinking = True
+                thinking_tokens = 0
+
+            if in_thinking:
+                thinking_tokens += 1
+
+            # Inject <|think_end|> if thinking budget exhausted
+            if (
+                max_thinking_tokens is not None
+                and in_thinking
+                and thinking_tokens >= max_thinking_tokens
+                and not think_end_injected
+            ):
+                next_token = self.think_end_id
+                in_thinking = False
+                think_end_injected = True
+
             generated.append(next_token)
             token_counts[next_token] = token_counts.get(next_token, 0) + 1
 
-            if verbose:
-                try:
-                    print(self.tokenizer.decode([next_token]), end="", flush=True)
-                except Exception as e:
-                    # print(f"Error decoding token: {e}")
-                    next_token = 12
+            # if verbose:
+            try:
+                # print(self.tokenizer.decode([next_token]), end="", flush=True)
+                yield self.tokenizer.decode([next_token])
+            except Exception as e:
+                print(f"Error decoding token: {e}")
+
+            # Stop if we hit the end token
+            if next_token == self.eos_token_id:
+                break
 
             # Next step
             token_tensor[0, 0] = next_token
@@ -271,3 +305,140 @@ class TorchGenerator:
             return self.tokenizer.decode(generated)
         except Exception as e:
             print(f"Error decoding token: {e}")
+
+    @staticmethod
+    def _stack_states(all_states):
+        """Stack states from multiple individual prefills into a single batched state.
+
+        Each element of all_states is a list of block states from one prefill (B=1).
+        Returns a single list of block states with B = len(all_states).
+        """
+        num_blocks = len(all_states[0])
+        batched = []
+        for block_idx in range(num_blocks):
+            block_state_tuple = tuple(
+                torch.cat([s[block_idx][tensor_idx] for s in all_states], dim=0)
+                for tensor_idx in range(len(all_states[0][block_idx]))
+            )
+            batched.append(block_state_tuple)
+        return batched
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 0.0,
+        use_synth_template: bool = True,
+        max_thinking_tokens: Optional[int] = None,
+    ) -> List[str]:
+        """Generate completions for a batch of prompts in parallel.
+
+        Prefills each prompt individually (no padding noise in states),
+        stacks the states, then decodes in lockstep with per-sample positions.
+
+        Returns a list of generated strings (completion only, no prompt).
+        """
+        B = len(prompts)
+        if B == 0:
+            return []
+
+        # Tokenize all prompts
+        if use_synth_template:
+            prompts = [
+                "<|im_start|>user\n"
+                + p
+                + "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
+                for p in prompts
+            ]
+        all_tokens = self.tokenizer(prompts)
+        prompt_lens = [len(t) for t in all_tokens]
+        max_prompt_len = max(prompt_lens)
+
+        # Clamp max_new_tokens so longest prompt doesn't exceed maxlen
+        model_maxlen = getattr(self.model, "maxlen", 2048)
+        max_new_tokens = min(max_new_tokens, model_maxlen - max_prompt_len - 1)
+        if max_new_tokens <= 0:
+            return [""] * B
+
+        # Individual prefill for each prompt (no padding, clean states)
+        all_logits = []
+        all_states = []
+        for tokens in all_tokens:
+            input_ids = torch.tensor([tokens], device=self.device)  # (1, L_i)
+            logits, states = self.model.prefill(input_ids)
+            all_logits.append(logits.squeeze(1))  # (1, vocab_size)
+            all_states.append(states)
+
+        # Stack into batched tensors
+        logits = torch.cat(all_logits, dim=0)  # (B, vocab_size)
+        states = self._stack_states(all_states)
+
+        # Track generated tokens per sample and finished status
+        generated = [[] for _ in range(B)]
+        finished = [False] * B
+        thinking_counts = [0] * B
+        in_thinking = [use_synth_template] * B  # start inside <|think_start|>
+        think_end_injected = [False] * B
+        token_tensor = torch.zeros((B, 1), dtype=torch.long, device=self.device)
+
+        for step_idx in range(max_new_tokens):
+            # Greedy or temperature sampling
+            if temperature == 0:
+                next_tokens = torch.argmax(logits, dim=-1)  # (B,)
+            else:
+                logits_scaled = logits / temperature
+                probs = F.softmax(logits_scaled, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+            # Record tokens and check EOS
+            for i in range(B):
+                if not finished[i]:
+                    tok = next_tokens[i].item()
+
+                    # Track thinking state
+                    if tok == self.think_end_id:
+                        in_thinking[i] = False
+                    elif tok == self.think_start_id:
+                        in_thinking[i] = True
+                        thinking_counts[i] = 0
+
+                    if in_thinking[i]:
+                        thinking_counts[i] += 1
+
+                    # Inject <|think_end|> if thinking budget exhausted
+                    if (
+                        max_thinking_tokens is not None
+                        and in_thinking[i]
+                        and thinking_counts[i] >= max_thinking_tokens
+                        and not think_end_injected[i]
+                    ):
+                        tok = self.think_end_id
+                        next_tokens[i] = tok
+                        in_thinking[i] = False
+                        think_end_injected[i] = True
+
+                    generated[i].append(tok)
+                    if tok == self.eos_token_id:
+                        finished[i] = True
+
+            if all(finished):
+                break
+
+            # For finished samples, feed EOS to keep states in sync
+            next_tokens[torch.tensor(finished, device=self.device)] = self.eos_token_id
+            token_tensor[:, 0] = next_tokens
+
+            logits, states = self.model.step(token_tensor, states)
+
+        # Decode each sample's generated tokens (strip trailing EOS)
+        results = []
+        for i in range(B):
+            toks = generated[i]
+            if toks and toks[-1] == self.eos_token_id:
+                toks = toks[:-1]
+            try:
+                results.append(self.tokenizer.decode(toks))
+            except Exception:
+                results.append("")
+        return results

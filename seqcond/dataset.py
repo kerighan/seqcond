@@ -59,7 +59,7 @@ tokenizer = Tokenizer(
 
 def format_synth_item(item: dict) -> str:
     """Format a SYNTH dataset item into chat format."""
-    if len(str(item["constraints"])) > 0:
+    if len(str(item["constraints"])) > 0 and "rag" == item["exercise"]:
         query = item["query"] + "\n\n" + item["constraints"]
     else:
         query = item["query"]
@@ -105,20 +105,26 @@ def iterate_synth(
     # Counter for total samples yielded by this process
     samples_yielded = 0
 
+    # Load dataset once; use set_epoch() to reshuffle each epoch
+    dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+
+    # Use native HuggingFace sharding - each process only iterates its shard
+    if process_count > 1:
+        dataset = split_dataset_by_node(
+            dataset, rank=process_index, world_size=process_count
+        )
+
+    # Shuffle with a buffer; set_epoch() will reseed as (seed + epoch)
+    dataset = dataset.shuffle(seed=42, buffer_size=10_000)
+
     # Loop indefinitely if max_samples is None
     epoch = 0
     while True:
         if epoch > 0:
             print(
-                f"[Process {process_index}] SYNTH dataset reloading (epoch {epoch})..."
+                f"[Process {process_index}] SYNTH dataset reshuffling (epoch {epoch})..."
             )
-        dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
-
-        # Use native HuggingFace sharding - each process only iterates its shard
-        if process_count > 1:
-            dataset = split_dataset_by_node(
-                dataset, rank=process_index, world_size=process_count
-            )
+        dataset.set_epoch(epoch)
 
         epoch += 1
 

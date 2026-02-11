@@ -1,20 +1,29 @@
 #!/bin/bash
 
 # Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]
+#        ./copy_checkpoint.sh --local <local_path> [TPU_NAME] [ZONE]
 # Example: ./copy_checkpoint.sh seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step320000.pkl
+# Example: ./copy_checkpoint.sh --local /tmp/my_checkpoint.pkl node-v4-64 us-central2-b
 
 # Set correct GCloud project
 gcloud config set project seqcond --quiet
+
+# Parse --local flag
+FROM_LOCAL=false
+if [ "$1" = "--local" ]; then
+    FROM_LOCAL=true
+    shift
+fi
 
 CHECKPOINT=$1
 TPU_NAME="${2:-node-v4-64}"
 ZONE="${3:-us-central2-b}"
 REMOTE_DIR="/home/maixent/seqcond/checkpoints"
 SOURCE_WORKER=1
-LOCAL_TMP="/tmp/$CHECKPOINT"
 
 if [ -z "$CHECKPOINT" ]; then
     echo "Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]"
+    echo "       ./copy_checkpoint.sh --local <local_path> [TPU_NAME] [ZONE]"
     echo ""
     echo "Available checkpoints on worker $SOURCE_WORKER:"
     gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$SOURCE_WORKER \
@@ -22,30 +31,52 @@ if [ -z "$CHECKPOINT" ]; then
     exit 1
 fi
 
-echo "=== Copying checkpoint across TPU workers ==="
-echo "TPU Name: $TPU_NAME"
-echo "Zone: $ZONE"
-echo "Checkpoint: $CHECKPOINT"
-echo "Source worker: $SOURCE_WORKER"
-echo ""
-
-# Step 1: Download from source worker to local machine (skip if already exists)
-if [ -f "$LOCAL_TMP" ]; then
-    echo "--- Local copy already exists: $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}')) ---"
-else
-    echo "--- Downloading from worker $SOURCE_WORKER to local machine ---"
-    gcloud compute tpus tpu-vm scp "$TPU_NAME:$REMOTE_DIR/$CHECKPOINT" "$LOCAL_TMP" \
-        --zone="$ZONE" --worker=$SOURCE_WORKER
-
+if [ "$FROM_LOCAL" = true ]; then
+    # --local mode: CHECKPOINT is a local file path
+    LOCAL_TMP="$CHECKPOINT"
+    CHECKPOINT=$(basename "$LOCAL_TMP")
     if [ ! -f "$LOCAL_TMP" ]; then
-        echo "ERROR: Failed to download checkpoint"
+        echo "ERROR: Local file not found: $LOCAL_TMP"
         exit 1
     fi
-    echo "Downloaded to $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}'))"
+    echo "=== Uploading local checkpoint to ALL TPU workers ==="
+    echo "TPU Name: $TPU_NAME"
+    echo "Zone: $ZONE"
+    echo "Local file: $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}'))"
+    echo "Remote name: $CHECKPOINT"
+    echo ""
+else
+    LOCAL_TMP="/tmp/$CHECKPOINT"
+    echo "=== Copying checkpoint across TPU workers ==="
+    echo "TPU Name: $TPU_NAME"
+    echo "Zone: $ZONE"
+    echo "Checkpoint: $CHECKPOINT"
+    echo "Source worker: $SOURCE_WORKER"
+    echo ""
+
+    # Step 1: Download from source worker to local machine (skip if already exists)
+    if [ -f "$LOCAL_TMP" ]; then
+        echo "--- Local copy already exists: $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}')) ---"
+    else
+        echo "--- Downloading from worker $SOURCE_WORKER to local machine ---"
+        gcloud compute tpus tpu-vm scp "$TPU_NAME:$REMOTE_DIR/$CHECKPOINT" "$LOCAL_TMP" \
+            --zone="$ZONE" --worker=$SOURCE_WORKER
+
+        if [ ! -f "$LOCAL_TMP" ]; then
+            echo "ERROR: Failed to download checkpoint"
+            exit 1
+        fi
+        echo "Downloaded to $LOCAL_TMP ($(ls -lh $LOCAL_TMP | awk '{print $5}'))"
+    fi
 fi
 
 # Step 2: Upload to all workers that don't have it
-for i in 0 2 3 4 5 6 7; do
+ALL_WORKERS=(0 1 2 3 4 5 6 7)
+if [ "$FROM_LOCAL" = false ]; then
+    # Normal mode: skip source worker (already has it)
+    ALL_WORKERS=(0 2 3 4 5 6 7)
+fi
+for i in "${ALL_WORKERS[@]}"; do
     echo ""
     echo "--- Checking worker $i ---"
     
@@ -67,7 +98,9 @@ for i in 0 2 3 4 5 6 7; do
 done
 
 echo ""
-echo "(Local temp file kept at $LOCAL_TMP - delete manually if needed)"
+if [ "$FROM_LOCAL" = false ]; then
+    echo "(Local temp file kept at $LOCAL_TMP - delete manually if needed)"
+fi
 
 echo ""
 echo "--- Verifying checkpoint on all workers ---"

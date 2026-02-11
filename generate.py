@@ -4,6 +4,18 @@ import time
 from seqcond.torch.generator import TorchGenerator
 
 
+class bcolors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate text using SeqCond PyTorch model"
@@ -12,7 +24,7 @@ def main():
         "--checkpoint",
         type=str,
         # default="checkpoints/seqcond_opt_torch.pt",
-        default="checkpoints/seqcond_torch_330k.pt",
+        default="checkpoints/seqcond_torch_130k.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
@@ -27,7 +39,7 @@ def main():
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
-        "--temp", type=float, default=0.7, help="Sampling temperature (0.0 for greedy)"
+        "--temp", type=float, default=0.6, help="Sampling temperature (0.0 for greedy)"
     )
     parser.add_argument(
         "--top_p", type=float, default=0.9, help="Nucleus sampling top-p probability"
@@ -109,7 +121,7 @@ def main():
         gen.precompute(max_seq_len=1024, use_triton=args.use_triton)
         start = time.time()  # Reset start time after precompute
 
-    output = gen.generate(
+    generator = gen.generate(
         args.prompt,
         max_new_tokens=args.max_tokens,
         temperature=args.temp,
@@ -121,8 +133,26 @@ def main():
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
         use_triton=args.use_triton,
-        use_synth_template=False,
+        use_synth_template=True,
     )
+    output = []
+    current_color = bcolors.OKBLUE
+    print()
+    for token in generator:
+        if token == "<|think_end|>":
+            print()
+            current_color = ""
+        elif token == "<|think_start|>":
+            current_color = bcolors.OKBLUE
+        elif token == "<|im_end|>":
+            print()
+            continue
+        else:
+            if current_color:
+                print(current_color + token + bcolors.ENDC, end="", flush=True)
+            else:
+                print(token, end="", flush=True)
+        output.append(token)
 
     if torch.cuda.is_available() and not args.cpu:
         torch.cuda.synchronize()
@@ -130,16 +160,25 @@ def main():
     print()
     print("-" * 60)
     if args.quiet:
-        print(output)
+        print("".join(output))
         print("-" * 60)
     else:
         print()  # Newline after streaming output
 
-    tps = args.max_tokens / duration
+    # Count actual generated tokens (output length - prompt length)
+    # prompt_tokens = len(gen.tokenizer.encode(args.prompt))
+    if hasattr(gen, "tokenizer"):
+        total_tokens = len(output)
+        generated_tokens = max(1, total_tokens)
+    else:
+        generated_tokens = args.max_tokens
+
+    tps = generated_tokens / duration
     print(f"\nStats:")
+    print(f"  Tokens generated: {generated_tokens}")
     print(f"  Time: {duration:.2f}s")
     print(f"  Speed: {tps:.2f} tokens/sec")
-    print(f"  Latency: {duration*1000/args.max_tokens:.2f} ms/token")
+    print(f"  Latency: {duration*1000/generated_tokens:.2f} ms/token")
 
     # Memory stats
     if torch.cuda.is_available() and not args.cpu:

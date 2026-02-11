@@ -1014,7 +1014,7 @@ class Trainer:
             try:
                 if using_tf_data:
                     x_batch, y_batch, real_tokens_in_batch = next(data_iterator)
-                    tokens_seen += real_tokens_in_batch
+                    tokens_seen += int(real_tokens_in_batch)
                 else:
                     x_batch, y_batch = next(data_iterator)
 

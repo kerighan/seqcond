@@ -253,13 +253,13 @@ class SeqCondModel(nn.Module):
         x = self.embedding(token_id).squeeze(1)  # (B, D)
 
         if self.use_positional_embedding:
-            pos_idx = pos[0:1].long()
+            pos_idx = pos.long()  # (B,) — per-sample positions
             x = x + torch.index_select(self.position_embedding.weight, 0, pos_idx)
 
         # Get RoPE for current position (use index_select for CUDA graph compatibility)
-        pos_idx = pos[0:1].long()  # Keep as 1D tensor to avoid CPU sync
-        cos_t = torch.index_select(self.cos_emb, 0, pos_idx).unsqueeze(0).unsqueeze(0)
-        sin_t = torch.index_select(self.sin_emb, 0, pos_idx).unsqueeze(0).unsqueeze(0)
+        pos_idx = pos.long()  # (B,) — per-sample positions
+        cos_t = torch.index_select(self.cos_emb, 0, pos_idx).unsqueeze(1).unsqueeze(1)
+        sin_t = torch.index_select(self.sin_emb, 0, pos_idx).unsqueeze(1).unsqueeze(1)
         cos_t = cos_t.expand(B, 1, self.num_heads, -1)
         sin_t = sin_t.expand(B, 1, self.num_heads, -1)
 
