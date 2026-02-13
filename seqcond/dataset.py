@@ -3,6 +3,7 @@ Dataset utilities for training language models on PleIAs/SYNTH.
 Provides clean, framework-agnostic data loading with optional TensorFlow integration.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Iterator, Tuple, Optional, Callable, Iterable, List
 import numpy as np
@@ -115,7 +116,7 @@ def iterate_synth(
         )
 
     # Shuffle with a buffer; set_epoch() will reseed as (seed + epoch)
-    dataset = dataset.shuffle(seed=42, buffer_size=10_000)
+    dataset = dataset.shuffle(seed=43, buffer_size=100_000)
 
     # Loop indefinitely if max_samples is None
     epoch = 0
@@ -128,29 +129,73 @@ def iterate_synth(
 
         epoch += 1
 
-        for item in dataset:
-            if max_samples is not None and samples_yielded >= max_samples:
-                return
+        # Track position within this epoch so we can resume on network errors
+        epoch_position = 0
+        epoch_done = False
 
-            text = format_synth_item(item)
-
-            if tokenize:
-                try:
-                    tokens = tok.encode(text)
-                    yield tokens
-                    samples_yielded += 1
-                except ValueError as e:
-                    if "disallowed special token" in str(e):
-                        if samples_yielded % 10000 == 0:
-                            print(
-                                f"[WARNING] Skipping SYNTH sample with disallowed special token"
-                            )
+        while not epoch_done:
+            items_skipped = 0
+            try:
+                for item in dataset:
+                    # Skip items we already yielded before the error
+                    if items_skipped < epoch_position:
+                        items_skipped += 1
                         continue
+
+                    if max_samples is not None and samples_yielded >= max_samples:
+                        return
+
+                    text = format_synth_item(item)
+
+                    if tokenize:
+                        try:
+                            tokens = tok.encode(text)
+                            yield tokens
+                            samples_yielded += 1
+                            epoch_position += 1
+                        except ValueError as e:
+                            if "disallowed special token" in str(e):
+                                if samples_yielded % 10000 == 0:
+                                    print(
+                                        f"[WARNING] Skipping SYNTH sample with disallowed special token"
+                                    )
+                                epoch_position += 1
+                                continue
+                            else:
+                                raise
                     else:
-                        raise
-            else:
-                yield text
-                samples_yielded += 1
+                        yield text
+                        samples_yielded += 1
+                        epoch_position += 1
+
+                # If we get here, the epoch finished normally
+                epoch_done = True
+
+            except Exception as e:
+                err_name = type(e).__name__
+                print(
+                    f"[Process {process_index}] HF streaming error at epoch_position={epoch_position}: "
+                    f"{err_name}: {e}"
+                )
+                for wait in (30, 60, 120, 300, 300, 300):
+                    print(
+                        f"[Process {process_index}] Retrying in {wait}s (will skip to position {epoch_position})..."
+                    )
+                    time.sleep(wait)
+                    try:
+                        # Re-create the dataset iterator for this epoch
+                        dataset.set_epoch(epoch - 1)
+                        print(
+                            f"[Process {process_index}] Reconnected, resuming from position {epoch_position}"
+                        )
+                        break
+                    except Exception as retry_e:
+                        print(f"[Process {process_index}] Reconnect failed: {retry_e}")
+                else:
+                    print(
+                        f"[Process {process_index}] All retries exhausted, raising original error"
+                    )
+                    raise
 
         if max_samples is not None:
             if samples_yielded >= max_samples:

@@ -27,8 +27,9 @@ def _collect_generation(
         top_p=1.0,
         top_k=0,
         verbose=False,
-        use_cuda_graph=False,
-        use_synth_template=False,
+        use_cuda_graph=True,
+        use_synth_template=True,
+        use_triton=True,
     ):
         toks.append(tok)
     print(len(toks))
@@ -37,7 +38,7 @@ def _collect_generation(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_120k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_30k.pt")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--start", type=int, default=0)
@@ -82,7 +83,6 @@ def main():
         prompt = f"{question}\n\n" + "\n".join(
             f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
         )
-        print(correct_letter)
 
         # wrapped = _wrap_synth(prompt)
         output = _collect_generation(
@@ -90,7 +90,6 @@ def main():
             prompt,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
-            use_synth_template=True,
         )
         print("\n" + "=" * 80)
         print(f"IDX {idx} | correct={correct_letter}")
@@ -104,6 +103,9 @@ def main():
         print("\n" + "-" * 80)
         print("MODEL OUTPUT (full):\n")
         print(output)
+        print("Correct letter: " + correct_letter)
+        # break
+        print("\n" + "-" * 80)
 
         if args.pause:
             input("\n[enter] next... ")

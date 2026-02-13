@@ -15,6 +15,17 @@ from datasets import load_dataset
 from seqcond.torch.generator import TorchGenerator
 
 
+def _format_dist(choice_counts, total, parse_failures):
+    """Format choice distribution string for progress display."""
+    answered = total - parse_failures
+    if answered <= 0:
+        return ""
+    return " ".join(
+        f"{k}:{choice_counts.get(k, 0)/answered*100:.0f}%"
+        for k in sorted(choice_counts)
+    )
+
+
 def _send_notification(title: str, message: str):
     """Send a Linux desktop notification."""
     try:
@@ -182,6 +193,7 @@ def evaluate_winogrande(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(42)
 
     if max_samples:
@@ -215,11 +227,10 @@ def evaluate_winogrande(
                 correct_letter = "B" if answer == "1" else "A"
 
             prompt = (
-                f"Complete the following sentence by choosing the correct option.\n\n"
-                f"Sentence: {sentence}\n"
+                # f"Complete the following sentence by choosing the correct option.\n\n"
+                f"{sentence}\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n"
-                f"Answer with a single letter: A or B."
+                f"B. {opt_b}\n"
             )
             prompts.append(prompt)
             metadata.append((opt_a, opt_b, correct_letter))
@@ -247,6 +258,7 @@ def evaluate_winogrande(
                     print(f"    Output: {output[:200]}")
                     print(f"    Answer text: {answer_text[:200]}")
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
                     correct += 1
 
@@ -256,9 +268,11 @@ def evaluate_winogrande(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -291,6 +305,7 @@ def evaluate_gpqa(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(0)
 
     if max_samples:
@@ -323,13 +338,14 @@ def evaluate_gpqa(
             )
             correct_letter = chr(ord("A") + correct_idx)
 
+            assert len(choices) == 4
+
             prompt = (
                 f"{question}\n\n"
                 f"A. {choices[0]}\n"
                 f"B. {choices[1]}\n"
                 f"C. {choices[2]}\n"
-                f"D. {choices[3]}\n\n"
-                f"Answer with a single letter: A, B, C, or D."
+                f"D. {choices[3]}"
             )
             prompts.append(prompt)
             metadata.append((choices, correct_letter))
@@ -355,6 +371,7 @@ def evaluate_gpqa(
                     print(f"    Output: {output[:200]}")
                     print(f"    Answer text: {answer_text[:200]}")
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
                     correct += 1
 
@@ -363,9 +380,11 @@ def evaluate_gpqa(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -449,14 +468,8 @@ def evaluate_openbookqa(
             )
             correct_letter = chr(ord("A") + new_correct_idx)
 
-            prompt = (
-                f"Question: {question}\n\n"
-                + "\n".join(
-                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
-                )
-                + "\n\nAnswer with a single letter: "
-                + ", ".join(chr(ord("A") + j) for j in range(len(shuffled_choices)))
-                + "."
+            prompt = f"{question}\n\n" + "\n".join(
+                f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
             prompts.append(prompt)
             metadata.append((shuffled_choices, correct_letter))
@@ -543,6 +556,7 @@ def evaluate_commonsenseqa(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(42)
 
     if max_samples:
@@ -581,15 +595,10 @@ def evaluate_commonsenseqa(
             correct_letter = chr(ord("A") + new_correct_idx)
             num_choices = len(shuffled_choices)
 
-            prompt = (
-                f"Question: {question}\n\n"
-                + "\n".join(
-                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
-                )
-                + "\n\nAnswer with a single letter: "
-                + ", ".join(chr(ord("A") + j) for j in range(num_choices))
-                + "."
+            prompt = f"{question}\n\n" + "\n".join(
+                f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
+            print(prompt)
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
 
@@ -621,6 +630,7 @@ def evaluate_commonsenseqa(
                     print(f"    Output: {output[:300]}")
                     print(f"    Answer text: {answer_text[:300]}")
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if idx < verbose_examples:
                     print(
                         f"  [DEBUG] idx={idx} predicted={predicted} correct={correct_letter}"
@@ -633,9 +643,11 @@ def evaluate_commonsenseqa(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -668,6 +680,7 @@ def evaluate_hellaswag(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(42)
 
     if max_samples:
@@ -705,7 +718,6 @@ def evaluate_hellaswag(
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(shuffled_endings)
                 )
-                + "\n\nAnswer with a single letter: A, B, C, D."
             )
             prompts.append(prompt)
             metadata.append((shuffled_endings, correct_letter))
@@ -726,6 +738,7 @@ def evaluate_hellaswag(
             if predicted is None:
                 parse_failures += 1
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
                     correct += 1
 
@@ -734,9 +747,11 @@ def evaluate_hellaswag(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -769,6 +784,7 @@ def evaluate_piqa(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(42)
 
     if max_samples:
@@ -799,12 +815,7 @@ def evaluate_piqa(
                 opt_a, opt_b = solutions[1], solutions[0]
                 correct_letter = "B" if label == 0 else "A"
 
-            prompt = (
-                f"Question: {goal}\n\n"
-                f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n"
-                f"Answer with a single letter: A, B."
-            )
+            prompt = f"{goal}\n\n" f"A. {opt_a}\n" f"B. {opt_b}"
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
 
@@ -824,6 +835,7 @@ def evaluate_piqa(
             if predicted is None:
                 parse_failures += 1
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
                     correct += 1
 
@@ -832,9 +844,11 @@ def evaluate_piqa(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -867,6 +881,7 @@ def evaluate_arc(
     correct = 0
     total = 0
     parse_failures = 0
+    choice_counts = {}
     rng = random.Random(42)
 
     if max_samples:
@@ -905,16 +920,10 @@ def evaluate_arc(
             correct_letter = chr(ord("A") + new_correct_idx)
             num_choices = len(shuffled_choices)
 
-            prompt = (
-                f"Question: {question}\n\n"
-                + "\n".join(
-                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
-                )
-                + "\n\nAnswer with a single letter: "
-                + ", ".join(chr(ord("A") + j) for j in range(num_choices))
-                + "."
+            prompt = f"{question}\n\n" + "\n".join(
+                f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
-            prompts.append(prompt)
+            prompts.append(prompt.strip())
             metadata.append((shuffled_choices, correct_letter))
 
         outputs = gen.generate_batch(
@@ -933,6 +942,7 @@ def evaluate_arc(
             if predicted is None:
                 parse_failures += 1
             else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
                     correct += 1
 
@@ -941,9 +951,11 @@ def evaluate_arc(
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
         acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
         print(
             f"  {total}/{n} | Acc: {acc:.1f}% "
             f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
             f"| Speed: {speed:.1f} samples/s"
         )
 
@@ -969,7 +981,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_100k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_60k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
