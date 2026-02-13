@@ -60,7 +60,11 @@ tokenizer = Tokenizer(
 
 def format_synth_item(item: dict) -> str:
     """Format a SYNTH dataset item into chat format."""
-    if len(str(item["constraints"])) > 0 and "rag" == item["exercise"]:
+    if (
+        "constraints" in item
+        and len(str(item["constraints"])) > 0
+        and "rag" == item["exercise"]
+    ):
         query = item["query"] + "\n\n" + item["constraints"]
     else:
         query = item["query"]
@@ -68,9 +72,9 @@ def format_synth_item(item: dict) -> str:
     text = "<|im_start|>user\n" + query + "\n<|im_end|>"
     text += (
         "<|im_start|>assistant\n<|think_start|>"
-        + item["synthetic_reasoning"]
+        + item.get("synthetic_reasoning", item.get("reasoning"))
         + "<|think_end|>\n"
-        + item["synthetic_answer"]
+        + item.get("synthetic_answer", item.get("answer"))
         + "\n<|im_end|>"
     )
     return text
@@ -81,6 +85,7 @@ def iterate_synth(
     tokenize: bool = True,
     tok: Tokenizer = None,
     shard_data: bool = True,
+    extra_data: str = None,
 ) -> Iterator:
     """
     Iterate over PleIAs/SYNTH dataset in streaming mode.
@@ -90,6 +95,7 @@ def iterate_synth(
         tokenize: If True, yield token IDs; if False, yield formatted text
         tok: Tokenizer to use (default: global tokenizer)
         shard_data: If True, shard data across JAX processes.
+        extra_data: Path to a local JSONL file to interleave with SYNTH (played once).
 
     Yields:
         Token IDs (list[int]) or formatted text (str)
@@ -108,6 +114,26 @@ def iterate_synth(
 
     # Load dataset once; use set_epoch() to reshuffle each epoch
     dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+
+    # Optionally interleave with a local JSONL file (played once, then SYNTH continues alone)
+    extra_iter = None
+    extra_exhausted = False
+    if extra_data:
+        import random as _rng_mod
+
+        extra_ds = load_dataset(
+            "json", data_files=extra_data, split="train", streaming=True
+        )
+        extra_ds = extra_ds.shuffle(seed=43, buffer_size=10_000)
+        if process_count > 1:
+            extra_ds = split_dataset_by_node(
+                extra_ds, rank=process_index, world_size=process_count
+            )
+        extra_iter = iter(extra_ds)
+        extra_rng = _rng_mod.Random(43)
+        print(
+            f"[Process {process_index}] Interleaving SYNTH with extra data: {extra_data}"
+        )
 
     # Use native HuggingFace sharding - each process only iterates its shard
     if process_count > 1:
@@ -144,6 +170,22 @@ def iterate_synth(
 
                     if max_samples is not None and samples_yielded >= max_samples:
                         return
+
+                    # Interleave: 50% chance to yield from extra data instead
+                    if (
+                        extra_iter is not None
+                        and not extra_exhausted
+                        and extra_rng.random() < 0.003
+                    ):
+                        try:
+                            extra_item = next(extra_iter)
+                            item = extra_item
+                        except StopIteration:
+                            extra_exhausted = True
+                            extra_iter = None
+                            print(
+                                f"[Process {process_index}] Extra data exhausted after {samples_yielded} total samples"
+                            )
 
                     text = format_synth_item(item)
 
@@ -619,6 +661,7 @@ def data_generator(
     log_every_n_steps: int = 1000,
     tok: Tokenizer = None,
     drop_last: bool = True,
+    extra_data: str = None,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Generate batches of (X, y) pairs for language model training.
@@ -630,11 +673,14 @@ def data_generator(
         log_every_n_steps: Print progress every N steps
         tok: Tokenizer to use (default: global tokenizer)
         drop_last: If True, drop incomplete final batch (required for multi-device training)
+        extra_data: Path to a local JSONL file to interleave with SYNTH.
 
     Yields:
         Tuple of (X, y, real_tokens_in_batch) numpy arrays
     """
-    iterator = iterate_synth(max_samples=None, tokenize=True, tok=tok)
+    iterator = iterate_synth(
+        max_samples=None, tokenize=True, tok=tok, extra_data=extra_data
+    )
 
     X_batch, y_batch, real_lengths = [], [], []
     steps_done = 0
@@ -685,6 +731,7 @@ def create_tf_dataset(
     maxlen: int = 768,
     log_every_n_steps: int = 1000,
     prefetch_buffer: int = None,
+    extra_data: str = None,
 ):
     """
     Create a tf.data.Dataset from the generator.
@@ -695,6 +742,7 @@ def create_tf_dataset(
         maxlen: Maximum sequence length
         log_every_n_steps: Print progress every N steps
         prefetch_buffer: Prefetch buffer size (None = AUTOTUNE)
+        extra_data: Path to a local JSONL file to interleave with SYNTH.
 
     Returns:
         tf.data.Dataset yielding (X, y, real_tokens_in_batch) batches
@@ -710,6 +758,7 @@ def create_tf_dataset(
             max_steps=max_steps,
             maxlen=maxlen,
             log_every_n_steps=log_every_n_steps,
+            extra_data=extra_data,
         ),
         output_signature=(
             tf.TensorSpec(shape=(batch_size, maxlen), dtype=tf.int32),

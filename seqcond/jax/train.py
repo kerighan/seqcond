@@ -465,6 +465,7 @@ class Trainer:
         model_name: Optional[str] = None,
         resume_checkpoint: Optional[str] = None,
         load_checkpoint: Optional[str] = None,
+        extra_data: Optional[str] = None,
     ):
         self.config = config
         self.model_config = config.model
@@ -474,6 +475,7 @@ class Trainer:
         self.model_name = model_name or config.name
         self.resume_checkpoint = resume_checkpoint
         self.load_checkpoint = load_checkpoint
+        self.extra_data = extra_data
         self._wandb = None
 
         # Will be initialized in setup()
@@ -976,6 +978,7 @@ class Trainer:
                 prefetch_buffer=(
                     tc.prefetch_batches if tc.prefetch_batches > 0 else None
                 ),
+                extra_data=self.extra_data,
             )
             data_iterator = dataset.as_numpy_iterator()
             # We need to track tokens manually since we are not using the python DataLoader class
@@ -1334,6 +1337,7 @@ def train(
     seed: int = 42,
     resume_checkpoint: Optional[str] = None,
     load_checkpoint: Optional[str] = None,
+    extra_data: Optional[str] = None,
 ) -> Any:
     """
     High-level training function.
@@ -1355,6 +1359,7 @@ def train(
         model_name=model_name,
         resume_checkpoint=resume_checkpoint,
         load_checkpoint=load_checkpoint,
+        extra_data=extra_data,
     )
     trainer.setup(seed=seed)
     return trainer.train()

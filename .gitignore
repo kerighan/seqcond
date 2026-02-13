@@ -9,6 +9,7 @@ hf_checkpoints/
 archive_tests/
 eval_*
 *.jsonl
+data/
 
 predict.py
 

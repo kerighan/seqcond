@@ -246,6 +246,13 @@ def parse_args():
         dest="max_synth",
         help="Maximum number of SYNTH samples (None = infinite)",
     )
+    parser.add_argument(
+        "--extra-data",
+        type=str,
+        default=None,
+        dest="extra_data",
+        help="Path to a local JSONL file to interleave with SYNTH (played once)",
+    )
 
     return parser.parse_args()
 
@@ -434,6 +441,7 @@ def main():
         seed=args.seed,
         resume_checkpoint=resume_ckpt,
         load_checkpoint=args.load_checkpoint,
+        extra_data=args.extra_data,
     )
 
 

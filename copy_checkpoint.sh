@@ -2,7 +2,7 @@
 
 # Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]
 #        ./copy_checkpoint.sh --local <local_path> [TPU_NAME] [ZONE]
-# Example: ./copy_checkpoint.sh seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step320000.pkl
+# Example: ./copy_checkpoint.sh seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step70000.pkl
 # Example: ./copy_checkpoint.sh --local /tmp/my_checkpoint.pkl node-v4-64 us-central2-b
 
 # Set correct GCloud project
@@ -70,34 +70,63 @@ else
     fi
 fi
 
-# Step 2: Upload to all workers that don't have it
+# Step 2: Upload to all workers in parallel
 ALL_WORKERS=(0 1 2 3 4 5 6 7)
 if [ "$FROM_LOCAL" = false ]; then
     # Normal mode: skip source worker (already has it)
     ALL_WORKERS=(0 2 3 4 5 6 7)
 fi
-for i in "${ALL_WORKERS[@]}"; do
-    echo ""
-    echo "--- Checking worker $i ---"
-    
-    # Check if file already exists on this worker
-    EXISTS=$(gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$i \
+
+# Ensure checkpoints dir exists on all workers at once
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=all \
+    --command "mkdir -p $REMOTE_DIR" 2>/dev/null
+
+# Upload function for a single worker (runs in background)
+upload_worker() {
+    local w=$1
+    # Check if already exists
+    EXISTS=$(gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$w \
         --command "[ -f $REMOTE_DIR/$CHECKPOINT ] && echo 'yes' || echo 'no'" 2>/dev/null | tail -1)
-    
-    if [ "$EXISTS" = "yes" ]; then
-        echo "Worker $i: Already has checkpoint, skipping"
-        continue
+    if [ "$EXISTS" = "zizi" ]; then
+        echo "Worker $w: Already has checkpoint, skipped"
+        return 0
     fi
-    
-    echo "Worker $i: Uploading..."
-    # Ensure checkpoints directory exists
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=$i \
-        --command "mkdir -p $REMOTE_DIR"
+    echo "Worker $w: Uploading..."
     gcloud compute tpus tpu-vm scp "$LOCAL_TMP" "$TPU_NAME:$REMOTE_DIR/$CHECKPOINT" \
-        --zone="$ZONE" --worker=$i
+        --zone="$ZONE" --worker=$w 2>/dev/null
+    if [ $? -eq 0 ]; then
+        echo "Worker $w: Done ✓"
+    else
+        echo "Worker $w: FAILED ✗"
+        return 1
+    fi
+}
+
+MAX_PARALLEL=3
+echo ""
+echo "--- Uploading to ${#ALL_WORKERS[@]} workers (max $MAX_PARALLEL parallel) ---"
+PIDS=()
+FAILED=0
+for i in "${ALL_WORKERS[@]}"; do
+    upload_worker "$i" &
+    PIDS+=($!)
+    # Throttle: if we hit the limit, wait for one to finish before launching more
+    if [ ${#PIDS[@]} -ge $MAX_PARALLEL ]; then
+        wait -n -p DONE_PID "${PIDS[@]}" || ((FAILED++))
+        PIDS=("${PIDS[@]/$DONE_PID/}")
+    fi
+done
+
+# Wait for remaining uploads
+for pid in "${PIDS[@]}"; do
+    [ -z "$pid" ] && continue
+    wait "$pid" || ((FAILED++))
 done
 
 echo ""
+if [ $FAILED -gt 0 ]; then
+    echo "⚠️  $FAILED worker(s) failed"
+fi
 if [ "$FROM_LOCAL" = false ]; then
     echo "(Local temp file kept at $LOCAL_TMP - delete manually if needed)"
 fi
