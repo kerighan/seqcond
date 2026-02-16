@@ -5,6 +5,7 @@ import random
 from datasets import load_dataset
 
 from seqcond.torch.generator import TorchGenerator
+from eval_reasoning import _extract_answer_after_thinking, _parse_choice
 
 
 def _wrap_synth(user_prompt: str) -> str:
@@ -38,7 +39,7 @@ def _collect_generation(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_30k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_190k.pt")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--start", type=int, default=0)
@@ -53,7 +54,11 @@ def main():
     gen = TorchGenerator(args.checkpoint)
 
     print(f"Loading CommonsenseQA dataset (split={args.split})...")
-    dataset = load_dataset("commonsense_qa", split=args.split)
+    # dataset = load_dataset("commonsense_qa", split=args.split)
+    dataset = load_dataset(
+        "ybisk/piqa", split=args.split, revision="refs/convert/parquet"
+    )
+    # dataset = load_dataset("commonsense_qa", split=args.split)
     dataset = dataset.shuffle(seed=args.seed)
 
     end = min(args.start + args.n, len(dataset))
@@ -103,7 +108,12 @@ def main():
         print("\n" + "-" * 80)
         print("MODEL OUTPUT (full):\n")
         print(output)
-        print("Correct letter: " + correct_letter)
+        valid = {chr(ord("A") + j) for j in range(len(shuffled_choices))}
+        answer_text = _extract_answer_after_thinking(output)
+        predicted = _parse_choice(answer_text, valid, options=shuffled_choices)
+        match = "OK" if predicted == correct_letter else "WRONG"
+        print(f"Answer text: {repr(answer_text[:200]) if answer_text else None}")
+        print(f"Parsed: {predicted} | Correct: {correct_letter} | {match}")
         # break
         print("\n" + "-" * 80)
 

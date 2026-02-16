@@ -331,11 +331,17 @@ class TorchGenerator:
         temperature: float = 0.0,
         use_synth_template: bool = True,
         max_thinking_tokens: Optional[int] = None,
+        output_constraints: Optional[List[str]] = None,
     ) -> List[str]:
         """Generate completions for a batch of prompts in parallel.
 
         Prefills each prompt individually (no padding noise in states),
         stacks the states, then decodes in lockstep with per-sample positions.
+
+        Args:
+            output_constraints: If provided, after <|think_end|> the model is
+                forced to emit one of these strings (e.g. ["A.", "B.", "C.", "D."])
+                by masking logits at each position. Free generation resumes after.
 
         Returns a list of generated strings (completion only, no prompt).
         """
@@ -353,36 +359,95 @@ class TorchGenerator:
             ]
         all_tokens = self.tokenizer(prompts)
         prompt_lens = [len(t) for t in all_tokens]
-        max_prompt_len = max(prompt_lens)
 
-        # Clamp max_new_tokens so longest prompt doesn't exceed maxlen
         model_maxlen = getattr(self.model, "maxlen", 2048)
+
+        # Skip samples whose prompts exceed maxlen (can't prefill)
+        skipped = [False] * B
+        for i in range(B):
+            if prompt_lens[i] >= model_maxlen:
+                skipped[i] = True
+
+        active_indices = [i for i in range(B) if not skipped[i]]
+        if not active_indices:
+            return [""] * B
+
+        max_prompt_len = max(prompt_lens[i] for i in active_indices)
+
+        # Clamp max_new_tokens so longest active prompt doesn't exceed maxlen
         max_new_tokens = min(max_new_tokens, model_maxlen - max_prompt_len - 1)
         if max_new_tokens <= 0:
             return [""] * B
 
+        # Per-sample thinking budget (absolute position semantics):
+        # max_thinking_tokens = total position limit (prompt + thinking).
+        # Thinking budget for sample i = max(0, max_thinking_tokens - prompt_lens[i])
+        # Also clamped by (max_new_tokens - margin) so think_end fires before loop ends.
+        ANSWER_MARGIN = 20
+        per_sample_max_thinking = [None] * B
+        if max_thinking_tokens is not None:
+            for i in range(B):
+                absolute_budget = max(0, max_thinking_tokens - prompt_lens[i])
+                loop_budget = max(0, max_new_tokens - ANSWER_MARGIN)
+                per_sample_max_thinking[i] = min(absolute_budget, loop_budget)
+
         # Individual prefill for each prompt (no padding, clean states)
         all_logits = []
         all_states = []
-        for tokens in all_tokens:
-            input_ids = torch.tensor([tokens], device=self.device)  # (1, L_i)
-            logits, states = self.model.prefill(input_ids)
-            all_logits.append(logits.squeeze(1))  # (1, vocab_size)
-            all_states.append(states)
+        for i, tokens in enumerate(all_tokens):
+            if skipped[i]:
+                dummy = torch.tensor([[self.eos_token_id]], device=self.device)
+                logits_i, states_i = self.model.prefill(dummy)
+                all_logits.append(logits_i.squeeze(1))
+                all_states.append(states_i)
+            else:
+                input_ids = torch.tensor([tokens], device=self.device)
+                logits_i, states_i = self.model.prefill(input_ids)
+                all_logits.append(logits_i.squeeze(1))
+                all_states.append(states_i)
 
         # Stack into batched tensors
         logits = torch.cat(all_logits, dim=0)  # (B, vocab_size)
         states = self._stack_states(all_states)
 
+        # Pre-tokenize output constraints (once)
+        constraint_token_seqs = None
+        if output_constraints:
+            constraint_token_seqs = [
+                self.tokenizer.encode("\n" + c) for c in output_constraints
+            ]
+
         # Track generated tokens per sample and finished status
         generated = [[] for _ in range(B)]
-        finished = [False] * B
+        finished = [skipped[i] for i in range(B)]
         thinking_counts = [0] * B
         in_thinking = [use_synth_template] * B  # start inside <|think_start|>
         think_end_injected = [False] * B
+        # Constraint state: position within constraint prefix (-1 = not active, >=0 = forcing)
+        constraint_pos = [-1] * B
+        # Which constraints are still viable for each sample
+        constraint_viable = [None] * B
         token_tensor = torch.zeros((B, 1), dtype=torch.long, device=self.device)
 
         for step_idx in range(max_new_tokens):
+            # Apply constraint masking before sampling
+            if constraint_token_seqs is not None:
+                for i in range(B):
+                    pos = constraint_pos[i]
+                    if pos >= 0 and not finished[i]:
+                        # Mask logits: only allow tokens that are valid at this position
+                        viable = constraint_viable[i]
+                        allowed_tokens = set()
+                        for ci in viable:
+                            seq = constraint_token_seqs[ci]
+                            if pos < len(seq):
+                                allowed_tokens.add(seq[pos])
+                        if allowed_tokens:
+                            mask = torch.full_like(logits[i], float("-inf"))
+                            for t in allowed_tokens:
+                                mask[t] = 0.0
+                            logits[i] = logits[i] + mask
+
             # Greedy or temperature sampling
             if temperature == 0:
                 next_tokens = torch.argmax(logits, dim=-1)  # (B,)
@@ -399,6 +464,12 @@ class TorchGenerator:
                     # Track thinking state
                     if tok == self.think_end_id:
                         in_thinking[i] = False
+                        # Activate constraint forcing on the next token
+                        if constraint_token_seqs is not None and constraint_pos[i] < 0:
+                            constraint_pos[i] = 0
+                            constraint_viable[i] = list(
+                                range(len(constraint_token_seqs))
+                            )
                     elif tok == self.think_start_id:
                         in_thinking[i] = True
                         thinking_counts[i] = 0
@@ -408,15 +479,39 @@ class TorchGenerator:
 
                     # Inject <|think_end|> if thinking budget exhausted
                     if (
-                        max_thinking_tokens is not None
+                        per_sample_max_thinking[i] is not None
                         and in_thinking[i]
-                        and thinking_counts[i] >= max_thinking_tokens
+                        and thinking_counts[i] >= per_sample_max_thinking[i]
                         and not think_end_injected[i]
                     ):
                         tok = self.think_end_id
                         next_tokens[i] = tok
                         in_thinking[i] = False
                         think_end_injected[i] = True
+                        # Activate constraint forcing on the next token
+                        if constraint_token_seqs is not None and constraint_pos[i] < 0:
+                            constraint_pos[i] = 0
+                            constraint_viable[i] = list(
+                                range(len(constraint_token_seqs))
+                            )
+
+                    # Advance constraint state
+                    if constraint_pos[i] >= 0 and tok != self.think_end_id:
+                        # Narrow viable set based on emitted token
+                        pos = constraint_pos[i]
+                        constraint_viable[i] = [
+                            ci
+                            for ci in constraint_viable[i]
+                            if pos < len(constraint_token_seqs[ci])
+                            and constraint_token_seqs[ci][pos] == tok
+                        ]
+                        constraint_pos[i] = pos + 1
+                        # Check if any constraint is fully emitted
+                        if not constraint_viable[i] or all(
+                            constraint_pos[i] >= len(constraint_token_seqs[ci])
+                            for ci in constraint_viable[i]
+                        ):
+                            constraint_pos[i] = -1  # done, resume free generation
 
                     generated[i].append(tok)
                     if tok == self.eos_token_id:

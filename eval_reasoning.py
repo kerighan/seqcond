@@ -188,6 +188,7 @@ def evaluate_winogrande(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on Winogrande using batched generative reasoning."""
     correct = 0
@@ -241,6 +242,7 @@ def evaluate_winogrande(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         # Parse results
@@ -300,6 +302,7 @@ def evaluate_gpqa(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on GPQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -347,6 +350,12 @@ def evaluate_gpqa(
                 f"C. {choices[2]}\n"
                 f"D. {choices[3]}"
             )
+            # Truncate prompt if too long (whole prompt, to handle long choices)
+            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            max_prompt_tokens = model_maxlen // 2  # leave half for thinking + answer
+            prompt_tokens = gen.tokenizer.encode(prompt)
+            if len(prompt_tokens) > max_prompt_tokens:
+                prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
             prompts.append(prompt)
             metadata.append((choices, correct_letter))
 
@@ -355,6 +364,7 @@ def evaluate_gpqa(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
@@ -412,6 +422,7 @@ def evaluate_openbookqa(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on OpenBookQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -479,6 +490,7 @@ def evaluate_openbookqa(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
@@ -551,6 +563,7 @@ def evaluate_commonsenseqa(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on CommonsenseQA using batched generative reasoning (5-choice)."""
     correct = 0
@@ -595,10 +608,13 @@ def evaluate_commonsenseqa(
             correct_letter = chr(ord("A") + new_correct_idx)
             num_choices = len(shuffled_choices)
 
-            prompt = f"{question}\n\n" + "\n".join(
-                f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
+            prompt = (
+                f"{question}\n\n"
+                + "\n".join(
+                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
+                )
+                + "\n"
             )
-            print(prompt)
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
 
@@ -607,6 +623,7 @@ def evaluate_commonsenseqa(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (prompt, choices, correct_letter)) in enumerate(
@@ -675,6 +692,7 @@ def evaluate_hellaswag(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on HellaSwag using batched generative reasoning (4-choice)."""
     correct = 0
@@ -727,6 +745,7 @@ def evaluate_hellaswag(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (endings, correct_letter)) in enumerate(zip(outputs, metadata)):
@@ -779,6 +798,7 @@ def evaluate_piqa(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on PIQA using batched generative reasoning (2-choice)."""
     correct = 0
@@ -815,7 +835,7 @@ def evaluate_piqa(
                 opt_a, opt_b = solutions[1], solutions[0]
                 correct_letter = "B" if label == 0 else "A"
 
-            prompt = f"{goal}\n\n" f"A. {opt_a}\n" f"B. {opt_b}"
+            prompt = f"{goal}\n\n" f"A. {opt_a}\n" f"B. {opt_b}\n"
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
 
@@ -824,13 +844,25 @@ def evaluate_piqa(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (options, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
+
+            # get prompt
+            prompt = prompts[i]
+
             answer_text = _extract_answer_after_thinking(output)
+            # print(answer_text)
+            # print(correct_letter)
+            # print("-" * 50)
             valid = {"A", "B"}
             predicted = _parse_choice(answer_text, valid, options=options)
+            print(prompt)
+            print(output)
+            print(predicted, "=>", correct_letter)
+            print("-" * 80)
 
             if predicted is None:
                 parse_failures += 1
@@ -876,6 +908,7 @@ def evaluate_arc(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    output_constraints=None,
 ):
     """Evaluate on ARC using batched generative reasoning (3-5 choices)."""
     correct = 0
@@ -931,6 +964,7 @@ def evaluate_arc(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
         )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
@@ -975,13 +1009,148 @@ def evaluate_arc(
     return accuracy
 
 
+def _extract_number(text):
+    """Extract a number from text. Tries structured patterns first, then falls back to first number."""
+    import re
+
+    _NUM = r"-?\d+(?:,\d{3})*(?:\.\d+)?"
+
+    # Try #### pattern first (GSM8K format)
+    m = re.search(rf"####\s*({_NUM})", text)
+    if m:
+        return m.group(1).replace(",", "")
+    # Try "Answer: X" pattern (with optional markdown bold **)
+    m = re.search(rf"\*?\*?[Aa]nswer:?\*?\*?\s*\$?\s*({_NUM})", text)
+    if m:
+        return m.group(1).replace(",", "")
+    # Try "answer is X" / "equals X" / "= X" pattern
+    m = re.search(
+        rf"(?:answer is|equals?|=)\s*\$?\s*({_NUM})",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).replace(",", "")
+    # Fallback: first number in text
+    numbers = re.findall(rf"{_NUM}", text)
+    if numbers:
+        return numbers[0].replace(",", "")
+    return None
+
+
+def evaluate_gsm8k(
+    gen,
+    dataset,
+    max_samples=None,
+    max_new_tokens=512,
+    batch_size=16,
+    verbose_examples=5,
+    max_thinking_tokens=None,
+):
+    """Evaluate on GSM8K using batched generative reasoning (numerical answer)."""
+    import re
+
+    correct = 0
+    total = 0
+    parse_failures = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    n = len(dataset)
+    print(
+        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+    )
+    start_time = time.time()
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        batch = dataset.select(range(batch_start, batch_end))
+
+        prompts = []
+        ref_answers = []
+        for example in batch:
+            question = example["question"]
+            answer = example["answer"]
+
+            # Extract reference numerical answer (format: "#### 42")
+            ref_match = re.search(r"####\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", answer)
+            ref_val = ref_match.group(1).replace(",", "") if ref_match else None
+            ref_answers.append(ref_val)
+
+            prompt = f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
+            # Truncate if too long
+            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            max_prompt_tokens = model_maxlen // 2
+            prompt_tokens = gen.tokenizer.encode(prompt)
+            if len(prompt_tokens) > max_prompt_tokens:
+                prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
+            prompts.append(prompt)
+
+        outputs = gen.generate_batch(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            max_thinking_tokens=max_thinking_tokens,
+        )
+
+        for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
+            idx = batch_start + i
+            answer_text = _extract_answer_after_thinking(output)
+            predicted = _extract_number(answer_text)
+
+            if idx < verbose_examples:
+                print(f"  [DEBUG] idx={idx} predicted={predicted} ref={ref_val}")
+                print(f"    Answer text: {answer_text[:200]!r}")
+
+            if ref_val is None:
+                parse_failures += 1
+            elif predicted is None:
+                parse_failures += 1
+                if idx < verbose_examples:
+                    print(f"  [PARSE FAIL] idx={idx}")
+                    print(f"    Output: {output[:300]}")
+            else:
+                try:
+                    if float(predicted) == float(ref_val):
+                        correct += 1
+                except ValueError:
+                    pass
+
+            total += 1
+
+        elapsed = time.time() - start_time
+        speed = total / elapsed if elapsed > 0 else 0
+        acc = correct / total * 100
+        print(
+            f"  {total}/{n} | Acc: {acc:.1f}% "
+            f"| Parse fails: {parse_failures} "
+            f"| Speed: {speed:.1f} samples/s"
+        )
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100 if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"GSM8K (Reasoning) Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(
+        f"  Parse failures: {parse_failures}/{total} ({parse_failures/total*100:.1f}%)"
+    )
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_60k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_200k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1027,19 +1196,30 @@ def main():
     parser.add_argument(
         "--max_thinking_tokens",
         type=int,
-        default=512,
-        help="Max tokens for thinking before injecting <|think_end|> (None = unlimited)",
+        default=1000,
+        help="Absolute position limit: inject <|think_end|> when prompt_len + thinking_count >= this value",
     )
     parser.add_argument(
         "--debug_extract",
         action="store_true",
         help="Print _extract_answer_after_thinking decisions for the first verbose examples",
     )
+    parser.add_argument(
+        "--constrain_output",
+        action="store_true",
+        help="After thinking, force output to start with a valid choice letter (e.g. 'A.', 'B.')",
+    )
     args = parser.parse_args()
 
     print("Loading model...")
     gen = TorchGenerator(args.checkpoint)
     gen.debug_extract = bool(args.debug_extract)
+
+    def _make_constraints(n_choices):
+        """Build output_constraints list like ['A.', 'B.', ...] if --constrain_output."""
+        if not args.constrain_output:
+            return None
+        return [f"{chr(ord('A') + i)}." for i in range(n_choices)]
 
     if args.benchmark.startswith("winogrande"):
         parts = args.benchmark.split(":")
@@ -1060,6 +1240,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(2),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1080,6 +1261,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(4),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1100,6 +1282,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(5),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1122,6 +1305,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(2),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"PIQA (reasoning): {accuracy:.2f}%")
@@ -1140,6 +1324,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(4),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1167,6 +1352,7 @@ def main():
                 batch_size=args.batch_size,
                 verbose_examples=args.verbose_examples,
                 max_thinking_tokens=args.max_thinking_tokens,
+                output_constraints=_make_constraints(4),
             )
             accuracies[subset] = accuracy
             print(f"\nARC-{subset} Final Accuracy: {accuracy:.2f}%")
@@ -1179,6 +1365,24 @@ def main():
             print(f"ARC (average): {avg_accuracy:.2f}%")
             print(f"{'='*60}")
             _send_notification("Évaluation terminée", f"ARC (avg): {avg_accuracy:.2f}%")
+    elif args.benchmark == "gsm8k":
+        print(f"\nLoading GSM8K dataset (split={args.split})...")
+        dataset = load_dataset("openai/gsm8k", "main", split="test")
+        dataset = _maybe_shuffle_dataset(
+            dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
+        )
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_gsm8k(
+            gen,
+            dataset,
+            max_samples=args.max_samples,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            verbose_examples=args.verbose_examples,
+            max_thinking_tokens=args.max_thinking_tokens,
+        )
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"GSM8K (reasoning): {accuracy:.2f}%")
     elif args.benchmark.startswith("gpqa"):
         parts = args.benchmark.split(":")
         subset = parts[1] if len(parts) == 2 else "diamond"
@@ -1209,6 +1413,7 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(4),
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GPQA (reasoning): {accuracy:.2f}%")

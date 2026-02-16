@@ -115,24 +115,27 @@ def iterate_synth(
     # Load dataset once; use set_epoch() to reshuffle each epoch
     dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
 
-    # Optionally interleave with a local JSONL file (played once, then SYNTH continues alone)
+    # Optionally interleave with a local JSONL file (loops indefinitely)
     extra_iter = None
-    extra_exhausted = False
+    extra_epoch = 0
     if extra_data:
         import random as _rng_mod
 
-        extra_ds = load_dataset(
-            "json", data_files=extra_data, split="train", streaming=True
-        )
-        extra_ds = extra_ds.shuffle(seed=43, buffer_size=10_000)
-        if process_count > 1:
-            extra_ds = split_dataset_by_node(
-                extra_ds, rank=process_index, world_size=process_count
+        def _make_extra_iter(epoch_num):
+            ds = load_dataset(
+                "json", data_files=extra_data, split="train", streaming=True
             )
-        extra_iter = iter(extra_ds)
+            ds = ds.shuffle(seed=44 + epoch_num, buffer_size=10_000)
+            if process_count > 1:
+                ds = split_dataset_by_node(
+                    ds, rank=process_index, world_size=process_count
+                )
+            return iter(ds)
+
+        extra_iter = _make_extra_iter(extra_epoch)
         extra_rng = _rng_mod.Random(43)
         print(
-            f"[Process {process_index}] Interleaving SYNTH with extra data: {extra_data}"
+            f"[Process {process_index}] Interleaving SYNTH with extra data (looping): {extra_data}"
         )
 
     # Use native HuggingFace sharding - each process only iterates its shard
@@ -142,7 +145,7 @@ def iterate_synth(
         )
 
     # Shuffle with a buffer; set_epoch() will reseed as (seed + epoch)
-    dataset = dataset.shuffle(seed=43, buffer_size=100_000)
+    dataset = dataset.shuffle(seed=44, buffer_size=100_000)
 
     # Loop indefinitely if max_samples is None
     epoch = 0
@@ -171,21 +174,22 @@ def iterate_synth(
                     if max_samples is not None and samples_yielded >= max_samples:
                         return
 
-                    # Interleave: 50% chance to yield from extra data instead
-                    if (
-                        extra_iter is not None
-                        and not extra_exhausted
-                        and extra_rng.random() < 0.003
-                    ):
+                    # Interleave: x% chance to yield from extra data instead
+                    if extra_iter is not None and extra_rng.random() < 0.015:
                         try:
                             extra_item = next(extra_iter)
                             item = extra_item
                         except StopIteration:
-                            extra_exhausted = True
-                            extra_iter = None
+                            extra_epoch += 1
+                            extra_iter = _make_extra_iter(extra_epoch)
                             print(
-                                f"[Process {process_index}] Extra data exhausted after {samples_yielded} total samples"
+                                f"[Process {process_index}] Extra data looping (epoch {extra_epoch}) after {samples_yielded} total samples"
                             )
+                            try:
+                                extra_item = next(extra_iter)
+                                item = extra_item
+                            except StopIteration:
+                                pass
 
                     text = format_synth_item(item)
 
