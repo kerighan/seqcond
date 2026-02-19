@@ -24,7 +24,7 @@ def main():
         "--checkpoint",
         type=str,
         # default="checkpoints/seqcond_opt_torch.pt",
-        default="checkpoints/seqcond_torch_200k.pt",
+        default="checkpoints/seqcond_torch_310k.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
@@ -35,7 +35,7 @@ def main():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=128,
+        default=768,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(

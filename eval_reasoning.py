@@ -86,6 +86,11 @@ def _extract_answer_after_thinking(text, debug: bool = False, debug_id: str = ""
         if debug:
             print(f"  {prefix} found <|think_end|> (using text after last)")
         text = text.split("<|think_end|>")[-1]
+    elif "</think>" in text:
+        # Take everything after the last </think>
+        if debug:
+            print(f"  {prefix} found </think> (using text after last)")
+        text = text.split("</think>")[-1]
     elif "<|think_start|>" in text:
         # Model started thinking but never finished (ran out of tokens)
         # Try to use text before thinking started, if any
@@ -120,8 +125,17 @@ def _parse_choice(answer_text, valid_choices, options=None):
     """
     letters = "".join(sorted(valid_choices))
     answer_text = answer_text.strip()
+    if "\\boxed{" in answer_text:
+        choice = answer_text.split("\\boxed{")[-1].split("}")[0]
+        if len(choice) == 1:
+            print(choice, "choice")
+            return choice
     if not answer_text:
         return None
+
+    # Strategy 0: single character answer — almost always the intended letter
+    if len(answer_text) == 1 and answer_text.upper() in valid_choices:
+        return answer_text.upper()
 
     # Guardrail: reject prompt-like enumerations such as "A, B, C, D, E".
     # These often appear when the model echoes the instruction instead of answering.
@@ -229,9 +243,10 @@ def evaluate_winogrande(
 
             prompt = (
                 # f"Complete the following sentence by choosing the correct option.\n\n"
-                f"{sentence}\n"
+                f"Choose the best option to fill in the blank.\n\n{sentence}\n\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n"
+                f"B. {opt_b}"
+                "\n\nAnswer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append((opt_a, opt_b, correct_letter))
@@ -348,7 +363,7 @@ def evaluate_gpqa(
                 f"A. {choices[0]}\n"
                 f"B. {choices[1]}\n"
                 f"C. {choices[2]}\n"
-                f"D. {choices[3]}"
+                f"D. {choices[3]}\n"
             )
             # Truncate prompt if too long (whole prompt, to handle long choices)
             model_maxlen = getattr(gen.model, "maxlen", 2048)
@@ -482,7 +497,9 @@ def evaluate_openbookqa(
             prompt = f"{question}\n\n" + "\n".join(
                 f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
-            prompts.append(prompt)
+            prompts.append(
+                prompt  # + "\n\nAnswer with the letter only, like 'A' or 'B'..."
+            )
             metadata.append((shuffled_choices, correct_letter))
 
         outputs = gen.generate_batch(
@@ -503,6 +520,7 @@ def evaluate_openbookqa(
             )
             valid = {chr(ord("A") + j) for j in range(len(choices))}
             predicted = _parse_choice(answer_text, valid, options=choices)
+            print(predicted)
 
             if idx < verbose_examples:
                 print(
@@ -613,7 +631,7 @@ def evaluate_commonsenseqa(
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
                 )
-                + "\n"
+                # + "\n\nAnswer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
@@ -732,10 +750,11 @@ def evaluate_hellaswag(
 
             prompt = (
                 f"Complete the following sentence by choosing the correct ending.\n\n"
-                f"Context: {ctx}\n\n"
+                f"{ctx}\n\n"
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(shuffled_endings)
                 )
+                + "\n\nAnswer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append((shuffled_endings, correct_letter))
@@ -835,7 +854,11 @@ def evaluate_piqa(
                 opt_a, opt_b = solutions[1], solutions[0]
                 correct_letter = "B" if label == 0 else "A"
 
-            prompt = f"{goal}\n\n" f"A. {opt_a}\n" f"B. {opt_b}\n"
+            prompt = (
+                f"{goal}\n\n"
+                f"A. {opt_a}\n"
+                f"B. {opt_b}\n\n" + "Answer with the letter only, like 'A' or 'B'..."
+            )
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
 
@@ -956,7 +979,9 @@ def evaluate_arc(
             prompt = f"{question}\n\n" + "\n".join(
                 f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
-            prompts.append(prompt.strip())
+            prompts.append(
+                (prompt + "\n\nAnswer with the letter only, like 'A' or 'B'...").strip()
+            )
             metadata.append((shuffled_choices, correct_letter))
 
         outputs = gen.generate_batch(
@@ -975,6 +1000,9 @@ def evaluate_arc(
 
             if predicted is None:
                 parse_failures += 1
+                print(f"  [PARSE FAIL] idx={idx} correct={correct_letter}")
+                print(f"    answer_text: {answer_text[:300]!r}")
+                print(f"    raw output:  {output[:300]!r}")
             else:
                 choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
                 if predicted == correct_letter:
@@ -1150,7 +1178,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_200k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_310k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
