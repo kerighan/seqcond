@@ -945,39 +945,39 @@ def warmup_cosine_decay_schedule(
         import jax.numpy as jnp
 
         # Calculate what the LR should be at resume_step
-        if resume_step < warmup_steps:
-            # Still in initial warmup phase
-            target_lr = base_lr * (resume_step / warmup_steps)
-        else:
-            # In cosine decay phase
-            decay_progress = (resume_step - warmup_steps) / decay_steps
-            decay_progress = min(decay_progress, 1.0)
-            cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_progress))
-            target_lr = alpha + (base_lr - alpha) * cosine_decay
-
-        # Create a schedule that:
-        # 1. Warms up from 0.1x target_lr to target_lr over resume_warmup_steps
-        # 2. Then continues with the normal schedule
+        target_lr = jnp.where(
+            resume_step < warmup_steps,
+            base_lr * (resume_step / warmup_steps),
+            alpha
+            + (base_lr - alpha)
+            * 0.5
+            * (1.0 + jnp.cos(jnp.pi * (resume_step - warmup_steps) / decay_steps)),
+        )
 
         def schedule_fn(step):
-            # Adjust step to account for resume
             adjusted_step = step + resume_step
 
-            if step < resume_warmup_steps:
-                # Resume warmup phase: go from 0.1x to 1.0x of target LR
-                warmup_progress = step / resume_warmup_steps
-                return target_lr * (0.1 + 0.9 * warmup_progress)
-            else:
-                # Continue with normal schedule
-                if adjusted_step < warmup_steps:
-                    # Still in initial warmup
-                    return base_lr * (adjusted_step / warmup_steps)
-                else:
-                    # Cosine decay phase
-                    decay_progress = (adjusted_step - warmup_steps) / decay_steps
-                    decay_progress = jnp.clip(decay_progress, 0.0, 1.0)
-                    cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_progress))
-                    return alpha + (base_lr - alpha) * cosine_decay
+            # Resume warmup: 0.1x -> 1.0x of target LR
+            warmup_lr = target_lr * (0.1 + 0.9 * step / resume_warmup_steps)
+
+            # Normal cosine decay schedule
+            normal_decay_progress = jnp.clip(
+                (adjusted_step - warmup_steps) / decay_steps, 0.0, 1.0
+            )
+            normal_lr = alpha + (base_lr - alpha) * 0.5 * (
+                1.0 + jnp.cos(jnp.pi * normal_decay_progress)
+            )
+
+            # Initial warmup (unlikely when resuming, but for correctness)
+            initial_warmup_lr = base_lr * (adjusted_step / warmup_steps)
+
+            # Select: initial warmup vs cosine decay
+            normal_lr = jnp.where(
+                adjusted_step < warmup_steps, initial_warmup_lr, normal_lr
+            )
+
+            # Select: resume warmup vs normal schedule
+            return jnp.where(step < resume_warmup_steps, warmup_lr, normal_lr)
 
         return schedule_fn
 
