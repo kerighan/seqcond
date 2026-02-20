@@ -902,26 +902,84 @@ def warmup_cosine_decay_schedule(
     warmup_steps: int,
     total_steps: int,
     alpha: float = 1e-5,
+    resume_step: int = 0,
+    resume_warmup_steps: int = 500,
 ) -> optax.Schedule:
-    """Create a warmup + cosine decay learning rate schedule."""
+    """Create a warmup + cosine decay learning rate schedule.
+
+    Args:
+        base_lr: Maximum learning rate
+        warmup_steps: Initial warmup steps (from step 0)
+        total_steps: Total training steps
+        alpha: Minimum learning rate at the end
+        resume_step: Step to resume from (0 for fresh training)
+        resume_warmup_steps: Warmup steps when resuming (default: 500)
+
+    When resuming (resume_step > 0), the schedule will:
+    1. Calculate what the LR should be at resume_step
+    2. Warmup from 0.1x that LR to the full target LR over resume_warmup_steps
+    3. Continue with the normal cosine decay schedule
+    """
     decay_steps = total_steps - warmup_steps
 
-    warmup_fn = optax.linear_schedule(
-        init_value=0.0,
-        end_value=base_lr,
-        transition_steps=warmup_steps,
-    )
+    if resume_step == 0:
+        # Fresh training: normal warmup from 0
+        warmup_fn = optax.linear_schedule(
+            init_value=0.0,
+            end_value=base_lr,
+            transition_steps=warmup_steps,
+        )
 
-    cosine_fn = optax.cosine_decay_schedule(
-        init_value=base_lr,
-        decay_steps=decay_steps,
-        alpha=alpha / base_lr if base_lr > 0 else 0.0,
-    )
+        cosine_fn = optax.cosine_decay_schedule(
+            init_value=base_lr,
+            decay_steps=decay_steps,
+            alpha=alpha / base_lr if base_lr > 0 else 0.0,
+        )
 
-    return optax.join_schedules(
-        schedules=[warmup_fn, cosine_fn],
-        boundaries=[warmup_steps],
-    )
+        return optax.join_schedules(
+            schedules=[warmup_fn, cosine_fn],
+            boundaries=[warmup_steps],
+        )
+    else:
+        # Resuming: calculate target LR at resume_step and warmup to it
+        import jax.numpy as jnp
+
+        # Calculate what the LR should be at resume_step
+        if resume_step < warmup_steps:
+            # Still in initial warmup phase
+            target_lr = base_lr * (resume_step / warmup_steps)
+        else:
+            # In cosine decay phase
+            decay_progress = (resume_step - warmup_steps) / decay_steps
+            decay_progress = min(decay_progress, 1.0)
+            cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_progress))
+            target_lr = alpha + (base_lr - alpha) * cosine_decay
+
+        # Create a schedule that:
+        # 1. Warms up from 0.1x target_lr to target_lr over resume_warmup_steps
+        # 2. Then continues with the normal schedule
+
+        def schedule_fn(step):
+            # Adjust step to account for resume
+            adjusted_step = step + resume_step
+
+            if step < resume_warmup_steps:
+                # Resume warmup phase: go from 0.1x to 1.0x of target LR
+                warmup_progress = step / resume_warmup_steps
+                return target_lr * (0.1 + 0.9 * warmup_progress)
+            else:
+                # Continue with normal schedule
+                if adjusted_step < warmup_steps:
+                    # Still in initial warmup
+                    return base_lr * (adjusted_step / warmup_steps)
+                else:
+                    # Cosine decay phase
+                    decay_progress = (adjusted_step - warmup_steps) / decay_steps
+                    decay_progress = jnp.clip(decay_progress, 0.0, 1.0)
+                    cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_progress))
+                    return alpha + (base_lr - alpha) * cosine_decay
+
+        return schedule_fn
 
 
 def create_optimizer(
@@ -933,18 +991,24 @@ def create_optimizer(
     beta_1: float = 0.9,
     beta_2: float = 0.999,
     optimizer_type: str = "adamw",
+    resume_step: int = 0,
+    resume_warmup_steps: int = 500,
 ) -> optax.GradientTransformation:
     """Create an optimizer with warmup + cosine decay schedule.
 
     Args:
         optimizer_type: 'adamw' or 'muon'. Muon applies Newton-Schulz orthogonalization
             to 2D weight matrices and AdamW to everything else (embeddings, biases, norms).
+        resume_step: Step to resume from (0 for fresh training)
+        resume_warmup_steps: Warmup steps when resuming (default: 500)
     """
     lr_schedule = warmup_cosine_decay_schedule(
         base_lr=base_lr,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
         alpha=1e-5,
+        resume_step=resume_step,
+        resume_warmup_steps=resume_warmup_steps,
     )
 
     if optimizer_type == "muon":

@@ -769,7 +769,40 @@ class Trainer:
                     # Skip optimizer state to save memory - fresh optimizer with loaded weights
                     self.start_step = ckpt_step or 0
                     print(
-                        f"Resumed training state (step {self.start_step}, fresh optimizer)."
+                        f"Resumed training state (step {self.start_step}, fresh optimizer with warmup)."
+                    )
+
+                    # Recreate optimizer with resume_step for warmup
+                    optimizer_type = getattr(
+                        self.train_config, "optimizer_type", "adamw"
+                    )
+                    self._base_optimizer = create_optimizer(
+                        base_lr=self.train_config.base_lr,
+                        warmup_steps=self.train_config.warmup_steps,
+                        total_steps=self.train_config.total_steps,
+                        weight_decay=self.train_config.weight_decay,
+                        clipnorm=self.train_config.clipnorm,
+                        beta_1=self.train_config.beta_1,
+                        beta_2=self.train_config.beta_2,
+                        optimizer_type=optimizer_type,
+                        resume_step=self.start_step,
+                        resume_warmup_steps=500,
+                    )
+                    self.optimizer = self._base_optimizer
+
+                    # Update LR schedule for logging
+                    self._lr_schedule = warmup_cosine_decay_schedule(
+                        base_lr=self.train_config.base_lr,
+                        warmup_steps=self.train_config.warmup_steps,
+                        total_steps=self.train_config.total_steps,
+                        resume_step=self.start_step,
+                        resume_warmup_steps=500,
+                    )
+
+                    # Reinitialize optimizer state with new params
+                    self.opt_state = self.optimizer.init(self.params)
+                    print(
+                        f"Optimizer recreated with resume warmup (500 steps from {self.start_step})"
                     )
                 else:
                     print(
