@@ -2,7 +2,7 @@
 
 # Usage: ./copy_checkpoint.sh <checkpoint_name> [TPU_NAME] [ZONE]
 #        ./copy_checkpoint.sh --local <local_path> [TPU_NAME] [ZONE]
-# Example: ./copy_checkpoint.sh --local checkpoints/seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step310000.pkl
+# Example: ./copy_checkpoint.sh --local checkpoints/seqcond-l24-d1024-th16-sh16-m2-r2-o0-a0_step280000.pkl
 # Example: ./copy_checkpoint.sh --local /tmp/my_checkpoint.pkl node-v4-64 us-central2-b
 
 # Set correct GCloud project

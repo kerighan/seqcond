@@ -175,7 +175,7 @@ def iterate_synth(
                         return
 
                     # Interleave: x% chance to yield from extra data instead
-                    if extra_iter is not None and extra_rng.random() < 0.05:
+                    if extra_iter is not None and extra_rng.random() < 0.1:
                         try:
                             extra_item = next(extra_iter)
                             item = extra_item
