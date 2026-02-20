@@ -48,7 +48,15 @@ def _maybe_shuffle_dataset(dataset, seed: int, enabled: bool = True):
         return dataset
 
 
-def _collect_generation(gen, prompt, max_new_tokens=512, temperature=0.0, **kwargs):
+def _collect_generation(
+    gen,
+    prompt,
+    max_new_tokens=512,
+    temperature=0.0,
+    use_triton=False,
+    use_cuda_graph=False,
+    **kwargs,
+):
     """Run generate() and collect all yielded tokens into a single string."""
     tokens = []
     for tok in gen.generate(
@@ -58,12 +66,53 @@ def _collect_generation(gen, prompt, max_new_tokens=512, temperature=0.0, **kwar
         top_p=1.0,
         top_k=0,
         verbose=False,
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
+        use_triton=use_triton,
         use_synth_template=True,
         **kwargs,
     ):
         tokens.append(tok)
     return "".join(tokens)
+
+
+def _generate_for_batch(
+    gen,
+    prompts,
+    batch_size,
+    max_new_tokens=512,
+    temperature=0.0,
+    use_triton=False,
+    use_cuda_graph=False,
+    max_thinking_tokens=None,
+    output_constraints=None,
+    **kwargs,
+):
+    """Generate outputs for a batch of prompts, using generate() for batch_size=1 for better performance."""
+    if batch_size == 1:
+        # Use generate() for single prompts - faster with Triton/CUDA graphs
+        outputs = []
+        for prompt in prompts:
+            output = _collect_generation(
+                gen,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                use_triton=use_triton,
+                use_cuda_graph=use_cuda_graph,
+                max_thinking_tokens=max_thinking_tokens,
+                **kwargs,
+            )
+            outputs.append(output)
+        return outputs
+    else:
+        # Use generate_batch() for larger batches
+        return gen.generate_batch(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
+        )
 
 
 def _extract_answer_after_thinking(text, debug: bool = False, debug_id: str = ""):
@@ -128,7 +177,7 @@ def _parse_choice(answer_text, valid_choices, options=None):
     if "\\boxed{" in answer_text:
         choice = answer_text.split("\\boxed{")[-1].split("}")[0]
         if len(choice) == 1:
-            print(choice, "choice")
+            # print(choice, "choice")
             return choice
     if not answer_text:
         return None
@@ -203,6 +252,8 @@ def evaluate_winogrande(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on Winogrande using batched generative reasoning."""
     correct = 0
@@ -252,13 +303,29 @@ def evaluate_winogrande(
             metadata.append((opt_a, opt_b, correct_letter))
 
         # Batched generation
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         # Parse results
         for i, (output, (opt_a, opt_b, correct_letter)) in enumerate(
@@ -318,6 +385,8 @@ def evaluate_gpqa(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on GPQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -374,13 +443,30 @@ def evaluate_gpqa(
             prompts.append(prompt)
             metadata.append((choices, correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -438,6 +524,8 @@ def evaluate_openbookqa(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on OpenBookQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -498,17 +586,34 @@ def evaluate_openbookqa(
                 f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
             )
             prompts.append(
-                prompt  # + "\n\nAnswer with the letter only, like 'A' or 'B'..."
+                prompt + "\n\nAnswer with the letter only, like 'A' or 'B'..."
             )
             metadata.append((shuffled_choices, correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -520,7 +625,6 @@ def evaluate_openbookqa(
             )
             valid = {chr(ord("A") + j) for j in range(len(choices))}
             predicted = _parse_choice(answer_text, valid, options=choices)
-            print(predicted)
 
             if idx < verbose_examples:
                 print(
@@ -582,6 +686,8 @@ def evaluate_commonsenseqa(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on CommonsenseQA using batched generative reasoning (5-choice)."""
     correct = 0
@@ -636,13 +742,30 @@ def evaluate_commonsenseqa(
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (prompt, choices, correct_letter)) in enumerate(
             zip(outputs, metadata)
@@ -711,6 +834,8 @@ def evaluate_hellaswag(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on HellaSwag using batched generative reasoning (4-choice)."""
     correct = 0
@@ -759,13 +884,30 @@ def evaluate_hellaswag(
             prompts.append(prompt)
             metadata.append((shuffled_endings, correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (endings, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -818,6 +960,8 @@ def evaluate_piqa(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on PIQA using batched generative reasoning (2-choice)."""
     correct = 0
@@ -862,13 +1006,30 @@ def evaluate_piqa(
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (options, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -932,6 +1093,8 @@ def evaluate_arc(
     verbose_examples=5,
     max_thinking_tokens=None,
     output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on ARC using batched generative reasoning (3-5 choices)."""
     correct = 0
@@ -984,13 +1147,30 @@ def evaluate_arc(
             )
             metadata.append((shuffled_choices, correct_letter))
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-            output_constraints=output_constraints,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+                output_constraints=output_constraints,
+            )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -1074,6 +1254,8 @@ def evaluate_gsm8k(
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
+    use_triton=False,
+    use_cuda_graph=False,
 ):
     """Evaluate on GSM8K using batched generative reasoning (numerical answer)."""
     import re
@@ -1115,12 +1297,29 @@ def evaluate_gsm8k(
                 prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
             prompts.append(prompt)
 
-        outputs = gen.generate_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            max_thinking_tokens=max_thinking_tokens,
-        )
+        # Batched generation
+        if batch_size == 1:
+            # Use generate() for single prompts - faster with Triton/CUDA graphs
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            # Use generate_batch() for larger batches
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+            )
 
         for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
             idx = batch_start + i
@@ -1178,7 +1377,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_310k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_330k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1195,7 +1394,7 @@ def main():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=1024,
+        default=1024 * 2,
         help="Max tokens to generate per sample (includes reasoning)",
     )
     parser.add_argument(
@@ -1224,7 +1423,7 @@ def main():
     parser.add_argument(
         "--max_thinking_tokens",
         type=int,
-        default=1000,
+        default=1000 * 2,
         help="Absolute position limit: inject <|think_end|> when prompt_len + thinking_count >= this value",
     )
     parser.add_argument(
@@ -1237,11 +1436,26 @@ def main():
         action="store_true",
         help="After thinking, force output to start with a valid choice letter (e.g. 'A.', 'B.')",
     )
+    parser.add_argument(
+        "--use_triton",
+        action="store_true",
+        default=True,
+        help="Use Triton kernels for SeqCond acceleration (requires triton package)",
+    )
+    parser.add_argument(
+        "--no_cuda_graph",
+        action="store_true",
+        help="Disable CUDA Graphs optimization",
+    )
     args = parser.parse_args()
 
     print("Loading model...")
     gen = TorchGenerator(args.checkpoint)
     gen.debug_extract = bool(args.debug_extract)
+
+    # Pre-capture CUDA graphs for fast generation if not disabled
+    if not args.no_cuda_graph:
+        gen.precompute(max_seq_len=1024, use_triton=args.use_triton)
 
     def _make_constraints(n_choices):
         """Build output_constraints list like ['A.', 'B.', ...] if --constrain_output."""
@@ -1269,6 +1483,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(2),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1290,6 +1506,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(4),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1311,6 +1529,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(5),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1334,6 +1554,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(2),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"PIQA (reasoning): {accuracy:.2f}%")
@@ -1353,6 +1575,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(4),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -1381,6 +1605,8 @@ def main():
                 verbose_examples=args.verbose_examples,
                 max_thinking_tokens=args.max_thinking_tokens,
                 output_constraints=_make_constraints(4),
+                use_triton=args.use_triton,
+                use_cuda_graph=not args.no_cuda_graph,
             )
             accuracies[subset] = accuracy
             print(f"\nARC-{subset} Final Accuracy: {accuracy:.2f}%")
@@ -1408,6 +1634,8 @@ def main():
             batch_size=args.batch_size,
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GSM8K (reasoning): {accuracy:.2f}%")
@@ -1442,6 +1670,8 @@ def main():
             verbose_examples=args.verbose_examples,
             max_thinking_tokens=args.max_thinking_tokens,
             output_constraints=_make_constraints(4),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GPQA (reasoning): {accuracy:.2f}%")
