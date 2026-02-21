@@ -737,7 +737,7 @@ def evaluate_commonsenseqa(
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
                 )
-                # + "\n\nAnswer with the letter only, like 'A' or 'B'..."
+                + "\n\nAnswer with the letter only."
             )
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
@@ -837,7 +837,7 @@ def evaluate_hellaswag(
     use_triton=False,
     use_cuda_graph=False,
 ):
-    """Evaluate on HellaSwag using batched generative reasoning (4-choice)."""
+    """Evaluate on HellaSwag using batched generative reasoning (4-choice) with 5-shot examples."""
     correct = 0
     total = 0
     parse_failures = 0
@@ -849,9 +849,37 @@ def evaluate_hellaswag(
 
     n = len(dataset)
     print(
-        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+        f"Evaluating on {n} samples (batched generative reasoning with 5-shot, bs={batch_size})..."
     )
     start_time = time.time()
+
+    # Create 5-shot examples from the training set
+    from datasets import load_dataset
+
+    train_dataset = load_dataset("hellaswag", split="train")
+    few_shot_rng = random.Random(123)  # Fixed seed for reproducible few-shot examples
+    few_shot_indices = few_shot_rng.sample(range(len(train_dataset)), 5)
+
+    few_shot_examples = []
+    for idx in few_shot_indices:
+        ex = train_dataset[idx]
+        ctx_a = ex.get("ctx_a", "")
+        ctx_b = ex.get("ctx_b", "")
+        endings = ex["endings"]
+        label = int(ex["label"])
+
+        # Build full sentences
+        full_endings = [f"{ctx_a} {ctx_b} {e}" for e in endings]
+        correct_letter = chr(ord("A") + label)
+
+        example_text = "Pick the most plausible continuation of the sentence.\n\n"
+        example_text += "\n".join(
+            f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(full_endings)
+        )
+        example_text += f"\n\nAnswer: {correct_letter}"
+        few_shot_examples.append(example_text)
+
+    few_shot_prefix = "\n\n".join(few_shot_examples) + "\n\n---\n\n"
 
     for batch_start in range(0, n, batch_size):
         batch_end = min(batch_start + batch_size, n)
@@ -860,12 +888,16 @@ def evaluate_hellaswag(
         prompts = []
         metadata = []
         for example in batch:
-            ctx = example["ctx"]
+            ctx_a = example.get("ctx_a", "")
+            ctx_b = example.get("ctx_b", "")
             endings = example["endings"]
             label = int(example["label"])
 
+            # Build full sentences: ctx_a + ctx_b + ending
+            full_endings = [f"{ctx_a} {ctx_b} {e}" for e in endings]
+
             # Randomize option order
-            indexed = list(enumerate(endings))
+            indexed = list(enumerate(full_endings))
             rng.shuffle(indexed)
             shuffled_endings = [e for _, e in indexed]
             new_correct_idx = next(
@@ -874,12 +906,12 @@ def evaluate_hellaswag(
             correct_letter = chr(ord("A") + new_correct_idx)
 
             prompt = (
-                f"Complete the following sentence by choosing the correct ending.\n\n"
-                f"{ctx}\n\n"
+                few_shot_prefix
+                + "Pick the most plausible continuation of the sentence.\n\n"
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(shuffled_endings)
                 )
-                + "\n\nAnswer with the letter only, like 'A' or 'B'..."
+                + "\n\nAnswer with a single letter (A, B, C, or D)."
             )
             prompts.append(prompt)
             metadata.append((shuffled_endings, correct_letter))
@@ -999,7 +1031,7 @@ def evaluate_piqa(
                 correct_letter = "B" if label == 0 else "A"
 
             prompt = (
-                f"{goal}\n\n"
+                f"Select the best option for the following scenario:\n{goal}\n\n"
                 f"A. {opt_a}\n"
                 f"B. {opt_b}\n\n" + "Answer with the letter only, like 'A' or 'B'..."
             )
@@ -1217,8 +1249,14 @@ def evaluate_arc(
     return accuracy
 
 
-def _extract_number(text):
-    """Extract a number from text. Tries structured patterns first, then falls back to first number."""
+def _extract_number(text, answer_last=None):
+    """Extract a number from text. Tries structured patterns first, then falls back.
+
+    Args:
+        answer_last: If None (default), tries structured patterns then first number.
+                     If True, fallback uses the last number in text.
+                     If False, fallback uses the first number in text.
+    """
     import re
 
     _NUM = r"-?\d+(?:,\d{3})*(?:\.\d+)?"
@@ -1239,10 +1277,11 @@ def _extract_number(text):
     )
     if m:
         return m.group(1).replace(",", "")
-    # Fallback: first number in text
+    # Fallback: pick first or last number depending on answer_last
     numbers = re.findall(rf"{_NUM}", text)
     if numbers:
-        return numbers[0].replace(",", "")
+        idx = -1 if answer_last else 0
+        return numbers[idx].replace(",", "")
     return None
 
 
@@ -1256,6 +1295,7 @@ def evaluate_gsm8k(
     max_thinking_tokens=None,
     use_triton=False,
     use_cuda_graph=False,
+    answer_last=None,
 ):
     """Evaluate on GSM8K using batched generative reasoning (numerical answer)."""
     import re
@@ -1288,7 +1328,10 @@ def evaluate_gsm8k(
             ref_val = ref_match.group(1).replace(",", "") if ref_match else None
             ref_answers.append(ref_val)
 
-            prompt = f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
+            prompt = (
+                f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
+                # + "\n\nProvide only the answer."
+            )
             # Truncate if too long
             model_maxlen = getattr(gen.model, "maxlen", 2048)
             max_prompt_tokens = model_maxlen // 2
@@ -1324,7 +1367,7 @@ def evaluate_gsm8k(
         for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
             idx = batch_start + i
             answer_text = _extract_answer_after_thinking(output)
-            predicted = _extract_number(answer_text)
+            predicted = _extract_number(answer_text, answer_last=answer_last)
 
             if idx < verbose_examples:
                 print(f"  [DEBUG] idx={idx} predicted={predicted} ref={ref_val}")
@@ -1377,7 +1420,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_330k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_325k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1423,7 +1466,7 @@ def main():
     parser.add_argument(
         "--max_thinking_tokens",
         type=int,
-        default=1000 * 2,
+        default=2000,
         help="Absolute position limit: inject <|think_end|> when prompt_len + thinking_count >= this value",
     )
     parser.add_argument(
@@ -1447,6 +1490,12 @@ def main():
         action="store_true",
         help="Disable CUDA Graphs optimization",
     )
+    parser.add_argument(
+        "--answer_last",
+        action="store_true",
+        default=None,
+        help="GSM8K: extract the last number in the answer instead of the first (depends on model)",
+    )
     args = parser.parse_args()
 
     print("Loading model...")
@@ -1455,7 +1504,7 @@ def main():
 
     # Pre-capture CUDA graphs for fast generation if not disabled
     if not args.no_cuda_graph:
-        gen.precompute(max_seq_len=1024, use_triton=args.use_triton)
+        gen.precompute(max_seq_len=2048, use_triton=args.use_triton)
 
     def _make_constraints(n_choices):
         """Build output_constraints list like ['A.', 'B.', ...] if --constrain_output."""
@@ -1636,6 +1685,7 @@ def main():
             max_thinking_tokens=args.max_thinking_tokens,
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            answer_last=args.answer_last,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GSM8K (reasoning): {accuracy:.2f}%")

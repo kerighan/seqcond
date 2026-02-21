@@ -49,7 +49,17 @@ class TorchGenerator:
         self._static_logits_dict = {}  # seq_len -> logits tensor
         self._static_token = None
         self._static_states = None
-        self._seq_lens = [8, 16, 32, 64, 128, 256, 512, 1024]  # Power-of-2 lengths
+        self._seq_lens = [
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+        ]  # Power-of-2 lengths
         # self._seq_lens = [16, 64, 256, 1024]  # Power-of-4 lengths
         self._use_triton = False  # Whether to use Triton kernels in CUDA graphs
 
@@ -182,7 +192,14 @@ class TorchGenerator:
         # Generate
         # if verbose:
         #     print(prompt, end="", flush=True)
+        model_maxlen = getattr(self.model, "maxlen", 2048)
         for _ in range(max_new_tokens):
+            # Safety: stop if we're about to exceed model's max length
+            if len(generated) >= model_maxlen:
+                print(
+                    f"WARNING: Reached model max length ({model_maxlen}), stopping generation"
+                )
+                break
             # Apply temperature
             if temperature > 0:
                 logits_scaled = logits[0] / temperature
@@ -192,12 +209,14 @@ class TorchGenerator:
             # Apply repetition penalty
             if repetition_penalty != 1.0:
                 for token_id in set(generated):
-                    logits_scaled[token_id] /= repetition_penalty
+                    if 0 <= token_id < self.model.vocab_size:
+                        logits_scaled[token_id] /= repetition_penalty
 
             # Apply frequency penalty
             if frequency_penalty > 0:
                 for token_id, count in token_counts.items():
-                    logits_scaled[token_id] -= frequency_penalty * count
+                    if 0 <= token_id < self.model.vocab_size:
+                        logits_scaled[token_id] -= frequency_penalty * count
 
             # Apply no_repeat_ngram
             if no_repeat_ngram_size > 0 and len(generated) >= no_repeat_ngram_size:
@@ -205,7 +224,14 @@ class TorchGenerator:
                 for i in range(len(generated) - no_repeat_ngram_size + 1):
                     if tuple(generated[i : i + no_repeat_ngram_size - 1]) == ngram:
                         blocked_token = generated[i + no_repeat_ngram_size - 1]
-                        logits_scaled[blocked_token] = float("-inf")
+                        if 0 <= blocked_token < self.model.vocab_size:
+                            logits_scaled[blocked_token] = float("-inf")
+
+            # Safety check: replace NaN/inf with very negative values
+            if torch.isnan(logits_scaled).any() or torch.isinf(logits_scaled).any():
+                logits_scaled = torch.nan_to_num(
+                    logits_scaled, nan=-1e9, posinf=-1e9, neginf=-1e9
+                )
 
             # Sample
             if temperature == 0:
@@ -234,6 +260,13 @@ class TorchGenerator:
 
                 probs = F.softmax(logits_scaled, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Safety clamp: ensure token is within vocab bounds
+            if next_token >= self.model.vocab_size or next_token < 0:
+                print(
+                    f"WARNING: Invalid token {next_token} (vocab_size={self.model.vocab_size}), using EOS"
+                )
+                next_token = self.eos_token_id
 
             # Track thinking state
             if next_token == self.think_end_id:

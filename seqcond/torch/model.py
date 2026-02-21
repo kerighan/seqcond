@@ -252,6 +252,9 @@ class SeqCondModel(nn.Module):
 
         x = self.embedding(token_id).squeeze(1)  # (B, D)
 
+        # Clamp pos to valid range to prevent out-of-bounds access in RoPE and KV cache
+        pos = pos.clamp(max=self.maxlen - 1)
+
         if self.use_positional_embedding:
             pos_idx = pos.long()  # (B,) — per-sample positions
             x = x + torch.index_select(self.position_embedding.weight, 0, pos_idx)

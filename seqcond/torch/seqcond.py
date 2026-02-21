@@ -434,6 +434,8 @@ class SeqCondAttention(nn.Module):
 
         # Update position in-place for CUDA graph compatibility
         pos.add_(1)
+        # Clamp to prevent out-of-bounds in RoPE/KV cache when exceeding maxlen
+        pos.clamp_(max=(self.maxlen or 2048) - 1)
 
         # Update conv_buffer in-place (shift left and insert new value)
         if self.conv_kernel_size > 1:
