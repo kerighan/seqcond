@@ -283,6 +283,7 @@ def evaluate_winogrande(
             option1 = example["option1"]
             option2 = example["option2"]
             answer = example["answer"]  # "1" or "2"
+            query, end_of_target = sentence.split("_")
 
             # Randomize option order to prevent positional bias
             if rng.random() < 0.5:
@@ -294,10 +295,10 @@ def evaluate_winogrande(
 
             prompt = (
                 # f"Complete the following sentence by choosing the correct option.\n\n"
-                f"Choose the best option to fill in the blank.\n\n{sentence}\n\n"
-                f"A. {opt_a}\n"
-                f"B. {opt_b}"
-                "\n\nAnswer with the letter only, like 'A' or 'B'..."
+                f"Choose the best option to fill in the blank.\n\n{query}\n\n"
+                f"A. {opt_a} {end_of_target}\n"
+                f"B. {opt_b} {end_of_target}"
+                # "\n\nAnswer with the letter only."
             )
             prompts.append(prompt)
             metadata.append((opt_a, opt_b, correct_letter))
@@ -858,28 +859,24 @@ def evaluate_hellaswag(
 
     train_dataset = load_dataset("hellaswag", split="train")
     few_shot_rng = random.Random(123)  # Fixed seed for reproducible few-shot examples
-    few_shot_indices = few_shot_rng.sample(range(len(train_dataset)), 5)
+    few_shot_indices = few_shot_rng.sample(range(len(train_dataset)), 8)
 
-    few_shot_examples = []
-    for idx in few_shot_indices:
-        ex = train_dataset[idx]
-        ctx_a = ex.get("ctx_a", "")
-        ctx_b = ex.get("ctx_b", "")
-        endings = ex["endings"]
-        label = int(ex["label"])
+    from string import ascii_uppercase
+    
+    # few_shot_examples = []
+    # for idx in few_shot_indices:
+    #     ex = train_dataset[idx]
+    #     label = int(ex["label"])
+    #     correct_letter = chr(ord("A") + label)
 
-        # Build full sentences
-        full_endings = [f"{ctx_a} {ctx_b} {e}" for e in endings]
-        correct_letter = chr(ord("A") + label)
+    #     # example_text = "The following are multiple choice questions (with answers) about common sense.\n\n"
+    #     example_text = f"Question: {ex['activity_label']}: {ex['ctx_a']} {ex['ctx_b'].capitalize()}\n"
+    #     example_text += "".join([f"{key}. {choice}\n" for key, choice in zip(ascii_uppercase, ex["endings"])])
+    #     example_text += f"Answer: {correct_letter}"
+    #     few_shot_examples.append(example_text)
 
-        example_text = "Pick the most plausible continuation of the sentence.\n\n"
-        example_text += "\n".join(
-            f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(full_endings)
-        )
-        example_text += f"\n\nAnswer: {correct_letter}"
-        few_shot_examples.append(example_text)
-
-    few_shot_prefix = "\n\n".join(few_shot_examples) + "\n\n---\n\n"
+    # few_shot_prefix = "\n\n".join(few_shot_examples) + "\n\n---\n\n"
+    few_shot_prefix = ""
 
     for batch_start in range(0, n, batch_size):
         batch_end = min(batch_start + batch_size, n)
@@ -905,15 +902,23 @@ def evaluate_hellaswag(
             )
             correct_letter = chr(ord("A") + new_correct_idx)
 
-            prompt = (
-                few_shot_prefix
-                + "Pick the most plausible continuation of the sentence.\n\n"
-                + "\n".join(
-                    f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(shuffled_endings)
-                )
-                + "\n\nAnswer with a single letter (A, B, C, or D)."
-            )
-            prompts.append(prompt)
+            # prompt = (
+            #     "The following are multiple choice questions (with answers) about common sense.\n\nQuestion: "
+            #     + example["activity_label"] + ": "
+            #     + "\n".join(
+            #         f"{chr(ord('A') + j)}. {e}" for j, e in enumerate(shuffled_endings)
+            #     )
+            #     # + "\n\nAnswer with a single letter (A, B, C, or D)."
+            # )
+            query = "The following are multiple choice questions (with answers) about common sense.\n\n"
+            query += f"Question: {example['activity_label']}: {example['ctx_a']} {example['ctx_b'].capitalize()}\n"
+            query += "".join([f"{key}. {choice}\n" for key, choice in zip(ascii_uppercase, example["endings"])])
+            query += "Answer:"
+            
+            # Add few-shot prefix
+            full_prompt = few_shot_prefix + query
+            # print(full_prompt)
+            prompts.append(full_prompt)
             metadata.append((shuffled_endings, correct_letter))
 
         # Batched generation
@@ -1033,7 +1038,7 @@ def evaluate_piqa(
             prompt = (
                 f"Select the best option for the following scenario:\n{goal}\n\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n" + "Answer with the letter only, like 'A' or 'B'..."
+                f"B. {opt_b}\n\n" # + "Answer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
@@ -1075,10 +1080,10 @@ def evaluate_piqa(
             # print("-" * 50)
             valid = {"A", "B"}
             predicted = _parse_choice(answer_text, valid, options=options)
-            print(prompt)
-            print(output)
-            print(predicted, "=>", correct_letter)
-            print("-" * 80)
+            # print(prompt)
+            # print(output)
+            # print(predicted, "=>", correct_letter)
+            # print("-" * 80)
 
             if predicted is None:
                 parse_failures += 1
@@ -1420,7 +1425,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_325k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_365k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1588,7 +1593,7 @@ def main():
     elif args.benchmark == "piqa":
         print(f"\nLoading PIQA dataset (split={args.split})...")
         dataset = load_dataset(
-            "ybisk/piqa", split=args.split, revision="refs/convert/parquet"
+            "ybisk/piqa", split=args.split, revision="refs/convert/parquet",
         )
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
@@ -1610,7 +1615,7 @@ def main():
         _send_notification("Évaluation terminée", f"PIQA (reasoning): {accuracy:.2f}%")
     elif args.benchmark == "hellaswag":
         print(f"\nLoading HellaSwag dataset (split={args.split})...")
-        dataset = load_dataset("hellaswag", split=args.split)
+        dataset = load_dataset("Rowan/hellaswag", split="validation")
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
         )
