@@ -298,7 +298,7 @@ def evaluate_winogrande(
                 f"Choose the best option to fill in the blank.\n\n{query}\n\n"
                 f"A. {opt_a} {end_of_target}\n"
                 f"B. {opt_b} {end_of_target}"
-                # "\n\nAnswer with the letter only."
+                "\n\nAnswer with the letter only."
             )
             prompts.append(prompt)
             metadata.append((opt_a, opt_b, correct_letter))
@@ -434,10 +434,13 @@ def evaluate_gpqa(
                 f"B. {choices[1]}\n"
                 f"C. {choices[2]}\n"
                 f"D. {choices[3]}\n"
+                "\nAnswer only with a letter, like 'A' or 'B'."
             )
             # Truncate prompt if too long (whole prompt, to handle long choices)
             model_maxlen = getattr(gen.model, "maxlen", 2048)
-            max_prompt_tokens = model_maxlen // 2  # leave half for thinking + answer
+            max_prompt_tokens = (
+                2 * model_maxlen // 3
+            )  # leave half for thinking + answer
             prompt_tokens = gen.tokenizer.encode(prompt)
             if len(prompt_tokens) > max_prompt_tokens:
                 prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
@@ -826,6 +829,135 @@ def evaluate_commonsenseqa(
     return accuracy
 
 
+def evaluate_mmlu(
+    gen,
+    dataset,
+    max_samples=None,
+    max_new_tokens=512,
+    batch_size=16,
+    verbose_examples=5,
+    max_thinking_tokens=None,
+    output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
+):
+    """Evaluate on MMLU using batched generative reasoning (4-choice)."""
+    correct = 0
+    total = 0
+    parse_failures = 0
+    choice_counts = {}
+    rng = random.Random(42)
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    n = len(dataset)
+    print(
+        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+    )
+    start_time = time.time()
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        batch = dataset.select(range(batch_start, batch_end))
+
+        prompts = []
+        metadata = []
+        for example in batch:
+            question = example["question"]
+            choices = [example["choices"][i] for i in range(4)]  # A, B, C, D
+            answer_idx = example["answer"]  # 0-3
+
+            # Randomize option order
+            indexed = list(enumerate(choices))
+            rng.shuffle(indexed)
+            shuffled_choices = [c for _, c in indexed]
+            new_correct_idx = next(
+                j for j, (orig_i, _) in enumerate(indexed) if orig_i == answer_idx
+            )
+            correct_letter = chr(ord("A") + new_correct_idx)
+
+            prompt = (
+                f"{question}\n\n"
+                + "\n".join(
+                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
+                )
+                + "\n\nAnswer with the letter only."
+            )
+            prompts.append(prompt)
+            metadata.append((prompt, shuffled_choices, correct_letter))
+
+        # Batched generation
+        outputs = _generate_for_batch(
+            gen,
+            prompts,
+            batch_size,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            use_triton=use_triton,
+            use_cuda_graph=use_cuda_graph,
+            max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
+        )
+
+        for i, (output, (prompt, choices, correct_letter)) in enumerate(
+            zip(outputs, metadata)
+        ):
+            idx = batch_start + i
+            debug_extract = bool(verbose_examples) and idx < verbose_examples
+            answer_text = _extract_answer_after_thinking(
+                output,
+                debug=debug_extract and _is_debug_extract_enabled(gen),
+                debug_id=f"idx={idx}",
+            )
+            valid = {"A", "B", "C", "D"}
+            predicted = _parse_choice(answer_text, valid, options=choices)
+
+            if predicted is None:
+                parse_failures += 1
+                if idx < verbose_examples:
+                    print(f"  [PARSE FAIL] idx={idx}")
+                    print(f"    Prompt: {prompt[:300]}")
+                    print(f"    Output: {output[:300]}")
+                    print(f"    Answer text: {answer_text[:300]}")
+            else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
+                if idx < verbose_examples:
+                    print(
+                        f"  [DEBUG] idx={idx} predicted={predicted} correct={correct_letter}"
+                    )
+                if predicted == correct_letter:
+                    correct += 1
+
+            total += 1
+
+        elapsed = time.time() - start_time
+        speed = total / elapsed if elapsed > 0 else 0
+        acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
+        print(
+            f"  {total}/{n} | Acc: {acc:.1f}% "
+            f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
+            f"| Speed: {speed:.1f} samples/s"
+        )
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100 if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"MMLU (Reasoning) Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(
+        f"  Parse failures: {parse_failures}/{total} ({parse_failures/total*100:.1f}%)"
+    )
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def evaluate_hellaswag(
     gen,
     dataset,
@@ -862,7 +994,7 @@ def evaluate_hellaswag(
     few_shot_indices = few_shot_rng.sample(range(len(train_dataset)), 8)
 
     from string import ascii_uppercase
-    
+
     # few_shot_examples = []
     # for idx in few_shot_indices:
     #     ex = train_dataset[idx]
@@ -912,9 +1044,14 @@ def evaluate_hellaswag(
             # )
             query = "The following are multiple choice questions (with answers) about common sense.\n\n"
             query += f"Question: {example['activity_label']}: {example['ctx_a']} {example['ctx_b'].capitalize()}\n"
-            query += "".join([f"{key}. {choice}\n" for key, choice in zip(ascii_uppercase, example["endings"])])
+            query += "".join(
+                [
+                    f"{key}. {choice}\n"
+                    for key, choice in zip(ascii_uppercase, example["endings"])
+                ]
+            )
             query += "Answer:"
-            
+
             # Add few-shot prefix
             full_prompt = few_shot_prefix + query
             # print(full_prompt)
@@ -1038,7 +1175,7 @@ def evaluate_piqa(
             prompt = (
                 f"Select the best option for the following scenario:\n{goal}\n\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n" # + "Answer with the letter only, like 'A' or 'B'..."
+                f"B. {opt_b}\n\n"  # + "Answer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
@@ -1264,6 +1401,16 @@ def _extract_number(text, answer_last=None):
     """
     import re
 
+    if "answer is " in text:
+        res = text.split("answer is ")[1].split(".")[0].strip()
+        # keep only digits
+        res = re.sub(r"[^0-9]", "", res)
+        return res
+    if "\\boxed{" in text:
+        res = text.split("\\boxed{")[1].split("}")[0].strip()
+        res = re.sub(r"[^0-9]", "", res)
+        return res
+
     _NUM = r"-?\d+(?:,\d{3})*(?:\.\d+)?"
 
     # Try #### pattern first (GSM8K format)
@@ -1373,6 +1520,9 @@ def evaluate_gsm8k(
             idx = batch_start + i
             answer_text = _extract_answer_after_thinking(output)
             predicted = _extract_number(answer_text, answer_last=answer_last)
+            print(answer_text)
+            print(predicted)
+            print("\n" + "-" * 80 + "\n")
 
             if idx < verbose_examples:
                 print(f"  [DEBUG] idx={idx} predicted={predicted} ref={ref_val}")
@@ -1425,7 +1575,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_365k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_400k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1593,7 +1743,9 @@ def main():
     elif args.benchmark == "piqa":
         print(f"\nLoading PIQA dataset (split={args.split})...")
         dataset = load_dataset(
-            "ybisk/piqa", split=args.split, revision="refs/convert/parquet",
+            "ybisk/piqa",
+            split=args.split,
+            revision="refs/convert/parquet",
         )
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
@@ -1730,6 +1882,27 @@ def main():
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GPQA (reasoning): {accuracy:.2f}%")
+    elif args.benchmark == "mmlu":
+        print(f"\nLoading MMLU dataset (split={args.split})...")
+        dataset = load_dataset("cais/mmlu", "all", split=args.split)
+        dataset = _maybe_shuffle_dataset(
+            dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
+        )
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_mmlu(
+            gen,
+            dataset,
+            max_samples=args.max_samples,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            verbose_examples=args.verbose_examples,
+            max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(4),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
+        )
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification("Évaluation terminée", f"MMLU (reasoning): {accuracy:.2f}%")
     else:
         print(f"Benchmark '{args.benchmark}' not implemented yet in eval_reasoning.py")
 

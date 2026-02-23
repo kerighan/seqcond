@@ -125,12 +125,13 @@ class ModelConfig:
     def xlarge(cls, **kwargs) -> "ModelConfig":
         """XLarge model (~770M params). Override any param with kwargs."""
         defaults = dict(
-            d_model=1536,
-            d_ff=int(8 * 1536 / 3),
+            d_model=2048,
+            d_ff=5460,
             num_layers=24,
             num_heads=16,
-            seqcond_heads=96,
-            num_kv_heads=8,
+            seqcond_heads=16,
+            num_query_heads=16,
+            num_kv_heads=4,
         )
         defaults.update(kwargs)
         return cls(**defaults)

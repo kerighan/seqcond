@@ -223,10 +223,22 @@ def parse_args():
         help="Save the untrained model to the specified filepath (e.g., model.pkl)",
     )
 
+    # CPU-only option
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Force JAX to use CPU only (useful for large models that don't fit in GPU memory)",
+    )
+
     return parser.parse_args()
 
 
 args = parse_args()
+
+# Force CPU if requested (must be set before importing JAX)
+if args.cpu_only:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    print("Forcing JAX to use CPU only...")
 
 import jax
 import jax.numpy as jnp
