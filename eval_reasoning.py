@@ -1173,9 +1173,9 @@ def evaluate_piqa(
                 correct_letter = "B" if label == 0 else "A"
 
             prompt = (
-                f"Select the best option for the following scenario:\n{goal}\n\n"
+                f"{goal}\n\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n"  # + "Answer with the letter only, like 'A' or 'B'..."
+                f"B. {opt_b}\n\n" + "Answer with the letter only, like 'A' or 'B'..."
             )
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
@@ -1575,7 +1575,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_400k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_480k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1610,7 +1610,7 @@ def main():
     parser.add_argument(
         "--shuffle_seed",
         type=int,
-        default=42,
+        default=43,
         help="Deterministically shuffle dataset order (helps stabilize running accuracy)",
     )
     parser.add_argument(
@@ -1723,7 +1723,12 @@ def main():
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
         )
-        print(f"Dataset loaded: {len(dataset)} examples\n")
+        print(f"Dataset loaded: {len(dataset)} examples")
+        # Diagnostic: show first few IDs to verify shuffle
+        first_ids = [
+            dataset[i].get("id", f"idx_{i}") for i in range(min(10, len(dataset)))
+        ]
+        print(f"First 10 IDs (shuffle_seed={args.shuffle_seed}): {first_ids}\n")
         accuracy = evaluate_commonsenseqa(
             gen,
             dataset,

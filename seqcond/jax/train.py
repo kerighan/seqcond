@@ -944,11 +944,7 @@ class Trainer:
         else:
             debug_opt = os.environ.get("SLM_JAX_DEBUG_OPT", "0").strip() == "1"
             if debug_opt:
-                lr_schedule = warmup_cosine_decay_schedule(
-                    base_lr=self.train_config.base_lr,
-                    warmup_steps=self.train_config.warmup_steps,
-                    total_steps=self.train_config.total_steps,
-                )
+                lr_schedule = self._lr_schedule
                 self._train_step_dbg = make_train_step_with_debug(
                     self.model,
                     self.optimizer,
@@ -1279,7 +1275,7 @@ class Trainer:
 
         # Wandb detailed logging
         if self._wandb is not None:
-            current_lr = float(self._lr_schedule(macro_step))
+            current_lr = float(self._lr_schedule(macro_step - self.start_step))
             log_data = {
                 **{k: float(v) for k, v in results.items()},
                 "tokens_per_sec": tokens_per_sec,
