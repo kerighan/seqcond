@@ -1175,7 +1175,7 @@ def evaluate_piqa(
             prompt = (
                 f"{goal}\n\n"
                 f"A. {opt_a}\n"
-                f"B. {opt_b}\n\n" + "Answer with the letter only, like 'A' or 'B'..."
+                f"B. {opt_b}\n\nAnswer with the letter only, like 'A' or 'B'."
             )
             prompts.append(prompt)
             metadata.append(([opt_a, opt_b], correct_letter))
@@ -1437,6 +1437,223 @@ def _extract_number(text, answer_last=None):
     return None
 
 
+def _extract_boxed(text):
+    """Extract content from \\boxed{...}, handling nested braces."""
+    idx = text.rfind("\\boxed{")
+    if idx == -1:
+        return None
+    depth = 0
+    start = idx + len("\\boxed{")
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            if depth == 0:
+                return text[start:i]
+            depth -= 1
+    return text[start:]
+
+
+def _normalize_math_answer(answer):
+    """Normalize a math answer string for comparison.
+
+    Handles LaTeX formatting, whitespace, and common variations.
+    """
+    if answer is None:
+        return None
+    s = str(answer).strip()
+    # Remove \text{...} wrappers
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    # Remove \mathrm{...} wrappers
+    s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
+    # Remove \left / \right
+    s = s.replace("\\left", "").replace("\\right", "")
+    # Remove \, and \; and \! (thin spaces)
+    s = re.sub(r"\\[,;!]", "", s)
+    # Remove \displaystyle
+    s = s.replace("\\displaystyle", "")
+    # Remove dollar signs
+    s = s.replace("$", "")
+    # Normalize whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # Remove trailing period
+    s = s.rstrip(".")
+    # Normalize dfrac -> frac
+    s = s.replace("\\dfrac", "\\frac")
+    s = s.replace("\\tfrac", "\\frac")
+    # Remove optional \\ at end
+    s = s.rstrip("\\").strip()
+    return s
+
+
+def _math_answers_equal(predicted, reference):
+    """Compare two math answers for equivalence.
+
+    Tries string normalization first, then numeric comparison.
+    """
+    if predicted is None or reference is None:
+        return False
+    norm_pred = _normalize_math_answer(predicted)
+    norm_ref = _normalize_math_answer(reference)
+    if not norm_pred or not norm_ref:
+        return False
+    # Direct string match after normalization
+    if norm_pred == norm_ref:
+        return True
+    # Try numeric comparison
+    try:
+        val_pred = float(norm_pred.replace(",", ""))
+        val_ref = float(norm_ref.replace(",", ""))
+        if abs(val_pred - val_ref) < 1e-6:
+            return True
+    except (ValueError, OverflowError):
+        pass
+    # Try sympy for symbolic comparison (optional, best-effort)
+    try:
+        from sympy.parsing.latex import parse_latex
+
+        expr_pred = parse_latex(norm_pred)
+        expr_ref = parse_latex(norm_ref)
+        if expr_pred.equals(expr_ref):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _extract_math_answer(text):
+    """Extract the final math answer from model output.
+
+    Tries \\boxed{} first, then 'answer is ...', then last line.
+    """
+    # Try \boxed{} (last occurrence)
+    boxed = _extract_boxed(text)
+    if boxed is not None:
+        return boxed.strip()
+    # Try "answer is ..." pattern
+    m = re.search(
+        r"(?:final\s+)?answer\s*(?:is|:)\s*(.+?)(?:\.|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    # Fallback: last non-empty line
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    if lines:
+        return lines[-1]
+    return text.strip()
+
+
+def evaluate_math500(
+    gen,
+    dataset,
+    max_samples=None,
+    max_new_tokens=2048,
+    batch_size=16,
+    verbose_examples=5,
+    max_thinking_tokens=None,
+    use_triton=False,
+    use_cuda_graph=False,
+    answer_last=None,
+):
+    """Evaluate on MATH-500 using batched generative reasoning (free-form math answers)."""
+    correct = 0
+    total = 0
+    parse_failures = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    n = len(dataset)
+    print(
+        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+    )
+    start_time = time.time()
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        batch = dataset.select(range(batch_start, batch_end))
+
+        prompts = []
+        ref_answers = []
+        for example in batch:
+            problem = example["problem"]
+            answer = example["answer"]
+            ref_answers.append(answer)
+
+            prompt = f"Solve the following math problem. Show your work and give your final answer in \\boxed{{}}.\n\n{problem}"
+            # Truncate if too long
+            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            max_prompt_tokens = model_maxlen // 2
+            prompt_tokens = gen.tokenizer.encode(prompt)
+            if len(prompt_tokens) > max_prompt_tokens:
+                prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
+            prompts.append(prompt)
+
+        # Batched generation
+        if batch_size == 1:
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+            )
+
+        for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
+            idx = batch_start + i
+            answer_text = _extract_answer_after_thinking(output)
+            predicted = _extract_math_answer(answer_text)
+
+            if idx < verbose_examples:
+                print(f"  [DEBUG] idx={idx} predicted={predicted!r} ref={ref_val!r}")
+                print(f"    Answer text: {answer_text[:300]!r}")
+
+            if predicted is None:
+                parse_failures += 1
+            elif _math_answers_equal(predicted, ref_val):
+                correct += 1
+
+            total += 1
+
+        elapsed = time.time() - start_time
+        speed = total / elapsed if elapsed > 0 else 0
+        acc = correct / total * 100
+        print(
+            f"  {total}/{n} | Acc: {acc:.1f}% "
+            f"| Parse fails: {parse_failures} "
+            f"| Speed: {speed:.1f} samples/s"
+        )
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100 if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"MATH-500 (Reasoning) Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(
+        f"  Parse failures: {parse_failures}/{total} ({parse_failures/total*100:.1f}%)"
+    )
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def evaluate_gsm8k(
     gen,
     dataset,
@@ -1482,7 +1699,7 @@ def evaluate_gsm8k(
 
             prompt = (
                 f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
-                # + "\n\nProvide only the answer."
+                + "\n\nProvide only the answer."
             )
             # Truncate if too long
             model_maxlen = getattr(gen.model, "maxlen", 2048)
@@ -1520,9 +1737,9 @@ def evaluate_gsm8k(
             idx = batch_start + i
             answer_text = _extract_answer_after_thinking(output)
             predicted = _extract_number(answer_text, answer_last=answer_last)
-            print(answer_text)
-            print(predicted)
-            print("\n" + "-" * 80 + "\n")
+            # print(answer_text)
+            # print(predicted, ref_val)
+            # print("\n" + "-" * 80 + "\n")
 
             if idx < verbose_examples:
                 print(f"  [DEBUG] idx={idx} predicted={predicted} ref={ref_val}")
@@ -1575,7 +1792,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_480k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_555k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1610,7 +1827,7 @@ def main():
     parser.add_argument(
         "--shuffle_seed",
         type=int,
-        default=43,
+        default=44,
         help="Deterministically shuffle dataset order (helps stabilize running accuracy)",
     )
     parser.add_argument(
@@ -1851,6 +2068,28 @@ def main():
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GSM8K (reasoning): {accuracy:.2f}%")
+    elif args.benchmark == "math500":
+        print(f"\nLoading MATH-500 dataset (split=test)...")
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        dataset = _maybe_shuffle_dataset(
+            dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
+        )
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_math500(
+            gen,
+            dataset,
+            max_samples=args.max_samples,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            verbose_examples=args.verbose_examples,
+            max_thinking_tokens=args.max_thinking_tokens,
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
+        )
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification(
+            "Évaluation terminée", f"MATH-500 (reasoning): {accuracy:.2f}%"
+        )
     elif args.benchmark.startswith("gpqa"):
         parts = args.benchmark.split(":")
         subset = parts[1] if len(parts) == 2 else "diamond"
