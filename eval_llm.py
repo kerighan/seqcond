@@ -20,6 +20,7 @@ from eval_reasoning import (
     evaluate_arc,
     evaluate_gpqa,
     evaluate_gsm8k,
+    evaluate_triviaqa,
     _maybe_shuffle_dataset,
     _send_notification,
 )
@@ -587,6 +588,19 @@ def main():
                 verbose_examples=args.verbose_examples,
             )
             results["gpqa:diamond"] = acc
+
+        elif bench == "triviaqa":
+            dataset = load_dataset("trivia_qa", "rc.nocontext", split="validation")
+            dataset = _maybe_shuffle_dataset(dataset, seed=42)
+            acc = evaluate_triviaqa(
+                gen,
+                dataset,
+                max_samples=args.max_samples,
+                max_new_tokens=args.max_new_tokens,
+                batch_size=args.batch_size,
+                verbose_examples=args.verbose_examples,
+            )
+            results["triviaqa"] = acc
 
         elif bench == "gsm8k":
             dataset = load_dataset("openai/gsm8k", "main", split="test")

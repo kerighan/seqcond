@@ -298,7 +298,7 @@ def evaluate_winogrande(
                 f"Choose the best option to fill in the blank.\n\n{query}\n\n"
                 f"A. {opt_a} {end_of_target}\n"
                 f"B. {opt_b} {end_of_target}"
-                "\n\nAnswer with the letter only."
+                # "\n\nAnswer with the letter only."
             )
             prompts.append(prompt)
             metadata.append((opt_a, opt_b, correct_letter))
@@ -1699,7 +1699,7 @@ def evaluate_gsm8k(
 
             prompt = (
                 f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
-                + "\n\nProvide only the answer."
+                # + "\n\nProvide only the answer."
             )
             # Truncate if too long
             model_maxlen = getattr(gen.model, "maxlen", 2048)
@@ -1786,13 +1786,199 @@ def evaluate_gsm8k(
     return accuracy
 
 
+def _normalize_triviaqa_answer(text):
+    """Normalize an answer string for TriviaQA comparison (lowercased, stripped punctuation/articles)."""
+    import string
+
+    text = text.lower().strip()
+    # Remove articles
+    for article in ["a ", "an ", "the "]:
+        if text.startswith(article):
+            text = text[len(article) :]
+    # Remove punctuation
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    # Collapse whitespace
+    text = " ".join(text.split())
+    return text
+
+
+def _triviaqa_match(predicted, answer_obj):
+    """Check if predicted answer matches any of the accepted TriviaQA answers.
+
+    answer_obj has 'value' (canonical) and 'aliases' (list of accepted variants).
+    """
+    if not predicted:
+        return False
+    norm_pred = _normalize_triviaqa_answer(predicted)
+    if not norm_pred:
+        return False
+    # Collect all accepted answers
+    accepted = []
+    if isinstance(answer_obj, dict):
+        if answer_obj.get("value"):
+            accepted.append(answer_obj["value"])
+        accepted.extend(answer_obj.get("aliases", []))
+        accepted.extend(answer_obj.get("normalized_aliases", []))
+    for ref in accepted:
+        if _normalize_triviaqa_answer(ref) == norm_pred:
+            return True
+    # Containment fallback: if predicted is a substring of a ref or vice versa
+    for ref in accepted:
+        norm_ref = _normalize_triviaqa_answer(ref)
+        if norm_ref and (norm_pred in norm_ref or norm_ref in norm_pred):
+            return True
+    return False
+
+
+def _extract_short_answer(text):
+    """Extract a short factual answer from model output."""
+    # Try "answer is ..." pattern
+    m = re.search(
+        r"(?:final\s+)?answer\s*(?:is|:)\s*(.+?)(?:\.|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    # Try \boxed{}
+    if "\\boxed{" in text:
+        content = text.split("\\boxed{")[-1].split("}")[0]
+        return content.strip()
+    # Fallback: first line (short answers tend to be brief)
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    if lines:
+        # If the first line is short enough, use it; otherwise use last line
+        if len(lines[0]) < 200:
+            return lines[0]
+        return lines[-1]
+    return text.strip()
+
+
+def evaluate_triviaqa(
+    gen,
+    dataset,
+    max_samples=None,
+    max_new_tokens=512,
+    batch_size=16,
+    verbose_examples=5,
+    max_thinking_tokens=None,
+    use_triton=False,
+    use_cuda_graph=False,
+):
+    """Evaluate on TriviaQA using batched generative reasoning (open-domain QA)."""
+    correct = 0
+    total = 0
+    parse_failures = 0
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    n = len(dataset)
+    print(
+        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+    )
+    start_time = time.time()
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        batch = dataset.select(range(batch_start, batch_end))
+
+        prompts = []
+        ref_answers = []
+        for example in batch:
+            question = example["question"]
+            answer_obj = example["answer"]
+            ref_answers.append(answer_obj)
+
+            prompt = (
+                f"Answer the following question with a short factual answer.\n\n"
+                f"Question: {question}\n\nAnswer:"
+            )
+            # Truncate if too long
+            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            max_prompt_tokens = model_maxlen // 2
+            prompt_tokens = gen.tokenizer.encode(prompt)
+            if len(prompt_tokens) > max_prompt_tokens:
+                prompt = gen.tokenizer.decode(prompt_tokens[:max_prompt_tokens])
+            prompts.append(prompt)
+
+        # Batched generation
+        if batch_size == 1:
+            outputs = []
+            for prompt in prompts:
+                output = _collect_generation(
+                    gen,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    use_triton=use_triton,
+                    use_cuda_graph=use_cuda_graph,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+                outputs.append(output)
+        else:
+            outputs = gen.generate_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                max_thinking_tokens=max_thinking_tokens,
+            )
+
+        for i, (output, answer_obj) in enumerate(zip(outputs, ref_answers)):
+            idx = batch_start + i
+            answer_text = _extract_answer_after_thinking(output)
+            predicted = _extract_short_answer(answer_text)
+
+            if idx < verbose_examples:
+                ref_display = (
+                    answer_obj.get("value", "?")
+                    if isinstance(answer_obj, dict)
+                    else str(answer_obj)
+                )
+                print(
+                    f"  [DEBUG] idx={idx} predicted={predicted!r} ref={ref_display!r}"
+                )
+                print(f"    Answer text: {answer_text[:300]!r}")
+
+            if predicted is None or not predicted.strip():
+                parse_failures += 1
+            elif _triviaqa_match(predicted, answer_obj):
+                correct += 1
+
+            total += 1
+
+        elapsed = time.time() - start_time
+        speed = total / elapsed if elapsed > 0 else 0
+        acc = correct / total * 100
+        print(
+            f"  {total}/{n} | Acc: {acc:.1f}% "
+            f"| Parse fails: {parse_failures} "
+            f"| Speed: {speed:.1f} samples/s"
+        )
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100 if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"TriviaQA (Reasoning) Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(
+        f"  Parse failures: {parse_failures}/{total} ({parse_failures/total*100:.1f}%)"
+    )
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_600k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_610k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -2147,6 +2333,28 @@ def main():
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"MMLU (reasoning): {accuracy:.2f}%")
+    elif args.benchmark == "triviaqa":
+        print(f"\nLoading TriviaQA dataset (split={args.split})...")
+        dataset = load_dataset("trivia_qa", "rc.nocontext", split=args.split)
+        dataset = _maybe_shuffle_dataset(
+            dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
+        )
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        accuracy = evaluate_triviaqa(
+            gen,
+            dataset,
+            max_samples=args.max_samples,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            verbose_examples=args.verbose_examples,
+            max_thinking_tokens=args.max_thinking_tokens,
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
+        )
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification(
+            "Évaluation terminée", f"TriviaQA (reasoning): {accuracy:.2f}%"
+        )
     else:
         print(f"Benchmark '{args.benchmark}' not implemented yet in eval_reasoning.py")
 
