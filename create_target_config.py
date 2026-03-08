@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
     # Charger le checkpoint original
     print(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
     if "config" in checkpoint:
         import dataclasses

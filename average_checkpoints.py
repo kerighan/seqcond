@@ -5,6 +5,7 @@ import argparse
 import pickle
 import os
 import glob
+import torch
 import jax.numpy as jnp
 from jax import tree_util
 
@@ -137,8 +138,7 @@ with weights 1.0, 0.75, 0.5 (L1 normalized to sum to 1).
 
     # Save
     print(f"\nSaving to: {args.output}")
-    with open(args.output, "wb") as f:
-        pickle.dump(output_data, f)
+    torch.save(output_data, args.output)
 
     print("Done!")
 

@@ -642,7 +642,7 @@ def upscale_model_functional(
     from upscale_model import compute_target_shapes
 
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     valid_fields = {f.name for f in dataclasses.fields(ModelConfig)}
     if "config" in checkpoint:

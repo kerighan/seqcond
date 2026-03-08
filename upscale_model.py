@@ -365,7 +365,7 @@ def upscale_model(
         device: Device pour l'entraînement
     """
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Extraire la config et les poids
     if "config" in checkpoint:

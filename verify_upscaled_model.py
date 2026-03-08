@@ -64,8 +64,8 @@ def verify_reconstruction_quality(
         Dict avec les métriques de reconstruction par layer
     """
     print("Loading checkpoints...")
-    original = torch.load(original_checkpoint, map_location="cpu")
-    upscaled = torch.load(upscaled_checkpoint, map_location="cpu")
+    original = torch.load(original_checkpoint, map_location="cpu", weights_only=False)
+    upscaled = torch.load(upscaled_checkpoint, map_location="cpu", weights_only=False)
 
     original_state = original.get("model", original.get("state_dict", original))
     upscaled_state = upscaled.get("model", upscaled.get("state_dict", upscaled))
@@ -140,7 +140,7 @@ def test_inference(checkpoint_path: str, device: str = "cuda"):
     """
     print(f"\nTesting inference with {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config_dict = checkpoint.get("config", {})
 
     if not config_dict:
@@ -236,8 +236,8 @@ def compare_models(
     print("=" * 80)
 
     # Charger les modèles
-    orig_ckpt = torch.load(original_checkpoint, map_location="cpu")
-    upsc_ckpt = torch.load(upscaled_checkpoint, map_location="cpu")
+    orig_ckpt = torch.load(original_checkpoint, map_location="cpu", weights_only=False)
+    upsc_ckpt = torch.load(upscaled_checkpoint, map_location="cpu", weights_only=False)
 
     orig_config = ModelConfig(**orig_ckpt.get("config", {}))
     upsc_config = ModelConfig(**upsc_ckpt.get("config", {}))

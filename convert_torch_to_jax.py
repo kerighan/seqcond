@@ -16,7 +16,7 @@ import numpy as np
 
 def convert_torch_to_jax(torch_path: str, jax_path: str):
     print(f"Loading PyTorch checkpoint from {torch_path}...")
-    checkpoint = torch.load(torch_path, map_location="cpu")
+    checkpoint = torch.load(torch_path, map_location="cpu", weights_only=False)
 
     config = checkpoint["config"]
     sd = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
@@ -25,15 +25,15 @@ def convert_torch_to_jax(torch_path: str, jax_path: str):
     num_layers = config["num_layers"]
     model_type = config.get("model_type", "seqcond")
 
-    print(f"  d_model={config['d_model']}, num_layers={num_layers}, "
-          f"seqcond_ratio={seqcond_ratio}")
+    print(
+        f"  d_model={config['d_model']}, num_layers={num_layers}, "
+        f"seqcond_ratio={seqcond_ratio}"
+    )
 
     jax_params = {}
 
     # Embedding: torch embedding.weight -> JAX token_embedding.embedding
-    jax_params["token_embedding"] = {
-        "embedding": sd["embedding.weight"].numpy()
-    }
+    jax_params["token_embedding"] = {"embedding": sd["embedding.weight"].numpy()}
     print(f"  embedding: {tuple(sd['embedding.weight'].shape)}")
 
     # Blocks
@@ -118,9 +118,13 @@ def convert_torch_to_jax(torch_path: str, jax_path: str):
 
             # GatedRMSNorm
             if tp + "attn.gate_proj.weight" in sd:
-                attn["gate_proj"] = {"kernel": sd[tp + "attn.gate_proj.weight"].t().numpy()}
+                attn["gate_proj"] = {
+                    "kernel": sd[tp + "attn.gate_proj.weight"].t().numpy()
+                }
             if tp + "attn.gated_norm.weight" in sd:
-                attn["gated_norm"] = {"weight": sd[tp + "attn.gated_norm.weight"].numpy()}
+                attn["gated_norm"] = {
+                    "weight": sd[tp + "attn.gated_norm.weight"].numpy()
+                }
 
             # Skip projection
             if tp + "attn.skip_up.weight" in sd:
@@ -153,14 +157,19 @@ def convert_torch_to_jax(torch_path: str, jax_path: str):
         pickle.dump(data, f)
 
     import os
+
     size_mb = os.path.getsize(jax_path) / 1e6
     print(f"Done! ({size_mb:.0f} MB)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert PyTorch .pt to JAX .pkl")
-    parser.add_argument("--input", type=str, required=True, help="PyTorch checkpoint path")
-    parser.add_argument("--output", type=str, required=True, help="JAX checkpoint output path")
+    parser.add_argument(
+        "--input", type=str, required=True, help="PyTorch checkpoint path"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True, help="JAX checkpoint output path"
+    )
     args = parser.parse_args()
 
     convert_torch_to_jax(args.input, args.output)
