@@ -66,7 +66,7 @@ with weights 1.0, 0.75, 0.5 (L1 normalized to sum to 1).
     parser.add_argument(
         "-d",
         "--checkpoint-dir",
-        default="/media/maixent/2To/seqcond_checkpoints",
+        default="/media/maixent/2To/seqcond_checkpoints/reasoning_2048",
         help="Directory containing checkpoints (default: /media/maixent/2To/seqcond_checkpoints)",
     )
     parser.add_argument(

@@ -125,7 +125,7 @@ def iterate_synth(
             ds = load_dataset(
                 "json", data_files=extra_data, split="train", streaming=True
             )
-            ds = ds.shuffle(seed=666 + epoch_num, buffer_size=100_000)
+            ds = ds.shuffle(seed=999 + epoch_num, buffer_size=100_000)
             if process_count > 1:
                 ds = split_dataset_by_node(
                     ds, rank=process_index, world_size=process_count
@@ -145,7 +145,7 @@ def iterate_synth(
         )
 
     # Shuffle with a buffer; set_epoch() will reseed as (seed + epoch)
-    dataset = dataset.shuffle(seed=666, buffer_size=100_000)
+    dataset = dataset.shuffle(seed=999, buffer_size=100_000)
 
     # Loop indefinitely if max_samples is None
     epoch = 0

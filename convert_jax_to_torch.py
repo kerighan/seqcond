@@ -32,9 +32,12 @@ def convert_jax_to_torch(jax_path: str, torch_path: str):
     if hasattr(config_data, "model"):
         # Config object from count_params.py
         config = config_data.model
-    else:
-        # Dict format from training checkpoints
+    elif isinstance(config_data, dict) and "model" in config_data:
+        # Nested dict format from some checkpoints
         config = config_data["model"]
+    else:
+        # Flat dict format from training checkpoints
+        config = config_data
 
     print("Converting weights...")
     state_dict = {}

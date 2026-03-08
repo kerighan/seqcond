@@ -65,20 +65,19 @@ class WeightUpscaler(nn.Module):
     def downsample(self, weights: torch.Tensor) -> torch.Tensor:
         """
         Downsample les poids pour comparer avec l'original.
-        Utilise interpolation adaptative pour gérer des scaling factors non-entiers.
+        Supporte les tenseurs de 1D à N-D en appliquant une interpolation
+        dimension par dimension pour les dimensions qui changent de taille.
         """
-        if len(weights.shape) == 1:
-            # Vecteur (bias, norm weights, etc.)
-            # Utiliser interpolation pour supporter des ratios non-entiers
+        ndim = len(weights.shape)
+
+        if ndim == 1:
             w = weights.unsqueeze(0).unsqueeze(0)  # (1, 1, L)
             downsampled = F.interpolate(
                 w, size=self.input_shape[0], mode="linear", align_corners=True
             ).squeeze()
             return downsampled
 
-        elif len(weights.shape) == 2:
-            # Matrice (Linear layers)
-            # Interpolation 2D pour supporter des ratios non-entiers
+        elif ndim == 2:
             w = weights.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
             downsampled = (
                 F.interpolate(
@@ -89,33 +88,40 @@ class WeightUpscaler(nn.Module):
             )
             return downsampled
 
-        elif len(weights.shape) == 3:
-            # Conv1D ou autre (features, kernel, channels)
-            # On ne scale que la dimension des features (dim 0)
-            # Les autres dimensions restent identiques
-            if weights.shape[1:] != self.input_shape[1:]:
-                raise ValueError(
-                    f"Conv shape mismatch: {weights.shape[1:]} vs {self.input_shape[1:]}"
-                )
-
-            # Interpolation sur la dimension 0 seulement
-            w = weights.transpose(0, 2).unsqueeze(0)  # (1, channels, kernel, features)
-            downsampled = (
-                F.interpolate(
-                    w,
-                    size=(weights.shape[1], self.input_shape[0]),
-                    mode="bilinear",
-                    align_corners=True,
-                )
-                .squeeze(0)
-                .transpose(0, 2)
-            )  # Back to (features, kernel, channels)
-            return downsampled
-
         else:
-            raise NotImplementedError(
-                f"Downsampling for shape {weights.shape} not implemented"
-            )
+            # Generic N-D: downsample each dimension that changed size
+            # by reshaping to 2D, interpolating, and reshaping back.
+            result = weights
+            current_shape = list(weights.shape)
+            for dim in range(ndim):
+                if current_shape[dim] == self.input_shape[dim]:
+                    continue
+                # Flatten all other dims into one, keeping target dim last
+                # Move target dim to last position
+                perm = list(range(ndim))
+                perm.remove(dim)
+                perm.append(dim)
+                result = result.permute(*perm)  # (..., target_dim)
+                flat_shape = result.shape
+                result = result.reshape(-1, flat_shape[-1])  # (N, target_dim)
+                result = result.unsqueeze(1)  # (N, 1, target_dim)
+                result = F.interpolate(
+                    result,
+                    size=self.input_shape[dim],
+                    mode="linear",
+                    align_corners=True,
+                ).squeeze(
+                    1
+                )  # (N, new_target_dim)
+                # Reshape back and un-permute
+                new_flat_shape = list(flat_shape[:-1]) + [self.input_shape[dim]]
+                result = result.reshape(new_flat_shape)
+                inv_perm = [0] * ndim
+                for i, p in enumerate(perm):
+                    inv_perm[p] = i
+                result = result.permute(*inv_perm)
+                current_shape[dim] = self.input_shape[dim]
+            return result
 
 
 def initialize_upscaled_weights(
@@ -125,44 +131,64 @@ def initialize_upscaled_weights(
 ) -> torch.Tensor:
     """
     Initialise les poids upscalés avec une interpolation simple.
+    Supporte les tenseurs de 1D à N-D.
     """
-    if len(original_weights.shape) == 1:
-        # Vecteur: interpolation linéaire
-        scale = target_shape[0] / original_weights.shape[0]
+    ndim = len(original_weights.shape)
+
+    if ndim == 1:
         indices = torch.linspace(0, original_weights.shape[0] - 1, target_shape[0])
         indices_low = indices.long()
         indices_high = (indices_low + 1).clamp(max=original_weights.shape[0] - 1)
         alpha = indices - indices_low.float()
-
         upscaled = (1 - alpha) * original_weights[
             indices_low
         ] + alpha * original_weights[indices_high]
         return upscaled
 
-    elif len(original_weights.shape) == 2:
-        # Matrice: interpolation bilinéaire
+    elif ndim == 2:
         w = original_weights.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
         upscaled = F.interpolate(
             w,
             size=target_shape,
-            mode="bilinear" if method == "bilinear" else "nearest",
-            align_corners=True if method == "bilinear" else None,
+            mode="bilinear",
+            align_corners=True,
         )
         return upscaled.squeeze(0).squeeze(0)
 
-    elif len(original_weights.shape) == 3:
-        # Conv weights: on scale seulement la première dimension
-        scale = target_shape[0] // original_weights.shape[0]
-        # Répéter et ajouter du bruit pour diversifier
-        upscaled = original_weights.repeat_interleave(scale, dim=0)
-        # Ajouter un petit bruit gaussien pour briser la symétrie
-        upscaled = upscaled + torch.randn_like(upscaled) * 0.01 * upscaled.std()
-        return upscaled
-
     else:
-        raise NotImplementedError(
-            f"Initialization for shape {original_weights.shape} not implemented"
-        )
+        # Generic N-D: interpolate each changed dimension sequentially
+        result = original_weights
+        current_shape = list(original_weights.shape)
+        for dim in range(ndim):
+            if current_shape[dim] == target_shape[dim]:
+                continue
+            src_size = current_shape[dim]
+            tgt_size = target_shape[dim]
+            # Move target dim to last, flatten others, interpolate, reshape back
+            perm = list(range(len(current_shape)))
+            perm.remove(dim)
+            perm.append(dim)
+            result = result.permute(*perm)
+            flat_shape = result.shape
+            result = result.reshape(-1, flat_shape[-1]).unsqueeze(1)  # (N, 1, src)
+            result = F.interpolate(
+                result,
+                size=tgt_size,
+                mode="linear",
+                align_corners=True,
+            ).squeeze(
+                1
+            )  # (N, tgt)
+            new_flat_shape = list(flat_shape[:-1]) + [tgt_size]
+            result = result.reshape(new_flat_shape)
+            inv_perm = [0] * len(current_shape)
+            for i, p in enumerate(perm):
+                inv_perm[p] = i
+            result = result.permute(*inv_perm)
+            current_shape[dim] = tgt_size
+        # Add small noise to break symmetry
+        result = result + torch.randn_like(result) * 0.001 * (result.std() + 1e-8)
+        return result
 
 
 def learn_upscaling_for_layer(
@@ -260,133 +286,65 @@ def learn_upscaling_for_layer(
     return upscaled_weights
 
 
-def compute_dimension_mapping(
-    original_config: ModelConfig,
+def compute_target_shapes(
+    source_state_dict: Dict[str, torch.Tensor],
     target_config: ModelConfig,
-) -> Dict[str, Dict[str, Tuple[int, int]]]:
+) -> Dict[str, Tuple[int, ...]]:
     """
-    Calcule le mapping des dimensions entre le modèle original et target.
+    Compute exact target shapes by instantiating the target model.
 
-    Returns:
-        Dict avec le mapping pour chaque type de paramètre:
-        {
-            'embedding': {'d_model': (orig, target)},
-            'linear_d_model': {'in': (orig, target), 'out': (orig, target)},
-            'seqcond': {...},
-            etc.
-        }
+    This is the most reliable approach: instead of guessing shapes from
+    parameter names, we create the target model and read its state_dict shapes.
     """
-    mapping = {
-        "d_model": (original_config.d_model, target_config.d_model),
-        "d_ff": (original_config.d_ff, target_config.d_ff),
-        "num_heads": (original_config.num_heads, target_config.num_heads),
-        "seqcond_heads": (original_config.seqcond_heads, target_config.seqcond_heads),
-        "num_query_heads": (
-            original_config.num_query_heads,
-            target_config.num_query_heads,
-        ),
-        "num_kv_heads": (
-            original_config.num_kv_heads or original_config.num_heads,
-            target_config.num_kv_heads or target_config.num_heads,
-        ),
-        "vocab_size": (original_config.vocab_size, target_config.vocab_size),
-    }
+    from seqcond.torch.model import SeqCondModel
 
-    return mapping
+    print("  Instantiating target model to compute exact shapes...")
+    target_model = SeqCondModel(
+        d_model=target_config.d_model,
+        d_ff=target_config.d_ff,
+        num_layers=target_config.num_layers,
+        vocab_size=target_config.vocab_size,
+        maxlen=target_config.maxlen,
+        num_heads=target_config.num_heads,
+        num_kv_heads=target_config.num_kv_heads,
+        qk_norm=target_config.qk_norm,
+        seqcond_heads=target_config.seqcond_heads,
+        num_query_heads=target_config.num_query_heads,
+        num_thetas=target_config.num_thetas,
+        conv_kernel_size=target_config.conv_kernel_size,
+        expand_factor=target_config.expand_factor,
+        out_expand_factor=target_config.out_expand_factor,
+        seqcond_ratio=target_config.seqcond_ratio,
+        dropout=0.0,
+    )
 
+    target_state_dict = target_model.state_dict()
+    target_shapes = {}
 
-def infer_target_shape(
-    param_name: str,
-    original_shape: Tuple[int, ...],
-    dim_mapping: Dict[str, Tuple[int, int]],
-    original_config: ModelConfig,
-    target_config: ModelConfig,
-) -> Tuple[int, ...]:
-    """
-    Infère la shape target pour un paramètre donné basé sur son nom et shape originale.
+    matched = 0
+    unmatched = []
+    for name in source_state_dict:
+        if name in target_state_dict:
+            target_shapes[name] = tuple(target_state_dict[name].shape)
+            matched += 1
+        else:
+            # Keep original shape for params not in target model
+            target_shapes[name] = tuple(source_state_dict[name].shape)
+            unmatched.append(name)
 
-    Args:
-        param_name: Nom du paramètre (ex: 'blocks.0.attention.q_proj.weight')
-        original_shape: Shape originale du paramètre
-        dim_mapping: Mapping des dimensions calculé par compute_dimension_mapping
-        original_config: Config du modèle original
-        target_config: Config du modèle target
+    if unmatched:
+        print(f"  Warning: {len(unmatched)} source params not found in target model:")
+        for n in unmatched[:5]:
+            print(f"    {n}")
+        if len(unmatched) > 5:
+            print(f"    ... and {len(unmatched) - 5} more")
 
-    Returns:
-        Target shape pour ce paramètre
-    """
-    # Embedding layers: (vocab_size, d_model)
-    if "embedding" in param_name or "lm_head" in param_name:
-        if len(original_shape) == 2:
-            return (dim_mapping["vocab_size"][1], dim_mapping["d_model"][1])
-        elif len(original_shape) == 1:
-            return (dim_mapping["vocab_size"][1],)
+    print(f"  Matched {matched}/{len(source_state_dict)} parameters")
 
-    # Norm layers: (d_model,)
-    if "norm" in param_name and len(original_shape) == 1:
-        return (dim_mapping["d_model"][1],)
+    # Free target model memory
+    del target_model, target_state_dict
 
-    # Attention/Linear layers dans transformer blocks
-    if "transformer_block" in param_name:
-        if "weight" in param_name and len(original_shape) == 2:
-            # Déterminer si c'est d_model->d_ff, d_ff->d_model, ou d_model->d_model
-            if original_shape[0] == original_config.d_ff:
-                out_dim = dim_mapping["d_ff"][1]
-            elif original_shape[0] == original_config.d_model:
-                out_dim = dim_mapping["d_model"][1]
-            else:
-                # Proportionnel
-                ratio = original_shape[0] / original_config.d_model
-                out_dim = int(target_config.d_model * ratio)
-
-            if original_shape[1] == original_config.d_ff:
-                in_dim = dim_mapping["d_ff"][1]
-            elif original_shape[1] == original_config.d_model:
-                in_dim = dim_mapping["d_model"][1]
-            else:
-                ratio = original_shape[1] / original_config.d_model
-                in_dim = int(target_config.d_model * ratio)
-
-            return (out_dim, in_dim)
-        elif "bias" in param_name and len(original_shape) == 1:
-            if original_shape[0] == original_config.d_ff:
-                return (dim_mapping["d_ff"][1],)
-            elif original_shape[0] == original_config.d_model:
-                return (dim_mapping["d_model"][1],)
-            else:
-                ratio = original_shape[0] / original_config.d_model
-                return (int(target_config.d_model * ratio),)
-
-    # SeqCond blocks
-    if "seqcond_block" in param_name:
-        if "weight" in param_name and len(original_shape) == 2:
-            # Calculer les dimensions basées sur les formules de SeqCond
-            ratio_out = original_shape[0] / original_config.d_model
-            ratio_in = original_shape[1] / original_config.d_model
-            out_dim = int(target_config.d_model * ratio_out)
-            in_dim = int(target_config.d_model * ratio_in)
-            return (out_dim, in_dim)
-        elif "weight" in param_name and len(original_shape) == 3:
-            # Conv weights: (features, kernel, channels)
-            ratio = original_shape[0] / original_config.d_model
-            return (
-                int(target_config.d_model * ratio),
-                original_shape[1],
-                original_shape[2],
-            )
-        elif "bias" in param_name and len(original_shape) == 1:
-            ratio = original_shape[0] / original_config.d_model
-            return (int(target_config.d_model * ratio),)
-        elif len(original_shape) == 1:
-            # Autres vecteurs (theta_raw, etc.)
-            # Garder la même taille si c'est lié à num_thetas ou autres hyperparams constants
-            if original_shape[0] <= 10:  # Probablement un petit vecteur de config
-                return original_shape
-            ratio = original_shape[0] / original_config.d_model
-            return (int(target_config.d_model * ratio),)
-
-    # Par défaut: garder la même shape (pour les paramètres qu'on ne scale pas)
-    return original_shape
+    return target_shapes
 
 
 def upscale_model(
@@ -411,13 +369,18 @@ def upscale_model(
 
     # Extraire la config et les poids
     if "config" in checkpoint:
-        config_dict = checkpoint["config"]
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(ModelConfig)}
+        config_dict = {
+            k: v for k, v in checkpoint["config"].items() if k in valid_fields
+        }
         original_config = ModelConfig(**config_dict)
     else:
         print("No config found in checkpoint, using default large config")
         original_config = ModelConfig.large()
 
-    state_dict = checkpoint.get("model", checkpoint)
+    state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
 
     print(f"\nOriginal model config:")
     print(f"  d_model: {original_config.d_model}")
@@ -470,16 +433,13 @@ def upscale_model(
         f"  seqcond_heads: {target_config.seqcond_heads} (ratio: {target_config.seqcond_heads/original_config.seqcond_heads:.2f}x)"
     )
 
-    # Calculer le mapping des dimensions
-    dim_mapping = compute_dimension_mapping(original_config, target_config)
+    # Compute exact target shapes by instantiating target model
+    target_shapes = compute_target_shapes(state_dict, target_config)
 
     # Grouper les poids par layer
     layer_groups = {}
     for name, param in state_dict.items():
-        # Extraire le nom de la layer
         parts = name.split(".")
-
-        # Identifier la layer (blocks.0, blocks.1, etc.)
         if "blocks" in parts:
             idx = parts.index("blocks")
             layer_name = ".".join(parts[: idx + 2])  # ex: "blocks.0"
@@ -494,10 +454,15 @@ def upscale_model(
 
         if layer_name not in layer_groups:
             layer_groups[layer_name] = {}
-
         layer_groups[layer_name][name] = param
 
     print(f"\nFound {len(layer_groups)} layer groups")
+
+    # Count how many params will change
+    n_changed = sum(
+        1 for name, p in state_dict.items() if tuple(p.shape) != target_shapes[name]
+    )
+    print(f"Parameters to upscale: {n_changed}/{len(state_dict)}")
 
     # Upscaler chaque groupe de layers
     upscaled_state_dict = {}
@@ -505,24 +470,32 @@ def upscale_model(
     for layer_name, layer_weights in tqdm(
         layer_groups.items(), desc="Upscaling layers"
     ):
-        print(f"\nProcessing {layer_name} ({len(layer_weights)} parameters)")
+        # Gather target shapes for this layer
+        layer_target_shapes = {name: target_shapes[name] for name in layer_weights}
 
-        # Calculer les target shapes pour chaque paramètre de cette layer
-        target_shapes = {}
-        for name, weight in layer_weights.items():
-            target_shape = infer_target_shape(
-                name, weight.shape, dim_mapping, original_config, target_config
+        # Count changes in this layer
+        changes = [
+            name
+            for name, w in layer_weights.items()
+            if tuple(w.shape) != layer_target_shapes[name]
+        ]
+        if changes:
+            print(
+                f"\nProcessing {layer_name} ({len(layer_weights)} params, {len(changes)} to upscale)"
             )
-            target_shapes[name] = target_shape
-
-            # Log si changement
-            if weight.shape != target_shape:
-                print(f"  {name}: {weight.shape} -> {target_shape}")
+            for name in changes:
+                print(
+                    f"  {name}: {tuple(layer_weights[name].shape)} -> {layer_target_shapes[name]}"
+                )
+        else:
+            print(
+                f"\nProcessing {layer_name} ({len(layer_weights)} params, no changes)"
+            )
 
         # Apprendre l'upscaling pour cette layer
         upscaled_layer = learn_upscaling_for_layer(
             layer_weights,
-            target_shapes=target_shapes,
+            target_shapes=layer_target_shapes,
             num_steps=num_steps_per_layer,
             lr=1e-3,
             device=device,
