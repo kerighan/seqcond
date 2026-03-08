@@ -18,9 +18,7 @@ class TorchGenerator:
         dtype: str = "float32",
     ):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(
-            checkpoint_path, map_location=device, weights_only=False
-        )
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
         self.device = device
         self.config = checkpoint["config"]
@@ -61,6 +59,7 @@ class TorchGenerator:
             512,
             1024,
             2048,
+            4096,
         ]  # Power-of-2 lengths
         # self._seq_lens = [16, 64, 256, 1024]  # Power-of-4 lengths
         self._use_triton = False  # Whether to use Triton kernels in CUDA graphs

@@ -1978,7 +1978,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_opt.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_755k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -1995,7 +1995,7 @@ def main():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=1024 * 2,
+        default=4096,
         help="Max tokens to generate per sample (includes reasoning)",
     )
     parser.add_argument(
@@ -2062,7 +2062,7 @@ def main():
 
     # Pre-capture CUDA graphs for fast generation if not disabled
     if not args.no_cuda_graph:
-        gen.precompute(max_seq_len=2048, use_triton=args.use_triton)
+        gen.precompute(max_seq_len=4096, use_triton=args.use_triton)
 
     def _make_constraints(n_choices):
         """Build output_constraints list like ['A.', 'B.', ...] if --constrain_output."""
