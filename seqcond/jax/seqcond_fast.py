@@ -256,7 +256,7 @@ class SeqCondAttention(nn.Module):
 
         # Combine and clip for safety (relu² produces larger values than softplus)
         p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 0.0, 1000.0)  # (B, L, K)
+        # p_w = jnp.clip(p_w, 0.0, 1000.0)  # (B, L, K)
 
         # Modulation (with softsign to bound phase - smoother than tanh)
         k_f32 = k_val.astype(jnp.float32)[..., None]
