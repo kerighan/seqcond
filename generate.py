@@ -23,8 +23,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        # default="checkpoints/seqcond_opt_torch.pt",
-        default="checkpoints/seqcond_torch_660k.pt",
+        default="checkpoints/seqcond_torch_800k.pt",
+        # default="checkpoints/seqcond_xlarge_init.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
@@ -118,7 +118,7 @@ def main():
 
     # Pre-capture CUDA graphs for fast generation
     if not args.no_cuda_graph:
-        gen.precompute(max_seq_len=1024, use_triton=args.use_triton)
+        gen.precompute(max_seq_len=4096, use_triton=args.use_triton)
         start = time.time()  # Reset start time after precompute
 
     generator = gen.generate(

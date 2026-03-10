@@ -903,7 +903,7 @@ def warmup_cosine_decay_schedule(
     total_steps: int,
     alpha: float = 1e-5,
     resume_step: int = 0,
-    resume_warmup_steps: int = 500,
+    resume_warmup_steps: int = 1000,
 ) -> optax.Schedule:
     """Create a warmup + cosine decay learning rate schedule.
 
@@ -913,7 +913,7 @@ def warmup_cosine_decay_schedule(
         total_steps: Total training steps
         alpha: Minimum learning rate at the end
         resume_step: Step to resume from (0 for fresh training)
-        resume_warmup_steps: Warmup steps when resuming (default: 500)
+        resume_warmup_steps: Warmup steps when resuming (default: 1000)
 
     When resuming (resume_step > 0), the schedule will:
     1. Calculate what the LR should be at resume_step
@@ -992,7 +992,7 @@ def create_optimizer(
     beta_2: float = 0.999,
     optimizer_type: str = "adamw",
     resume_step: int = 0,
-    resume_warmup_steps: int = 500,
+    resume_warmup_steps: int = 1000,
 ) -> optax.GradientTransformation:
     """Create an optimizer with warmup + cosine decay schedule.
 
@@ -1000,7 +1000,7 @@ def create_optimizer(
         optimizer_type: 'adamw' or 'muon'. Muon applies Newton-Schulz orthogonalization
             to 2D weight matrices and AdamW to everything else (embeddings, biases, norms).
         resume_step: Step to resume from (0 for fresh training)
-        resume_warmup_steps: Warmup steps when resuming (default: 500)
+        resume_warmup_steps: Warmup steps when resuming (default: 1000)
     """
     lr_schedule = warmup_cosine_decay_schedule(
         base_lr=base_lr,

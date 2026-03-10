@@ -23,6 +23,6 @@
   "use_positional_embedding": false,
   "seqcond_ratio": 2,
   "chunk_size": 128,
-  "use_square_matrix": false,
+  "use_square_matrix": true,
   "state_size": 128
 }

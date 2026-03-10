@@ -27,10 +27,18 @@ with open('target_config_xlarge.json', 'w') as f:
 "
 
 # 2. Upscaler le modèle (< 1 min sur CPU, pas de GPU nécessaire)
+#    Sans noise (duplication exacte, loss = 0 à l'init) :
 python upscale_head_aware.py \
   --checkpoint checkpoints/seqcond_torch_640k.pt \
   --target-config target_config_xlarge.json \
   --output checkpoints/seqcond_xlarge_init.pt
+
+#    Avec antipodal noise (recommandé pour le training, voir section dédiée) :
+python upscale_head_aware.py \
+  --checkpoint checkpoints/seqcond_torch_640k.pt \
+  --target-config target_config_xlarge.json \
+  --output checkpoints/seqcond_xlarge_init.pt \
+  --noise-scale 0.02
 
 # 3. Convertir en format JAX (.pkl) pour l'entraînement
 python convert_torch_to_jax.py \
@@ -226,6 +234,84 @@ Pour SeqCond ET Transformer blocks.
 | conv_weight | Split per-head + repeat | Même structure que in_proj |
 | final_norm.scale | `ones(d_model_large)` | Pas dans le source, init défaut |
 | cos_emb, sin_emb | Recalculés par le modèle | Buffers RoPE, pas des poids |
+
+---
+
+## Symmetry Breaking — Antipodal Noise Injection
+
+### Le problème
+
+La duplication exacte des heads crée une **symétrie parfaite** : les deux copies d'un
+head ont des poids identiques, reçoivent les mêmes entrées, produisent les mêmes sorties,
+et donc reçoivent les mêmes gradients. Sans perturbation, elles restent identiques
+**indéfiniment** pendant le training — on gaspille 50% de la capacité ajoutée.
+
+En pratique, le bruit numérique (FP32 rounding, batch stochastique) peut briser la symétrie
+très lentement, mais c'est insuffisant : des dizaines de milliers de steps peuvent être
+nécessaires avant que les heads divergent significativement.
+
+### La solution : noise antipodal
+
+On ajoute un bruit gaussien **calibré** et **antisymétrique** sur les heads dupliquées :
+
+```
+Pour chaque head original h_i dupliqué en (h_i_a, h_i_b) :
+    ε ~ N(0, α × std(W))
+    h_i_a += ε
+    h_i_b -= ε
+```
+
+**Propriétés clés :**
+- **Préserve la moyenne** : `mean(h_i_a, h_i_b) = h_i` original → le modèle reste
+  fonctionnellement proche de l'original à l'init
+- **Maximise la divergence** : les signes opposés créent la plus grande distance possible
+  entre les copies, accélérant la spécialisation pendant le training
+- **Calibré par paramètre** : `σ_noise = α × std(W_param)` s'adapte à l'échelle de
+  chaque groupe de poids
+
+### Choix de α par type de poids
+
+Le noise n'est **pas appliqué uniformément**. Les paramètres per-head reçoivent plus de
+noise (ils sont strictement dupliqués et le risque de symétrie est maximal) :
+
+| Type de poids | α effectif | Justification |
+|---|---|---|
+| **Per-head scalaires** (decay_slopes, score_scale, score_bias, phase_scale, theta_d_raw, w_int_raw) | `2 × α` | Strictement dupliqués, contrôlent la dynamique individuelle de chaque head. Doivent diverger rapidement. |
+| **Projections per-head** (in_proj, q_proj, k_proj, v_proj, out_proj, gate_proj, conv_weight, W_readout, gated_norm) | `1 × α` | Structure per-head dans une dimension, partagent la dimension d_model. Besoin de diverger mais moins critique. |
+| **FFN** (ff_in, ff_out) | `0` (pas de noise) | Neurones dupliqués mais pas structurés par head. Le gradient stochastique suffit généralement. |
+| **Embedding** | `0` | Interpolé (pas dupliqué), pas de symétrie à briser. |
+| **Norms, biases** | `0` | Suivent d_model, pas de structure per-head. |
+
+### Valeurs recommandées de `--noise-scale`
+
+| α | Effet | Cas d'usage |
+|---|---|---|
+| `0.0` | Duplication exacte, loss = 0 | Test, vérification de la reconstruction |
+| `0.01` | Noise conservateur | Si le training est long (>100k steps) et le LR faible |
+| **`0.02`** | **Recommandé** | Bon compromis : loss légèrement augmentée à l'init (~0.01-0.05 au-dessus de l'original), mais divergence rapide des heads en ~500-2000 steps |
+| `0.05` | Noise agressif | Si le LR est élevé ou le training est court (<50k steps) |
+| `>0.1` | Déconseillé | Risque de détruire les représentations apprises |
+
+### Vérifier que ça marche
+
+Après upscaling avec noise, on peut vérifier la divergence pendant le training en mesurant
+la distance cosinus entre les paires de heads dupliquées. Si le noise fonctionne, la distance
+doit augmenter régulièrement pendant les premiers milliers de steps :
+
+```python
+# Mesurer la divergence entre heads dupliquées (exemple pour decay_slopes)
+d = model.blocks[0].attn.decay_slopes
+cos_sim = F.cosine_similarity(d[:K].unsqueeze(0), d[K:].unsqueeze(0))
+# Doit diminuer de ~1.0 (init sans noise) vers <0.9 après quelques k steps
+```
+
+### Références
+
+- **Net2Net** (Chen et al., 2015) : premier à proposer la duplication + noise pour
+  "function-preserving" model widening. Utilise un noise uniforme.
+- **StackingBERT** / **Bert2BERT** : appliquent le même principe aux Transformers.
+- **µP** (Yang et al., 2022) : montre que le noise scale optimal dépend de la largeur
+  du modèle ; notre approche calibrée par `std(W)` suit cette intuition.
 
 ---
 

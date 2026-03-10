@@ -248,15 +248,15 @@ class SeqCondAttention(nn.Module):
             + score_bias[None, None, :]
         )
 
-        # Softplus instead of exp for stability (Mamba-like)
-        p_w_content = jax.nn.softplus(score_raw)
+        # Squared ReLU for sharper, sparser content weighting (repasser à softplus si dégradation)
+        p_w_content = jax.nn.relu(score_raw) ** 2
 
         # Temporal weight with exp
         temporal_weight = jnp.exp(log_time_weight)
 
         # Combine and clip for safety
         p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 1e-6, 1000.0)  # (B, L, K)
+        # p_w = jnp.clip(p_w, 1e-6, 1000.0)  # (B, L, K) (wasn't commented)
 
         # Modulation (with softsign to bound phase - smoother than tanh)
         k_f32 = k_val.astype(jnp.float32)[..., None]
@@ -311,7 +311,7 @@ class SeqCondAttention(nn.Module):
             im_acc = im_acc_flat.reshape(B, L, self.K, H, self.M)
 
         # Normalize by accumulated denominator
-        inv_den = 1.0 / jnp.maximum(den_acc, 1e-4)
+        inv_den = 1.0 / jnp.maximum(den_acc, 1e-5)  # (was 1e-4)
         inv_den = inv_den[..., None, None]  # (B, L, K, 1, 1)
 
         state_re = re_acc * inv_den
@@ -362,7 +362,7 @@ class SeqCondAttention(nn.Module):
 
         # SwiGLU activation (no skip/highway)
         y_val, y_gate = jnp.split(y_spec_raw, 2, axis=-1)
-        y_act = y_val * jax.nn.sigmoid(y_gate)
+        y_act = y_val * jax.nn.silu(y_gate)  # (was sigmoid)
 
         # Output projection
         y_flat = y_act.reshape(B, L, -1)
@@ -564,8 +564,8 @@ class SeqCondAttention(nn.Module):
         )
         # score_raw = jnp.clip(score_raw, -20.0, 20.0)
 
-        # Softplus instead of exp for stability
-        p_w_content = jax.nn.softplus(score_raw)
+        # Squared ReLU (must match __call__)
+        p_w_content = jax.nn.relu(score_raw) ** 2
         temporal_weight = jnp.exp(log_time_weight)
         p_w = p_w_content * temporal_weight
         p_w = jnp.clip(p_w, 1e-6, 1000.0)

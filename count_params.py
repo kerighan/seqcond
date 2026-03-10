@@ -99,14 +99,14 @@ def parse_args():
     grp_model.add_argument(
         "--seqcond-query-heads",
         type=int,
-        default=6,
+        default=None,
         dest="num_query_heads",
         help="Override number of seqcond query heads",
     )
     grp_model.add_argument(
         "--expand",
         type=float,
-        default=2.0,
+        default=None,
         dest="expand_factor",
         help="Override expand factor",
     )
@@ -259,7 +259,7 @@ def get_config(args) -> Config:
     # Collect overrides for ModelConfig
     model_overrides = {}
 
-    # Direct mappings (name matches)
+    # Direct mappings (name matches) — only override if explicitly set (not None)
     for field in [
         "num_layers",
         "d_model",
@@ -272,13 +272,16 @@ def get_config(args) -> Config:
         "expand_factor",
         "out_expand_factor",
         "chunk_size",
-        "use_square_matrix",
         "state_size",
         "conv_kernel_size",
     ]:
         val = getattr(args, field)
         if val is not None:
             model_overrides[field] = val
+
+    # Boolean flags — only override if explicitly passed (True)
+    if args.use_square_matrix:
+        model_overrides["use_square_matrix"] = True
 
     # Renamed/Special mappings
     if args.derivative_order is not None:

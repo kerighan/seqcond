@@ -25,6 +25,78 @@ from seqcond.torch.model import SeqCondModel
 
 
 # ---------------------------------------------------------------------------
+# Antipodal noise for symmetry breaking
+# ---------------------------------------------------------------------------
+
+
+def _antipodal_noise_on_head_dim(
+    w: torch.Tensor, head_dim_idx: int, num_src_heads: int, hf: int, alpha: float
+) -> torch.Tensor:
+    """
+    Add antipodal Gaussian noise along a head-duplication dimension.
+
+    For each original head that was duplicated `hf` times, generate a noise
+    tensor ε ~ N(0, α × std(W_head)) and add it with alternating signs
+    (+ε, -ε, +ε, -ε, ...) across the `hf` copies. This preserves the mean
+    of each head group while breaking symmetry.
+
+    Args:
+        w: Weight tensor after head duplication.
+        head_dim_idx: Dimension index along which heads were duplicated.
+        num_src_heads: Number of heads before duplication.
+        hf: Head factor (how many copies per original head).
+        alpha: Noise scale relative to per-head std.
+    """
+    if alpha <= 0 or hf <= 1:
+        return w
+
+    # Move head dim to front for easy manipulation
+    w = w.clone()
+    w = w.transpose(0, head_dim_idx)
+    # Shape: (num_src_heads * hf, ...)
+    head_shape = list(w.shape)
+    head_shape[0] = num_src_heads
+    remaining = [hf] + head_shape[1:]
+
+    # Reshape to (num_src_heads, hf, ...)
+    w_grouped = w.reshape([num_src_heads, hf] + head_shape[1:])
+
+    # Compute per-head std for noise calibration
+    # std over all dims except the group dim
+    per_head_std = w_grouped.std()  # global std as baseline
+
+    # Generate noise: one ε per original head, broadcast to head shape
+    noise_shape = [num_src_heads, 1] + head_shape[1:]
+    epsilon = torch.randn(noise_shape) * (alpha * per_head_std)
+
+    # Alternating signs: +1, -1, +1, -1, ... for the hf copies
+    signs = torch.tensor([(-1) ** i for i in range(hf)], dtype=w.dtype)
+    signs = signs.reshape([1, hf] + [1] * (len(head_shape) - 1))
+
+    w_grouped = w_grouped + epsilon * signs
+
+    # Reshape back and transpose
+    w = w_grouped.reshape(head_shape[0] * hf, *head_shape[1:])
+    w = w.transpose(0, head_dim_idx)
+    return w.contiguous()
+
+
+def _antipodal_noise_1d(
+    w: torch.Tensor, num_src: int, hf: int, alpha: float
+) -> torch.Tensor:
+    """Antipodal noise for 1D per-head params (scalars per head)."""
+    if alpha <= 0 or hf <= 1:
+        return w
+    w = w.clone()
+    grouped = w.reshape(num_src, hf)
+    std = grouped.std()
+    epsilon = torch.randn(num_src, 1) * (alpha * std)
+    signs = torch.tensor([(-1) ** i for i in range(hf)], dtype=w.dtype).reshape(1, hf)
+    grouped = grouped + epsilon * signs
+    return grouped.reshape(-1)
+
+
+# ---------------------------------------------------------------------------
 # Head-aware weight initialization
 # ---------------------------------------------------------------------------
 
@@ -34,6 +106,7 @@ def head_aware_init_seqcond(
     target_shapes: Dict[str, Tuple[int, ...]],
     src_cfg: ModelConfig,
     tgt_cfg: ModelConfig,
+    noise_alpha: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Initialize SeqCond block weights by duplicating heads.
@@ -64,36 +137,47 @@ def head_aware_init_seqcond(
         # --- in_proj.weight: (dim_conv_total, d_model) ---
         if name == "attn.in_proj.weight":
             mem = w[:dim_memory].reshape(K, H, -1)
-            mem = mem.repeat_interleave(hf, dim=0).reshape(K * hf * H, -1)
+            mem = mem.repeat_interleave(hf, dim=0)
+            mem = _antipodal_noise_on_head_dim(mem, 0, K, hf, noise_alpha)
+            mem = mem.reshape(K * hf * H, -1)
             score = w[dim_memory:dim_mem_total].repeat_interleave(hf, dim=0)
+            score = _antipodal_noise_on_head_dim(
+                score.unsqueeze(-1), 0, K, hf, noise_alpha
+            ).squeeze(-1)
             query = w[dim_mem_total:].reshape(K_q, dim_query_head, -1)
-            query = query.repeat_interleave(hf, dim=0).reshape(
-                K_q * hf * dim_query_head, -1
-            )
+            query = query.repeat_interleave(hf, dim=0)
+            query = _antipodal_noise_on_head_dim(query, 0, K_q, hf, noise_alpha)
+            query = query.reshape(K_q * hf * dim_query_head, -1)
             out = torch.cat([mem, score, query], dim=0)
             result[name] = out.repeat_interleave(df, dim=1) / df
 
         # --- conv_weight: (dim_conv_total, 1, kernel) ---
         elif name == "attn.conv_weight":
             mem = w[:dim_memory].reshape(K, H, 1, -1)
-            mem = mem.repeat_interleave(hf, dim=0).reshape(K * hf * H, 1, -1)
+            mem = mem.repeat_interleave(hf, dim=0)
+            mem = _antipodal_noise_on_head_dim(mem, 0, K, hf, noise_alpha)
+            mem = mem.reshape(K * hf * H, 1, -1)
             score = w[dim_memory:dim_mem_total].repeat_interleave(hf, dim=0)
             query = w[dim_mem_total:].reshape(K_q, dim_query_head, 1, -1)
-            query = query.repeat_interleave(hf, dim=0).reshape(
-                K_q * hf * dim_query_head, 1, -1
-            )
+            query = query.repeat_interleave(hf, dim=0)
+            query = _antipodal_noise_on_head_dim(query, 0, K_q, hf, noise_alpha)
+            query = query.reshape(K_q * hf * dim_query_head, 1, -1)
             result[name] = torch.cat([mem, score, query], dim=0)
 
         # --- gate_proj.weight: (K * 2H, d_model) ---
         elif name == "attn.gate_proj.weight":
             heads = w.reshape(K, 2 * H, -1)
-            out = heads.repeat_interleave(hf, dim=0).reshape(K * hf * 2 * H, -1)
+            out = heads.repeat_interleave(hf, dim=0)
+            out = _antipodal_noise_on_head_dim(out, 0, K, hf, noise_alpha)
+            out = out.reshape(K * hf * 2 * H, -1)
             result[name] = out.repeat_interleave(df, dim=1) / df
 
         # --- out_proj.weight: (d_model, K * dim_expand) ---
         elif name == "attn.out_proj.weight":
             inp = w.reshape(-1, K, dim_expand)
-            inp = inp.repeat_interleave(hf, dim=1).reshape(-1, K * hf * dim_expand)
+            inp = inp.repeat_interleave(hf, dim=1)
+            inp = _antipodal_noise_on_head_dim(inp, 1, K, hf, noise_alpha)
+            inp = inp.reshape(-1, K * hf * dim_expand)
             result[name] = inp.repeat_interleave(df, dim=0) / df
 
         # --- per-head scalars ---
@@ -103,23 +187,31 @@ def head_aware_init_seqcond(
             "attn.score_bias",
             "attn.phase_scale",
         ):
-            result[name] = w.repeat_interleave(hf)
+            out = w.repeat_interleave(hf)
+            result[name] = _antipodal_noise_1d(out, K, hf, noise_alpha * 2)
 
         # --- gated_norm.weight: (K * 2H,) ---
         elif name == "attn.gated_norm.weight":
-            result[name] = w.reshape(K, 2 * H).repeat_interleave(hf, dim=0).reshape(-1)
+            out = w.reshape(K, 2 * H).repeat_interleave(hf, dim=0)
+            out = _antipodal_noise_on_head_dim(out, 0, K, hf, noise_alpha)
+            result[name] = out.reshape(-1)
 
         # --- W_readout: (K, 2H, swiglu_head) ---
         elif name == "attn.W_readout":
-            result[name] = w.repeat_interleave(hf, dim=0)
+            out = w.repeat_interleave(hf, dim=0)
+            result[name] = _antipodal_noise_on_head_dim(out, 0, K, hf, noise_alpha)
 
         # --- theta_d_raw: (1, 1, K, H, M) ---
         elif name == "attn.theta_d_raw":
-            result[name] = w.repeat_interleave(hf, dim=2)
+            out = w.repeat_interleave(hf, dim=2)
+            result[name] = _antipodal_noise_on_head_dim(out, 2, K, hf, noise_alpha * 2)
 
         # --- w_int_raw: (1, 1, K_q, n_rep, H, M) ---
         elif name == "attn.w_int_raw":
-            result[name] = w.repeat_interleave(hf, dim=2)
+            out = w.repeat_interleave(hf, dim=2)
+            result[name] = _antipodal_noise_on_head_dim(
+                out, 2, K_q, hf, noise_alpha * 2
+            )
 
         # --- norm.scale: (d_model,) ---
         elif name == "norm.scale":
@@ -142,6 +234,7 @@ def head_aware_init_transformer(
     target_shapes: Dict[str, Tuple[int, ...]],
     src_cfg: ModelConfig,
     tgt_cfg: ModelConfig,
+    noise_alpha: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Initialize Transformer block weights by duplicating heads.
@@ -165,19 +258,23 @@ def head_aware_init_transformer(
 
         if name == "attn.q_proj.weight":
             heads = w.reshape(num_h, head_dim, -1)
-            out = heads.repeat_interleave(hf, dim=0).reshape(num_h * hf * head_dim, -1)
+            out = heads.repeat_interleave(hf, dim=0)
+            out = _antipodal_noise_on_head_dim(out, 0, num_h, hf, noise_alpha)
+            out = out.reshape(num_h * hf * head_dim, -1)
             result[name] = out.repeat_interleave(df, dim=1) / df
 
         elif name == "attn.out_proj.weight":
             heads = w.reshape(-1, num_h, head_dim)
-            out = heads.repeat_interleave(hf, dim=1).reshape(-1, num_h * hf * head_dim)
+            out = heads.repeat_interleave(hf, dim=1)
+            out = _antipodal_noise_on_head_dim(out, 1, num_h, hf, noise_alpha)
+            out = out.reshape(-1, num_h * hf * head_dim)
             result[name] = out.repeat_interleave(df, dim=0) / df
 
         elif name in ("attn.k_proj.weight", "attn.v_proj.weight"):
             heads = w.reshape(num_kv, head_dim, -1)
-            out = heads.repeat_interleave(kv_f, dim=0).reshape(
-                num_kv * kv_f * head_dim, -1
-            )
+            out = heads.repeat_interleave(kv_f, dim=0)
+            out = _antipodal_noise_on_head_dim(out, 0, num_kv, kv_f, noise_alpha)
+            out = out.reshape(num_kv * kv_f * head_dim, -1)
             result[name] = out.repeat_interleave(df, dim=1) / df
 
         elif name == "ff_in.weight":
@@ -213,8 +310,22 @@ def head_aware_init_transformer(
 # ---------------------------------------------------------------------------
 
 
-def upscale_model(checkpoint_path: str, target_config: ModelConfig, output_path: str):
-    """Upscale a checkpoint using head-aware weight duplication."""
+def upscale_model(
+    checkpoint_path: str,
+    target_config: ModelConfig,
+    output_path: str,
+    noise_alpha: float = 0.0,
+):
+    """Upscale a checkpoint using head-aware weight duplication.
+
+    Args:
+        noise_alpha: Scale of antipodal noise for symmetry breaking.
+            0.0 = exact duplication (functionally equivalent, but heads
+            may never diverge during training).
+            0.01-0.05 = recommended range. Noise is calibrated as
+            alpha * std(W) per parameter group, with alternating signs
+            across duplicated heads to preserve the group mean.
+    """
 
     print(f"Loading {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -235,6 +346,10 @@ def upscale_model(checkpoint_path: str, target_config: ModelConfig, output_path:
     print(
         f"Target: d_model={target_config.d_model}, heads={target_config.seqcond_heads}"
     )
+    if noise_alpha > 0:
+        print(f"Antipodal noise: alpha={noise_alpha} (symmetry breaking enabled)")
+    else:
+        print("Antipodal noise: disabled (exact duplication)")
 
     # Block types
     block_types = []
@@ -282,10 +397,12 @@ def upscale_model(checkpoint_path: str, target_config: ModelConfig, output_path:
                 tgt_shapes[local] = tuple(tgt_sd[k].shape)
 
         if btype == "seqcond":
-            init_w = head_aware_init_seqcond(src_w, tgt_shapes, src_cfg, target_config)
+            init_w = head_aware_init_seqcond(
+                src_w, tgt_shapes, src_cfg, target_config, noise_alpha
+            )
         else:
             init_w = head_aware_init_transformer(
-                src_w, tgt_shapes, src_cfg, target_config
+                src_w, tgt_shapes, src_cfg, target_config, noise_alpha
             )
 
         n_changed = sum(1 for k in src_w if tuple(src_w[k].shape) != tgt_shapes[k])
@@ -318,6 +435,7 @@ def upscale_model(checkpoint_path: str, target_config: ModelConfig, output_path:
             "config": save_config,
             "original_checkpoint": checkpoint_path,
             "method": "head_aware_init",
+            "noise_alpha": noise_alpha,
         },
         output_path,
     )
@@ -337,9 +455,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", type=str, default="checkpoints/seqcond_xlarge_init.pt"
     )
+    parser.add_argument(
+        "--noise-scale",
+        type=float,
+        default=0.0,
+        help="Antipodal noise scale for symmetry breaking (0=off, recommended: 0.01-0.05)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for noise generation"
+    )
     args = parser.parse_args()
+
+    if args.noise_scale > 0:
+        torch.manual_seed(args.seed)
 
     with open(args.target_config) as f:
         tgt_cfg = ModelConfig(**json.load(f))
 
-    upscale_model(args.checkpoint, tgt_cfg, args.output)
+    upscale_model(args.checkpoint, tgt_cfg, args.output, noise_alpha=args.noise_scale)

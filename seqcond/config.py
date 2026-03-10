@@ -108,7 +108,7 @@ class ModelConfig:
 
     @classmethod
     def large(cls, **kwargs) -> "ModelConfig":
-        """Large model (~350M params). Override any param with kwargs."""
+        """Large model (~370M params). Override any param with kwargs."""
         defaults = dict(
             d_model=1024,
             d_ff=int(8 * 1024 / 3),
@@ -117,21 +117,31 @@ class ModelConfig:
             seqcond_heads=16,
             num_query_heads=16,
             num_kv_heads=4,
+            num_thetas=2,
+            expand_factor=2.0,
+            out_expand_factor=3,
+            seqcond_ratio=2,
+            use_square_matrix=True,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
     def xlarge(cls, **kwargs) -> "ModelConfig":
-        """XLarge model (~770M params). Override any param with kwargs."""
+        """XLarge model (~1.26B params). ×2 width scaling of large()."""
         defaults = dict(
             d_model=2048,
-            d_ff=5460,
+            d_ff=int(8 * 1024 / 3) * 2,  # exact ×2 of large (5460)
             num_layers=24,
-            num_heads=16,
-            seqcond_heads=16,
-            num_query_heads=16,
-            num_kv_heads=4,
+            num_heads=32,
+            seqcond_heads=32,
+            num_query_heads=32,
+            num_kv_heads=8,
+            num_thetas=2,
+            expand_factor=2.0,
+            out_expand_factor=3,
+            seqcond_ratio=2,
+            use_square_matrix=True,
         )
         defaults.update(kwargs)
         return cls(**defaults)
@@ -148,6 +158,7 @@ class TrainingConfig:
     # Optimizer
     optimizer_type: Literal["adamw", "muon"] = "adamw"
     base_lr: float = 1e-3
+    alpha: float = 1e-5
     warmup_steps: int = 100
     total_steps: int = 100000
     weight_decay: float = 1e-2
