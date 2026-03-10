@@ -362,7 +362,7 @@ class SeqCondAttention(nn.Module):
 
         # SwiGLU activation (no skip/highway)
         y_val, y_gate = jnp.split(y_spec_raw, 2, axis=-1)
-        y_act = y_val * jax.nn.silu(y_gate)  # (was sigmoid)
+        y_act = y_val * jax.nn.sigmoid(y_gate)  # (was sigmoid)
 
         # Output projection
         y_flat = y_act.reshape(B, L, -1)
