@@ -249,14 +249,14 @@ class SeqCondAttention(nn.Module):
         )
 
         # Squared ReLU for sharper, sparser content weighting (repasser à softplus si dégradation)
-        p_w_content = jax.nn.relu(score_raw)
+        p_w_content = jax.nn.softplus(score_raw)
 
         # Temporal weight with exp
         temporal_weight = jnp.exp(log_time_weight)
 
         # Combine and clip for safety (relu² produces larger values than softplus)
         p_w = p_w_content * temporal_weight
-        # p_w = jnp.clip(p_w, 0.0, 1000.0)  # (B, L, K)
+        p_w = jnp.clip(p_w, 1e-4, 1000.0)  # (B, L, K)
 
         # Modulation (with softsign to bound phase - smoother than tanh)
         k_f32 = k_val.astype(jnp.float32)[..., None]
