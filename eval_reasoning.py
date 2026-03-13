@@ -1978,7 +1978,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_746k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_750k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,

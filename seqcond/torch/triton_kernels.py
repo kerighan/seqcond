@@ -40,6 +40,9 @@ if TRITON_AVAILABLE:
             triton.Config({"BLOCK_M": 32, "BLOCK_H": 16}, num_warps=8, num_stages=2),
         ],
         key=["M", "H"],
+        # Restore in-place accumulator buffers between autotuner benchmark runs
+        # to prevent corruption from repeated kernel executions during tuning.
+        restore_value=["re_acc_ptr", "im_acc_ptr", "den_acc_ptr"],
     )
     @triton.jit
     def _seqcond_fully_fused_kernel(
@@ -119,16 +122,18 @@ if TRITON_AVAILABLE:
         phase_scale = tl.load(phase_scale_ptr + k)
 
         score = score_scale * s_raw + score_bias
-        score = tl.minimum(tl.maximum(score, -20.0), 20.0)
-        # Softplus: log(1 + exp(x)) - more stable than ReLU^2
-        p_w_content = tl.log(1.0 + tl.exp(score))
+        # Stable softplus matching PyTorch F.softplus(threshold=20)
+        p_w_content = tl.where(score > 20.0, score, tl.log(1.0 + tl.exp(score)))
         p_w = p_w_content * tl.exp(log_tw)
-        p_w = tl.minimum(tl.maximum(p_w, 1e-6), 1000.0)
+        p_w = tl.minimum(tl.maximum(p_w, 1e-4), 5000.0)
 
-        # Update den_acc (only once per (b, k) - use h_block == 0)
+        # Load old den_acc locally (every h_block computes new_den independently)
+        old_den = tl.load(den_acc_ptr + b * K + k)
+        new_den = old_den + p_w
+
+        # Update den_acc in memory (only once per (b, k) to avoid double-write)
         if h_block == 0:
-            old_den = tl.load(den_acc_ptr + b * K + k)
-            tl.store(den_acc_ptr + b * K + k, old_den + p_w)
+            tl.store(den_acc_ptr + b * K + k, new_den)
 
         # Process BLOCK_H heads
         offs_h = tl.arange(0, BLOCK_H)
@@ -152,6 +157,10 @@ if TRITON_AVAILABLE:
         # Accumulators for output sum over M (BLOCK_H,)
         sum_re = tl.zeros((BLOCK_H,), dtype=tl.float32)
         sum_im = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+        # Precompute inv_den and scale outside M loop (invariant)
+        inv_den = 1.0 / tl.maximum(new_den, 1e-4)
+        scale = 1.0 / tl.sqrt(float(H))
 
         # Process M dimension in blocks
         offs_m = tl.arange(0, BLOCK_M)
@@ -247,14 +256,11 @@ if TRITON_AVAILABLE:
                 other=0.0,
             )
 
-            # Normalize by accumulated denominator (load updated den_acc)
-            new_den = tl.load(den_acc_ptr + b * K + k)
-            inv_den = 1.0 / tl.maximum(new_den, 1e-4)
+            # Normalize by accumulated denominator (precomputed above)
             state_re = new_re * inv_den
             state_im = new_im * inv_den
 
             # Complex multiplication with 1/sqrt(H) scaling: (BLOCK_H, BLOCK_M)
-            scale = 1.0 / tl.sqrt(float(H))
             match_re = (state_re * q_re_vals + state_im * q_im_vals) * scale
             match_im = (state_im * q_re_vals - state_re * q_im_vals) * scale
 
@@ -305,22 +311,34 @@ def seqcond_step_triton(
     """
     B, K, H = k_val.shape
     M = theta.shape[2]
+    K_q = q_re.shape[1]
 
-    # Ensure contiguous and float32
-    k_val = k_val.contiguous().float()
-    s_raw = s_raw.contiguous().float()
-    q_re = q_re.contiguous().float()
-    q_im = q_im.contiguous().float()
-    theta = theta.contiguous().float()
-    phase_scale = phase_scale.contiguous().float()
-    score_scale = score_scale.contiguous().float()
-    score_bias = score_bias.contiguous().float()
-    log_time_weight = log_time_weight.contiguous().float()
+    # GQA safety: kernel indexes q/w_int with k directly, only correct when n_rep==1
+    assert K_q == K, (
+        f"Triton kernel requires n_rep==1 (K_q==K), got K_q={K_q}, K={K}. "
+        f"Use PyTorch path for n_rep>1."
+    )
+
+    # Ensure contiguous and float32 (avoid copies when already correct)
+    def _prep(t):
+        if t.is_contiguous() and t.dtype == torch.float32:
+            return t
+        return t.contiguous().float()
+
+    k_val = _prep(k_val)
+    s_raw = _prep(s_raw)
+    q_re = _prep(q_re)
+    q_im = _prep(q_im)
+    theta = _prep(theta)
+    phase_scale = _prep(phase_scale)
+    score_scale = _prep(score_scale)
+    score_bias = _prep(score_bias)
+    log_time_weight = _prep(log_time_weight)
 
     # Squeeze w_int from (K_q, n_rep, H, M) to (K_q, H, M) if needed
     if w_int.dim() == 4:
         w_int = w_int.squeeze(1)
-    w_int = w_int.contiguous().float()
+    w_int = _prep(w_int)
 
     # Allocate outputs
     out_re = torch.empty(B, K, H, device=k_val.device, dtype=torch.float32)
