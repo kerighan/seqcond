@@ -248,13 +248,13 @@ class SeqCondAttention(nn.Module):
             + score_bias[None, None, :]
         )
 
-        # Squared ReLU for sharper, sparser content weighting (repasser à softplus si dégradation)
+        # Softplus for content weighting (matches step)
         p_w_content = jax.nn.softplus(score_raw)
 
         # Temporal weight with exp
         temporal_weight = jnp.exp(log_time_weight)
 
-        # Combine and clip for safety (relu² produces larger values than softplus)
+        # Combine and clip for safety
         p_w = p_w_content * temporal_weight
         p_w = jnp.clip(p_w, 1e-4, 5000.0)  # (B, L, K)
 
@@ -562,13 +562,12 @@ class SeqCondAttention(nn.Module):
         score_raw = (
             score_scale[None, :] * s_raw.astype(jnp.float32) + score_bias[None, :]
         )
-        # score_raw = jnp.clip(score_raw, -20.0, 20.0)
 
-        # Squared ReLU (must match __call__)
-        p_w_content = jax.nn.relu(score_raw) ** 2
+        # Softplus (must match __call__)
+        p_w_content = jax.nn.softplus(score_raw)
         temporal_weight = jnp.exp(log_time_weight)
         p_w = p_w_content * temporal_weight
-        p_w = jnp.clip(p_w, 1e-6, 1000.0)
+        p_w = jnp.clip(p_w, 1e-4, 5000.0)
 
         # Modulation
         k_f32 = k_val[..., None].astype(jnp.float32)  # (B, K, H, 1)

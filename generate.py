@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_800k.pt",
+        default="checkpoints/seqcond_torch_746k.pt",
         # default="checkpoints/seqcond_xlarge_init.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
@@ -35,7 +35,7 @@ def main():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=768,
+        default=4096,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
@@ -56,7 +56,7 @@ def main():
     parser.add_argument(
         "--rep_penalty",
         type=float,
-        default=1.0,
+        default=1.2,
         help="Repetition penalty (1.0 = no penalty, >1.0 penalizes repetition)",
     )
     parser.add_argument(

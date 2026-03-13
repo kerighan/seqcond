@@ -1978,7 +1978,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_805k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_746k.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -2001,7 +2001,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=10,
         help="Batch size for parallel generation",
     )
     parser.add_argument(

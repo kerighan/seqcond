@@ -188,7 +188,7 @@ class SeqCondAttention(nn.Module):
             1, 1, -1
         ) * s_raw.float() + self.score_bias.view(1, 1, -1)
         p_w_content = F.softplus(score_raw)
-        p_w = (p_w_content * torch.exp(log_time_weight)).clamp(1e-6, 1000.0)
+        p_w = (p_w_content * torch.exp(log_time_weight)).clamp(1e-4, 5000.0)
 
         k_f32 = k_val.float().unsqueeze(-1)
         p_w_b = p_w.unsqueeze(-1).unsqueeze(-1)
@@ -377,11 +377,8 @@ class SeqCondAttention(nn.Module):
         else:
             # Standard PyTorch path
             score_raw = self._score_scale_b * s_raw.float() + self._score_bias_b
-            # p_w = (F.relu(score_raw) ** 2 * torch.exp(log_time_weight)).clamp(
-            #     1e-6, 1000.0
-            # )
             p_w = (F.softplus(score_raw) * torch.exp(log_time_weight)).clamp(
-                1e-6, 1000.0
+                1e-4, 5000.0
             )
 
             k_f32 = k_val.float().unsqueeze(-1)
