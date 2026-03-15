@@ -958,6 +958,136 @@ def evaluate_mmlu(
     return accuracy
 
 
+def evaluate_mmlupro(
+    gen,
+    dataset,
+    max_samples=None,
+    max_new_tokens=512,
+    batch_size=16,
+    verbose_examples=5,
+    max_thinking_tokens=None,
+    output_constraints=None,
+    use_triton=False,
+    use_cuda_graph=False,
+):
+    """Evaluate on MMLU-Pro using batched generative reasoning (up to 10 choices, A-J)."""
+    correct = 0
+    total = 0
+    parse_failures = 0
+    choice_counts = {}
+    rng = random.Random(42)
+
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    n = len(dataset)
+    print(
+        f"Evaluating on {n} samples (batched generative reasoning, bs={batch_size})..."
+    )
+    start_time = time.time()
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        batch = dataset.select(range(batch_start, batch_end))
+
+        prompts = []
+        metadata = []
+        for example in batch:
+            question = example["question"]
+            choices = example["options"]
+            answer_idx = example["answer_index"]
+
+            # Randomize option order
+            indexed = list(enumerate(choices))
+            rng.shuffle(indexed)
+            shuffled_choices = [c for _, c in indexed]
+            new_correct_idx = next(
+                j for j, (orig_i, _) in enumerate(indexed) if orig_i == answer_idx
+            )
+            correct_letter = chr(ord("A") + new_correct_idx)
+            valid = {chr(ord("A") + j) for j in range(len(shuffled_choices))}
+
+            prompt = (
+                f"{question}\n\n"
+                + "\n".join(
+                    f"{chr(ord('A') + j)}. {c}"
+                    for j, c in enumerate(shuffled_choices)
+                )
+                + "\n\nAnswer with the letter only."
+            )
+            prompts.append(prompt)
+            metadata.append((prompt, shuffled_choices, correct_letter, valid))
+
+        # Batched generation
+        outputs = _generate_for_batch(
+            gen,
+            prompts,
+            batch_size,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            use_triton=use_triton,
+            use_cuda_graph=use_cuda_graph,
+            max_thinking_tokens=max_thinking_tokens,
+            output_constraints=output_constraints,
+        )
+
+        for i, (output, (prompt, choices, correct_letter, valid)) in enumerate(
+            zip(outputs, metadata)
+        ):
+            idx = batch_start + i
+            debug_extract = bool(verbose_examples) and idx < verbose_examples
+            answer_text = _extract_answer_after_thinking(
+                output,
+                debug=debug_extract and _is_debug_extract_enabled(gen),
+                debug_id=f"idx={idx}",
+            )
+            predicted = _parse_choice(answer_text, valid, options=choices)
+
+            if predicted is None:
+                parse_failures += 1
+                if idx < verbose_examples:
+                    print(f"  [PARSE FAIL] idx={idx}")
+                    print(f"    Prompt: {prompt[:300]}")
+                    print(f"    Output: {output[:300]}")
+                    print(f"    Answer text: {answer_text[:300]}")
+            else:
+                choice_counts[predicted] = choice_counts.get(predicted, 0) + 1
+                if idx < verbose_examples:
+                    print(
+                        f"  [DEBUG] idx={idx} predicted={predicted} correct={correct_letter}"
+                    )
+                if predicted == correct_letter:
+                    correct += 1
+
+            total += 1
+
+        elapsed = time.time() - start_time
+        speed = total / elapsed if elapsed > 0 else 0
+        acc = correct / total * 100
+        dist = _format_dist(choice_counts, total, parse_failures)
+        print(
+            f"  {total}/{n} | Acc: {acc:.1f}% "
+            f"| Parse fails: {parse_failures} "
+            f"| Dist: [{dist}] "
+            f"| Speed: {speed:.1f} samples/s"
+        )
+
+    elapsed = time.time() - start_time
+    accuracy = correct / total * 100 if total > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"MMLU-Pro (Reasoning) Results:")
+    print(f"  Accuracy: {accuracy:.2f}% ({correct}/{total})")
+    print(
+        f"  Parse failures: {parse_failures}/{total} ({parse_failures/total*100:.1f}%)"
+    )
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Speed: {total/elapsed:.1f} samples/s")
+    print(f"{'='*60}")
+
+    return accuracy
+
+
 def evaluate_hellaswag(
     gen,
     dataset,
@@ -2333,6 +2463,30 @@ def main():
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"MMLU (reasoning): {accuracy:.2f}%")
+    elif args.benchmark == "mmlupro":
+        print(f"\nLoading MMLU-Pro dataset (split=test)...")
+        dataset = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+        dataset = _maybe_shuffle_dataset(
+            dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
+        )
+        print(f"Dataset loaded: {len(dataset)} examples\n")
+        n_choices = max(len(ex["options"]) for ex in dataset.select(range(min(100, len(dataset)))))
+        accuracy = evaluate_mmlupro(
+            gen,
+            dataset,
+            max_samples=args.max_samples,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            verbose_examples=args.verbose_examples,
+            max_thinking_tokens=args.max_thinking_tokens,
+            output_constraints=_make_constraints(n_choices),
+            use_triton=args.use_triton,
+            use_cuda_graph=not args.no_cuda_graph,
+        )
+        print(f"\nFinal Accuracy: {accuracy:.2f}%")
+        _send_notification(
+            "Évaluation terminée", f"MMLU-Pro (reasoning): {accuracy:.2f}%"
+        )
     elif args.benchmark == "triviaqa":
         print(f"\nLoading TriviaQA dataset (split={args.split})...")
         dataset = load_dataset("trivia_qa", "rc.nocontext", split=args.split)

@@ -22,6 +22,7 @@ from eval_reasoning import (
     evaluate_gsm8k,
     evaluate_triviaqa,
     evaluate_math500,
+    evaluate_mmlupro,
     _maybe_shuffle_dataset,
     _send_notification,
 )
@@ -371,7 +372,7 @@ def main():
         "--benchmark",
         type=str,
         default="all",
-        help="Benchmark to run: winogrande, openbookqa, commonsenseqa, hellaswag, piqa, arc, arc:easy, arc:challenge, gpqa:diamond, gsm8k, triviaqa, math500, speed, all",
+        help="Benchmark to run: winogrande, openbookqa, commonsenseqa, hellaswag, piqa, arc, arc:easy, arc:challenge, gpqa:diamond, gsm8k, triviaqa, math500, mmlupro, speed, all",
     )
     parser.add_argument(
         "--batch-size",
@@ -629,6 +630,19 @@ def main():
                 verbose_examples=args.verbose_examples,
             )
             results["math500"] = acc
+
+        elif bench == "mmlupro":
+            dataset = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+            dataset = _maybe_shuffle_dataset(dataset, seed=42)
+            acc = evaluate_mmlupro(
+                gen,
+                dataset,
+                max_samples=args.max_samples,
+                max_new_tokens=args.max_new_tokens,
+                batch_size=args.batch_size,
+                verbose_examples=args.verbose_examples,
+            )
+            results["mmlupro"] = acc
 
     # Print summary
     if results:
