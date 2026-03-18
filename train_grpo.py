@@ -33,11 +33,203 @@ from keras import ops
 from convert_torch_to_keras import (
     build_keras_model,
     convert_weights,
+    get_config_value,
     keras_pkl_to_torch_pt,
     load_torch_checkpoint,
     save_keras_checkpoint,
 )
 from seqcond.dataset import Tokenizer
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fast PyTorch generation model (Triton-accelerated)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def load_torch_gen_model(config, checkpoint_path):
+    """Load a pure PyTorch SeqCondModel for fast Triton-accelerated generation."""
+    import torch
+    from seqcond.torch.model import SeqCondModel
+
+    torch_model = SeqCondModel(**config).cuda().eval()
+    data = torch.load(checkpoint_path, map_location="cuda", weights_only=False)
+    torch_model.load_state_dict(data["state_dict"], strict=False)
+    n = sum(p.numel() for p in torch_model.parameters())
+    print(f"Loaded PyTorch gen model ({n:,} params, Triton-accelerated)")
+    return torch_model
+
+
+def sync_keras_to_torch(keras_model, torch_model, config):
+    """Copy weights from Keras model to PyTorch model (in-place).
+
+    Since KERAS_BACKEND=torch, Keras weights are torch tensors.
+    We reverse the mapping from convert_torch_to_keras.convert_weights.
+    """
+    import torch
+
+    # Build Keras weight lookup: short path -> tensor
+    keras_w = {}
+    for w in keras_model.weights:
+        parts = w.path.split("/")
+        short = "/".join(parts[1:]) if len(parts) > 1 else w.path
+        keras_w[short] = w
+
+    # Build block map
+    num_layers = get_config_value(config, "num_layers")
+    seqcond_ratio = get_config_value(config, "seqcond_ratio", 3)
+    transformer_idx = seqcond_idx = 0
+    block_map = []
+    for i in range(num_layers):
+        if (i + 1) % (seqcond_ratio + 1) == 0:
+            block_map.append((i, "transformer", f"transformer_block_{transformer_idx}"))
+            transformer_idx += 1
+        else:
+            block_map.append((i, "seqcond", f"seqcond_block_{seqcond_idx}"))
+            seqcond_idx += 1
+
+    state_dict = {}
+
+    def get(short):
+        if short not in keras_w:
+            return None
+        return keras_w[short].value  # returns underlying torch tensor
+
+    # Embedding
+    state_dict["embedding.weight"] = get("token_embedding/embeddings")
+
+    # Final norm
+    v = get("final_norm/scale")
+    if v is not None:
+        state_dict["final_norm.scale"] = v
+
+    # Blocks
+    for torch_i, btype, kname in block_map:
+        tp = f"blocks.{torch_i}."
+        if btype == "transformer":
+            state_dict[tp + "norm1.scale"] = get(f"{kname}/norm1/scale")
+            state_dict[tp + "norm2.scale"] = get(f"{kname}/norm2/scale")
+            state_dict[tp + "attn.q_proj.weight"] = get(f"{kname}/attn/q_proj/kernel").T
+            state_dict[tp + "attn.k_proj.weight"] = get(f"{kname}/attn/k_proj/kernel").T
+            state_dict[tp + "attn.v_proj.weight"] = get(f"{kname}/attn/v_proj/kernel").T
+            state_dict[tp + "attn.out_proj.weight"] = get(
+                f"{kname}/attn/out_proj/kernel"
+            ).T
+            state_dict[tp + "ff_in.weight"] = get(f"{kname}/ff_in/kernel").T
+            state_dict[tp + "ff_in.bias"] = get(f"{kname}/ff_in/bias")
+            state_dict[tp + "ff_out.weight"] = get(f"{kname}/ff_out/kernel").T
+            state_dict[tp + "ff_out.bias"] = get(f"{kname}/ff_out/bias")
+        else:  # seqcond
+            state_dict[tp + "norm.scale"] = get(f"{kname}/pre_norm/scale")
+            state_dict[tp + "attn.in_proj.weight"] = get(
+                f"{kname}/attn/in_proj/kernel"
+            ).T
+            conv = get(f"{kname}/attn/conv/kernel")
+            state_dict[tp + "attn.conv_weight"] = conv.permute(2, 1, 0).contiguous()
+            state_dict[tp + "attn.gate_proj.weight"] = get(
+                f"{kname}/attn/gate_proj/kernel"
+            ).T
+            state_dict[tp + "attn.out_proj.weight"] = get(
+                f"{kname}/attn/out_proj/kernel"
+            ).T
+            for raw_key in [
+                "theta_d_raw",
+                "theta_raw",
+                "w_int_raw",
+                "decay_slopes",
+                "anchor_slopes",
+                "score_scale",
+                "score_bias",
+                "phase_scale",
+            ]:
+                val = get(f"{kname}/attn/{raw_key}")
+                if val is not None:
+                    state_dict[tp + f"attn.{raw_key}"] = val
+            state_dict[tp + "attn.gated_norm.weight"] = get(
+                f"{kname}/attn/gated_norm_weight"
+            )
+            state_dict[tp + "attn.W_readout"] = get(f"{kname}/attn/W_readout")
+
+    # Filter None and load
+    state_dict = {k: v for k, v in state_dict.items() if v is not None}
+    torch_model.load_state_dict(state_dict, strict=False)
+
+
+def generate_completions_torch(
+    torch_model,
+    tokenizer,
+    prompt: str,
+    num_completions: int = 4,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    rep_penalty: float = 1.1,
+    gen_batch_size: int = 4,
+    return_tokens: bool = False,
+):
+    """Fast generation using PyTorch model with Triton kernels."""
+    import torch
+
+    eos_id = tokenizer.encode("<|im_end|>")[0]
+    prompt_toks = tokenizer([prompt])[0]
+    all_texts, all_ids = [], []
+
+    input_ids = torch.tensor([prompt_toks], device="cuda")
+
+    with torch.no_grad():
+        for start in range(0, num_completions, gen_batch_size):
+            B = min(gen_batch_size, num_completions - start)
+
+            # Prefill once
+            logits, states = torch_model.prefill(input_ids)
+            logits = logits.squeeze(1)  # (1, vocab)
+
+            # Tile for batch
+            if B > 1:
+                logits = logits.repeat(B, 1)
+                states = [
+                    tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state)
+                    for state in states
+                ]
+
+            logits_np = logits.cpu().float().numpy()
+            generated = [[] for _ in range(B)]
+            finished = [False] * B
+            token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
+
+            for _ in range(max_new_tokens):
+                if rep_penalty != 1.0:
+                    for i in range(B):
+                        for tid in set(generated[i]):
+                            logits_np[i, tid] = (
+                                logits_np[i, tid] / rep_penalty
+                                if logits_np[i, tid] > 0
+                                else logits_np[i, tid] * rep_penalty
+                            )
+                toks = _sample_batch(logits_np, temperature, top_k, top_p)
+                for i in range(B):
+                    if not finished[i]:
+                        generated[i].append(int(toks[i]))
+                        finished[i] = toks[i] == eos_id
+                        token_buf[i, 0] = toks[i]
+                    else:
+                        token_buf[i, 0] = eos_id
+                if all(finished):
+                    break
+                logits, states = torch_model.step(token_buf, states, use_triton=True)
+                logits_np = logits.cpu().float().numpy()
+
+            for i in range(B):
+                ids = generated[i]
+                if ids and ids[-1] == eos_id:
+                    ids = ids[:-1]
+                all_ids.append(list(ids))
+                try:
+                    all_texts.append(tokenizer.decode(ids))
+                except Exception:
+                    all_texts.append("")
+
+    return (all_texts, all_ids) if return_tokens else all_texts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,7 +587,7 @@ def grpo_step(
 
 
 def load_model(checkpoint_path: str):
-    """Load Keras SeqCond model from a PyTorch .pt checkpoint."""
+    """Load Keras SeqCond model + PyTorch gen model from a .pt checkpoint."""
     config, state_dict = load_torch_checkpoint(checkpoint_path)
     model = build_keras_model(config)
     convert_weights(config, state_dict, model)
@@ -403,7 +595,8 @@ def load_model(checkpoint_path: str):
     print(
         f"Loaded {checkpoint_path}  ({n_params:,} params, backend={keras.backend.backend()})"
     )
-    return model, config
+    torch_gen = load_torch_gen_model(config, checkpoint_path)
+    return model, config, torch_gen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,7 +605,7 @@ def load_model(checkpoint_path: str):
 
 
 def evaluate(
-    model,
+    torch_gen,
     examples,
     max_examples=50,
     num_completions=4,
@@ -427,8 +620,8 @@ def evaluate(
     correct = 0
     t0 = time.time()
     for i, ex in enumerate(examples):
-        comps = generate_completions(
-            model,
+        comps = generate_completions_torch(
+            torch_gen,
             tokenizer,
             ex["prompt"],
             num_completions=num_completions,
@@ -493,6 +686,8 @@ def train_grpo(
     config,
     examples,
     *,
+    torch_gen=None,
+    sync_every: int = 20,
     num_completions: int = 6,
     max_new_tokens: int = 512,
     temperature: float = 0.5,
@@ -531,16 +726,25 @@ def train_grpo(
         else torch.optim.SGD(all_params, lr=lr, momentum=0.0, weight_decay=weight_decay)
     )
 
+    use_fast_gen = torch_gen is not None
+
     print(
         f"\n── GRPO  {num_steps} steps  G={num_completions}  "
         f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks}  "
-        f"warmup={warmup_steps} ──\n"
+        f"warmup={warmup_steps}"
+        f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
     )
 
     t0 = time.time()
     run_reward = run_loss = run_correct = run_skipped = 0.0
 
     for step in range(1, num_steps + 1):
+        # Sync torch gen model periodically
+        if use_fast_gen and (step == 1 or step % sync_every == 0):
+            sync_keras_to_torch(model, torch_gen, config)
+            if step > 1:
+                print(f"  [sync weights → torch gen model at step {step}]")
+
         # Randomly unfreeze train_layers blocks (+ embedding)
         for p in model.parameters():
             p.requires_grad = False
@@ -553,18 +757,31 @@ def train_grpo(
         ex = random.choice(examples)
         prompt_tokens = tokenizer([ex["prompt"]])[0]
 
-        # Generate
-        texts, ids = generate_completions(
-            model,
-            tokenizer,
-            ex["prompt"],
-            num_completions=num_completions,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            rep_penalty=rep_penalty,
-            gen_batch_size=gen_batch_size,
-            return_tokens=True,
-        )
+        # Generate (fast path with Triton, or fallback to Keras)
+        if use_fast_gen:
+            texts, ids = generate_completions_torch(
+                torch_gen,
+                tokenizer,
+                ex["prompt"],
+                num_completions=num_completions,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                rep_penalty=rep_penalty,
+                gen_batch_size=gen_batch_size,
+                return_tokens=True,
+            )
+        else:
+            texts, ids = generate_completions(
+                model,
+                tokenizer,
+                ex["prompt"],
+                num_completions=num_completions,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                rep_penalty=rep_penalty,
+                gen_batch_size=gen_batch_size,
+                return_tokens=True,
+            )
 
         # Filter out degenerate completions (too short to be meaningful)
         valid = [len(c) >= min_completion_tokens for c in ids]
@@ -621,8 +838,10 @@ def train_grpo(
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
+            if use_fast_gen:
+                sync_keras_to_torch(model, torch_gen, config)
             evaluate(
-                model,
+                torch_gen if use_fast_gen else model,
                 examples,
                 max_examples=max_eval,
                 num_completions=4,
@@ -661,6 +880,12 @@ def main():
     p.add_argument("--gen_batch_size", type=int, default=4)
 
     # Training
+    p.add_argument(
+        "--sync_every",
+        type=int,
+        default=20,
+        help="Sync torch gen model weights every N steps (default: 20)",
+    )
     p.add_argument("--num_steps", type=int, default=250)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--beta", type=float, default=0.04)
@@ -686,14 +911,14 @@ def main():
 
     args = p.parse_args()
 
-    model, config = load_model(args.checkpoint)
+    model, config, torch_gen = load_model(args.checkpoint)
     examples = load_gsm8k(split="train", seed=42, max_examples=args.max_examples)
     print(f"Dataset: {len(examples)} GSM8K training examples")
 
     if not args.skip_baseline:
         print("\n── Baseline eval ──")
         evaluate(
-            model,
+            torch_gen,
             examples,
             max_examples=args.max_eval,
             num_completions=4,
@@ -715,6 +940,8 @@ def main():
         model,
         config,
         examples,
+        torch_gen=torch_gen,
+        sync_every=args.sync_every,
         num_completions=args.num_completions,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,

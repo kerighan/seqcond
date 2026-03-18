@@ -196,58 +196,61 @@ class RotarySelfAttention(layers.Layer):
             k_new = ops.cast(k_f32 * ops.rsqrt(k_ms + self.qk_norm_eps), k_new.dtype)
 
         # Update KV cache at position pos
-        # Use scatter update: for each batch element, write to its position
-        maxlen = ops.shape(k_cache)[1]
-
-        # Create indices for scatter: (B, 1, num_kv_heads, head_dim)
-        pos_expanded = ops.reshape(pos, (B, 1, 1, 1))
-        pos_expanded = ops.broadcast_to(
-            pos_expanded, (B, 1, self._num_kv_heads, self.head_dim)
-        )
-
-        # Manual scatter update (Keras ops doesn't have scatter_nd_update)
-        # We'll use a workaround: create one-hot mask and blend
         pos_int = ops.cast(pos, "int32")
-        batch_indices = ops.arange(B, dtype="int32")
 
-        # For each batch element, update k_cache[b, pos[b], :, :] = k_new[b, 0, :, :]
-        # This is tricky in Keras without scatter - we'll use a loop-free approach
-        # Create position mask: (B, maxlen)
-        positions = ops.arange(maxlen, dtype="int32")
-        positions = ops.reshape(positions, (1, maxlen))
-        pos_mask = ops.cast(
-            ops.equal(positions, ops.reshape(pos_int, (B, 1))), k_cache.dtype
-        )
-        pos_mask = ops.reshape(pos_mask, (B, maxlen, 1, 1))
+        import keras
 
-        # Update: cache = cache * (1 - mask) + new_value * mask
-        k_new_broadcast = ops.broadcast_to(
-            k_new, (B, maxlen, self._num_kv_heads, self.head_dim)
-        )
-        v_new_broadcast = ops.broadcast_to(
-            v_new, (B, maxlen, self._num_kv_heads, self.head_dim)
-        )
+        if keras.backend.backend() == "torch":
+            # Efficient in-place scatter update
+            import torch
 
-        k_cache = k_cache * (1.0 - pos_mask) + k_new_broadcast * pos_mask
-        v_cache = v_cache * (1.0 - pos_mask) + v_new_broadcast * pos_mask
+            pos_idx = (
+                pos_int.long()
+                .view(B, 1, 1, 1)
+                .expand(-1, 1, k_new.size(2), k_new.size(3))
+            )
+            k_cache.scatter_(1, pos_idx, k_new.to(k_cache.dtype))
+            v_cache.scatter_(1, pos_idx, v_new.to(v_cache.dtype))
+        else:
+            # Fallback: one-hot mask blend
+            maxlen_full = ops.shape(k_cache)[1]
+            positions = ops.reshape(
+                ops.arange(maxlen_full, dtype="int32"), (1, maxlen_full)
+            )
+            pos_mask = ops.cast(
+                ops.equal(positions, ops.reshape(pos_int, (B, 1))), k_cache.dtype
+            )
+            pos_mask = ops.reshape(pos_mask, (B, maxlen_full, 1, 1))
+            k_new_broadcast = ops.broadcast_to(
+                k_new, (B, maxlen_full, self._num_kv_heads, self.head_dim)
+            )
+            v_new_broadcast = ops.broadcast_to(
+                v_new, (B, maxlen_full, self._num_kv_heads, self.head_dim)
+            )
+            k_cache = k_cache * (1.0 - pos_mask) + k_new_broadcast * pos_mask
+            v_cache = v_cache * (1.0 - pos_mask) + v_new_broadcast * pos_mask
 
-        # Attention over full cache up to current position
-        # Create causal mask: attend only to positions <= current pos
+        # Slice KV cache to max_pos+1 to avoid operating on unused positions
+        max_pos = int(ops.max(pos_int)) + 1
+        k_slice = k_cache[:, :max_pos, :, :]
+        v_slice = v_cache[:, :max_pos, :, :]
+
+        # Repeat KV for GQA (only over the active slice)
+        k_repeated = self._repeat_kv(k_slice)  # (B, max_pos, num_heads, head_dim)
+        v_repeated = self._repeat_kv(v_slice)
+
+        # Create causal mask over the slice only
         all_positions = ops.reshape(
-            ops.arange(maxlen, dtype="int32"), (1, 1, 1, maxlen)
+            ops.arange(max_pos, dtype="int32"), (1, 1, 1, max_pos)
         )
         pos_for_mask = ops.reshape(pos_int, (B, 1, 1, 1))
-        causal_mask = ops.cast(all_positions <= pos_for_mask, k_cache.dtype)
-
-        # Repeat KV for GQA
-        k_repeated = self._repeat_kv(k_cache)  # (B, maxlen, num_heads, head_dim)
-        v_repeated = self._repeat_kv(v_cache)
+        causal_mask = ops.cast(all_positions <= pos_for_mask, k_slice.dtype)
 
         # Attention scores
         scale = ops.rsqrt(ops.cast(self.head_dim, "float32"))
         scores = (
             ops.einsum("bqhd,bkhd->bhqk", q, k_repeated) * scale
-        )  # (B, num_heads, 1, maxlen)
+        )  # (B, num_heads, 1, max_pos)
 
         # Apply causal mask
         large_neg = ops.cast(-1e9, scores.dtype)
