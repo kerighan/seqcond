@@ -366,6 +366,7 @@ class TorchGenerator:
         use_synth_template: bool = True,
         max_thinking_tokens: Optional[int] = None,
         output_constraints: Optional[List[str]] = None,
+        use_triton: bool = True,
     ) -> List[str]:
         """Generate completions for a batch of prompts in parallel.
 
@@ -558,7 +559,9 @@ class TorchGenerator:
             next_tokens[torch.tensor(finished, device=self.device)] = self.eos_token_id
             token_tensor[:, 0] = next_tokens
 
-            logits, states = self.model.step(token_tensor, states)
+            logits, states = self.model.step(
+                token_tensor, states, use_triton=use_triton
+            )
 
         # Decode each sample's generated tokens (strip trailing EOS)
         results = []
