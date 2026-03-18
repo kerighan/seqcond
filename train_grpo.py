@@ -173,22 +173,31 @@ def score_output(
     """Score a group of completions for one question.
 
     Returns a reward per completion:
-        1.0   answer is correct
+        1.2   correct answer + used <|think_end|> format
+        1.0   correct answer, no CoT separator
+        0.2   wrong answer but used <|think_end|> format  ← keeps format alive
+        0.0   wrong answer, no format
         +0.5  bonus for good reasoning quality (needs api_key / OPENAI_API_KEY)
-        0.0   wrong answer, no reasoning
 
     Modify this function to change what the model learns to do.
     Example ideas:
-        - reward format compliance (has <|think_end|>)
         - reward brevity (shorter correct answers score higher)
         - reward self-correction in chain of thought
         - drop ground_truth entirely and rely 100% on LLM score (RLAIF)
+        - remove format_bonus if you don't care about the CoT format
     """
-    binary = [1.0 if check_answer(c, ground_truth) else 0.0 for c in completions]
+    FORMAT_BONUS = 0.2  # reward for using <|think_end|> separator
+
+    rewards = []
+    for c in completions:
+        correct = 1.0 if check_answer(c, ground_truth) else 0.0
+        fmt = FORMAT_BONUS if "<|think_end|>" in c else 0.0
+        rewards.append(correct + fmt)
+
     if not api_key:
-        return binary
+        return rewards
     bonuses = _llm_bonuses(question, completions, api_key)
-    return [b + bon for b, bon in zip(binary, bonuses)]
+    return [r + bon for r, bon in zip(rewards, bonuses)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -489,12 +498,14 @@ def train_grpo(
     temperature: float = 0.5,
     rep_penalty: float = 1.1,
     gen_batch_size: int = 4,
-    beta: float = 0.1,
-    lr: float = 1e-4,
-    optimizer_name: str = "sgd",
+    beta: float = 0.04,
+    lr: float = 5e-5,
+    optimizer_name: str = "adamw",
     weight_decay: float = 0.01,
     max_grad_norm: float = 1.0,
-    train_layers: int = 2,
+    train_layers: int = 3,
+    warmup_steps: int = 20,
+    min_completion_tokens: int = 5,
     llm_api_key: str = None,
     num_steps: int = 250,
     log_every: int = 1,
@@ -522,7 +533,8 @@ def train_grpo(
 
     print(
         f"\n── GRPO  {num_steps} steps  G={num_completions}  "
-        f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks} ──\n"
+        f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks}  "
+        f"warmup={warmup_steps} ──\n"
     )
 
     t0 = time.time()
@@ -554,9 +566,17 @@ def train_grpo(
             return_tokens=True,
         )
 
+        # Filter out degenerate completions (too short to be meaningful)
+        valid = [len(c) >= min_completion_tokens for c in ids]
+        texts_f = [t for t, v in zip(texts, valid) if v]
+        ids_f = [c for c, v in zip(ids, valid) if v]
+        if not texts_f:
+            run_skipped += 1
+            continue
+
         # Score
-        rewards = score_output(ex["question"], texts, ex["ground_truth"], llm_api_key)
-        binary = [1.0 if check_answer(t, ex["ground_truth"]) else 0.0 for t in texts]
+        rewards = score_output(ex["question"], texts_f, ex["ground_truth"], llm_api_key)
+        binary = [1.0 if check_answer(t, ex["ground_truth"]) else 0.0 for t in texts_f]
         if llm_api_key:
             print(
                 f"  llm={[f'{r:.2f}' for r in rewards]}  binary={[int(b) for b in binary]}"
@@ -565,15 +585,22 @@ def train_grpo(
         advantages = _compute_advantages(rewards)
         run_reward += sum(rewards)
         run_correct += int(sum(binary))
-        run_skipped_step = 0
 
         if np.all(advantages == 0):
             run_skipped += 1
-            run_skipped_step = 1
         else:
+            # LR warmup: linear ramp for first warmup_steps
+            if warmup_steps > 0 and step <= warmup_steps:
+                scale = step / warmup_steps
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr * scale
+            elif warmup_steps > 0 and step == warmup_steps + 1:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr
+
             # GRPO update
             optimizer.zero_grad()
-            loss = grpo_step(model, prompt_tokens, ids, advantages, beta=beta)
+            loss = grpo_step(model, prompt_tokens, ids_f, advantages, beta=beta)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             run_loss += loss
@@ -635,10 +662,10 @@ def main():
 
     # Training
     p.add_argument("--num_steps", type=int, default=250)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--beta", type=float, default=0.1)
-    p.add_argument("--train_layers", type=int, default=2)
-    p.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"])
+    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--beta", type=float, default=0.04)
+    p.add_argument("--train_layers", type=int, default=3)
+    p.add_argument("--optimizer", default="adamw", choices=["sgd", "adamw"])
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--max_eval", type=int, default=50)
     p.add_argument(
