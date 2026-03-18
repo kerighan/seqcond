@@ -57,6 +57,7 @@ def to_numpy(x):
 def inference_mode():
     if keras.backend.backend() == "torch":
         import torch
+
         with torch.no_grad():
             yield
     else:
@@ -79,14 +80,17 @@ def load_gsm8k(split="train", seed=42, max_examples=None):
         if not m:
             continue
         gt = m.group(1).strip().replace(",", "")
-        examples.append({
-            "question": ex["question"],
-            "ground_truth": gt,
-            "prompt": (
-                "<|im_start|>user\n" + ex["question"]
-                + "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
-            ),
-        })
+        examples.append(
+            {
+                "question": ex["question"],
+                "ground_truth": gt,
+                "prompt": (
+                    "<|im_start|>user\n"
+                    + ex["question"]
+                    + "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
+                ),
+            }
+        )
     random.Random(seed).shuffle(examples)
     return examples[:max_examples] if max_examples else examples
 
@@ -125,7 +129,10 @@ async def _score_one(client, question, response, semaphore):
                 model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": _LLM_SYSTEM},
-                    {"role": "user", "content": f"Problem: {question}\n\nStudent response:\n{response}\n\nScore (0-100):"},
+                    {
+                        "role": "user",
+                        "content": f"Problem: {question}\n\nStudent response:\n{response}\n\nScore (0-100):",
+                    },
                 ],
                 max_tokens=8,
                 temperature=0.0,
@@ -143,7 +150,9 @@ def _llm_bonuses(question, completions, api_key, max_concurrent=8):
     async def _run():
         client = AsyncOpenAI(api_key=api_key)
         sem = asyncio.Semaphore(max_concurrent)
-        scores = await asyncio.gather(*[_score_one(client, question, r, sem) for r in completions])
+        scores = await asyncio.gather(
+            *[_score_one(client, question, r, sem) for r in completions]
+        )
         await client.close()
         return scores
 
@@ -188,7 +197,10 @@ def score_output(
 
 
 def _tile_states(states, n):
-    return [tuple(ops.tile(s, (n,) + (1,) * (s.ndim - 1)) for s in state) for state in states]
+    return [
+        tuple(ops.tile(s, (n,) + (1,) * (s.ndim - 1)) for s in state)
+        for state in states
+    ]
 
 
 def _sample_batch(logits_np, temperature=0.7, top_k=50, top_p=0.95):
@@ -201,7 +213,11 @@ def _sample_batch(logits_np, temperature=0.7, top_k=50, top_p=0.95):
             tokens[i] = np.argmax(row)
             continue
         row = row / temperature
-        topk_idx = np.argpartition(row, -top_k)[-top_k:] if 0 < top_k < len(row) else np.arange(len(row))
+        topk_idx = (
+            np.argpartition(row, -top_k)[-top_k:]
+            if 0 < top_k < len(row)
+            else np.arange(len(row))
+        )
         vals = row[topk_idx]
         vals -= np.max(vals)
         probs = np.exp(vals)
@@ -210,7 +226,8 @@ def _sample_batch(logits_np, temperature=0.7, top_k=50, top_p=0.95):
             order = np.argsort(probs)[::-1]
             cut = np.searchsorted(np.cumsum(probs[order]), top_p) + 1
             nucleus = order[:cut]
-            p = probs[nucleus]; p /= p.sum()
+            p = probs[nucleus]
+            p /= p.sum()
             tokens[i] = topk_idx[np.random.choice(nucleus, p=p)]
         else:
             tokens[i] = topk_idx[np.random.choice(len(probs), p=probs)]
@@ -254,7 +271,8 @@ def generate_completions(
                     for i in range(B):
                         for tid in set(generated[i]):
                             logits_np[i, tid] = (
-                                logits_np[i, tid] / rep_penalty if logits_np[i, tid] > 0
+                                logits_np[i, tid] / rep_penalty
+                                if logits_np[i, tid] > 0
                                 else logits_np[i, tid] * rep_penalty
                             )
                 toks = _sample_batch(logits_np, temperature, top_k, top_p)
@@ -292,7 +310,7 @@ def _seq_log_prob(model, input_ids, prompt_len):
     """Sum of per-token log probs for the completion portion of input_ids."""
     logits = model(input_ids)
     log_probs = ops.log_softmax(logits, axis=-1)
-    shift = log_probs[0, prompt_len - 1:-1, :]
+    shift = log_probs[0, prompt_len - 1 : -1, :]
     targets = ops.expand_dims(ops.cast(input_ids[0, prompt_len:], "int32"), -1)
     per_tok = ops.squeeze(ops.take_along_axis(shift, targets, axis=-1), axis=-1)
     return ops.sum(per_tok)
@@ -373,7 +391,9 @@ def load_model(checkpoint_path: str):
     model = build_keras_model(config)
     convert_weights(config, state_dict, model)
     n_params = model.count_params()
-    print(f"Loaded {checkpoint_path}  ({n_params:,} params, backend={keras.backend.backend()})")
+    print(
+        f"Loaded {checkpoint_path}  ({n_params:,} params, backend={keras.backend.backend()})"
+    )
     return model, config
 
 
@@ -382,8 +402,16 @@ def load_model(checkpoint_path: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate(model, examples, max_examples=50, num_completions=4,
-             max_new_tokens=512, temperature=0.5, rep_penalty=1.1, gen_batch_size=4):
+def evaluate(
+    model,
+    examples,
+    max_examples=50,
+    num_completions=4,
+    max_new_tokens=512,
+    temperature=0.5,
+    rep_penalty=1.1,
+    gen_batch_size=4,
+):
     """Evaluate pass@k accuracy on the first max_examples problems."""
     tokenizer = Tokenizer()
     examples = examples[:max_examples]
@@ -391,15 +419,22 @@ def evaluate(model, examples, max_examples=50, num_completions=4,
     t0 = time.time()
     for i, ex in enumerate(examples):
         comps = generate_completions(
-            model, tokenizer, ex["prompt"],
-            num_completions=num_completions, max_new_tokens=max_new_tokens,
-            temperature=temperature, rep_penalty=rep_penalty, gen_batch_size=gen_batch_size,
+            model,
+            tokenizer,
+            ex["prompt"],
+            num_completions=num_completions,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            rep_penalty=rep_penalty,
+            gen_batch_size=gen_batch_size,
         )
         ok = any(check_answer(c, ex["ground_truth"]) for c in comps)
         correct += int(ok)
-        print(f"  [{i+1}/{len(examples)}] {'✓' if ok else '✗'}  "
-              f"pass@{num_completions}={100*correct/(i+1):.1f}%  "
-              f"gt={ex['ground_truth']}")
+        print(
+            f"  [{i+1}/{len(examples)}] {'✓' if ok else '✗'}  "
+            f"pass@{num_completions}={100*correct/(i+1):.1f}%  "
+            f"gt={ex['ground_truth']}"
+        )
     acc = correct / len(examples)
     print(f"\n  pass@{num_completions}: {100*acc:.1f}%  ({time.time()-t0:.0f}s)\n")
     return acc
@@ -410,8 +445,43 @@ def evaluate(model, examples, max_examples=50, num_completions=4,
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _save_and_upload_gcp(model, config, save_path, step):
+    """Save checkpoint locally and upload to GCS."""
+    import subprocess
+
+    GCS_BUCKET = "gs://telekinesis-43/checkpoints"
+
+    # Save locally
+    pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
+    save_keras_checkpoint(model, config, pkl_path)
+    if save_path.endswith(".pt"):
+        keras_pkl_to_torch_pt(pkl_path, save_path)
+
+    # Upload to GCS
+    try:
+        filename = os.path.basename(save_path)
+        base, ext = os.path.splitext(filename)
+        gcs_filename = f"{base}_step{step}{ext}"
+        gcs_path = f"{GCS_BUCKET}/{gcs_filename}"
+
+        print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
+        result = subprocess.run(
+            ["gsutil", "cp", save_path, gcs_path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            print("✓")
+        else:
+            print(f"✗ ({result.stderr.strip()[:50]})")
+    except Exception as e:
+        print(f"✗ ({str(e)[:50]})")
+
+
 def train_grpo(
     model,
+    config,
     examples,
     *,
     num_completions: int = 6,
@@ -430,6 +500,8 @@ def train_grpo(
     log_every: int = 1,
     eval_every: int = 50,
     max_eval: int = 50,
+    save_gcp_every: int = 0,
+    save_path: str = None,
     seed: int = 42,
 ):
     import torch
@@ -448,8 +520,10 @@ def train_grpo(
         else torch.optim.SGD(all_params, lr=lr, momentum=0.0, weight_decay=weight_decay)
     )
 
-    print(f"\n── GRPO  {num_steps} steps  G={num_completions}  "
-          f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks} ──\n")
+    print(
+        f"\n── GRPO  {num_steps} steps  G={num_completions}  "
+        f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks} ──\n"
+    )
 
     t0 = time.time()
     run_reward = run_loss = run_correct = run_skipped = 0.0
@@ -469,17 +543,24 @@ def train_grpo(
 
         # Generate
         texts, ids = generate_completions(
-            model, tokenizer, ex["prompt"],
-            num_completions=num_completions, max_new_tokens=max_new_tokens,
-            temperature=temperature, rep_penalty=rep_penalty,
-            gen_batch_size=gen_batch_size, return_tokens=True,
+            model,
+            tokenizer,
+            ex["prompt"],
+            num_completions=num_completions,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            rep_penalty=rep_penalty,
+            gen_batch_size=gen_batch_size,
+            return_tokens=True,
         )
 
         # Score
         rewards = score_output(ex["question"], texts, ex["ground_truth"], llm_api_key)
         binary = [1.0 if check_answer(t, ex["ground_truth"]) else 0.0 for t in texts]
         if llm_api_key:
-            print(f"  llm={[f'{r:.2f}' for r in rewards]}  binary={[int(b) for b in binary]}")
+            print(
+                f"  llm={[f'{r:.2f}' for r in rewards]}  binary={[int(b) for b in binary]}"
+            )
 
         advantages = _compute_advantages(rewards)
         run_reward += sum(rewards)
@@ -504,17 +585,29 @@ def train_grpo(
             elapsed = time.time() - t0
             eta = elapsed / step * (num_steps - step)
             llm_str = f" llm_avg={avg_r:.3f} |" if llm_api_key else ""
-            print(f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} |{llm_str} "
-                  f"correct={int(run_correct)}/{n} | skip={int(run_skipped)} | "
-                  f"ETA {int(eta//60):02d}:{int(eta%60):02d}")
+            print(
+                f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} |{llm_str} "
+                f"correct={int(run_correct)}/{n} | skip={int(run_skipped)} | "
+                f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
+            )
             run_reward = run_loss = run_correct = run_skipped = 0.0
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
-            evaluate(model, examples, max_examples=max_eval,
-                     num_completions=4, max_new_tokens=max_new_tokens,
-                     temperature=temperature, rep_penalty=rep_penalty,
-                     gen_batch_size=gen_batch_size)
+            evaluate(
+                model,
+                examples,
+                max_examples=max_eval,
+                num_completions=4,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                rep_penalty=rep_penalty,
+                gen_batch_size=gen_batch_size,
+            )
+
+        # Periodic GCP backup
+        if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
+            _save_and_upload_gcp(model, config, save_path, step)
 
     print(f"\n── GRPO complete ({time.time()-t0:.0f}s) ──\n")
 
@@ -527,7 +620,9 @@ def train_grpo(
 def main():
     p = argparse.ArgumentParser(description="GRPO fine-tuning for SeqCond")
     p.add_argument("--checkpoint", required=True, help="PyTorch .pt checkpoint")
-    p.add_argument("--save", default=None, help="Output .pt path (default: <base>_grpo.pt)")
+    p.add_argument(
+        "--save", default=None, help="Output .pt path (default: <base>_grpo.pt)"
+    )
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--skip_baseline", action="store_true")
 
@@ -546,10 +641,21 @@ def main():
     p.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"])
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--max_eval", type=int, default=50)
+    p.add_argument(
+        "--save-gcp",
+        type=int,
+        default=0,
+        dest="save_gcp_every",
+        help="Save checkpoint to GCS every N steps (0=disabled). "
+        "Uploads to gs://telekinesis-43/checkpoints/",
+    )
 
     # Reward
-    p.add_argument("--openai_api_key", default=None,
-                   help="OpenAI key for LLM reward (falls back to OPENAI_API_KEY env var)")
+    p.add_argument(
+        "--openai_api_key",
+        default=None,
+        help="OpenAI key for LLM reward (falls back to OPENAI_API_KEY env var)",
+    )
 
     args = p.parse_args()
 
@@ -559,10 +665,16 @@ def main():
 
     if not args.skip_baseline:
         print("\n── Baseline eval ──")
-        evaluate(model, examples, max_examples=args.max_eval,
-                 num_completions=4, max_new_tokens=args.max_new_tokens,
-                 temperature=args.temperature, rep_penalty=args.rep_penalty,
-                 gen_batch_size=args.gen_batch_size)
+        evaluate(
+            model,
+            examples,
+            max_examples=args.max_eval,
+            num_completions=4,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            rep_penalty=args.rep_penalty,
+            gen_batch_size=args.gen_batch_size,
+        )
 
     api_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY") or None
     print(f"LLM reward: {'enabled (gpt-4.1-mini)' if api_key else 'disabled'}")
@@ -573,7 +685,9 @@ def main():
     )
 
     train_grpo(
-        model, examples,
+        model,
+        config,
+        examples,
         num_completions=args.num_completions,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -587,6 +701,8 @@ def main():
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_eval=args.max_eval,
+        save_gcp_every=args.save_gcp_every,
+        save_path=save_path,
     )
 
     # Save: .pkl intermediary → .pt with correct PyTorch key mapping
