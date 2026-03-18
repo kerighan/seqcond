@@ -36,7 +36,7 @@ from convert_torch_to_keras import (
     build_keras_model,
     convert_weights,
 )
-from seqcond.keras.depth_model import DepthSeqCondModel
+from seqcond.keras3.depth_model import DepthSeqCondModel
 from seqcond.dataset import Tokenizer, DataLoader, iterate_synth
 
 

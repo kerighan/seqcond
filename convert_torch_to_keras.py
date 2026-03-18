@@ -33,7 +33,7 @@ def load_torch_checkpoint(path):
 
 def build_keras_model(config):
     """Create a Keras model from the torch checkpoint config dict."""
-    from seqcond.keras.model import create_seqcond_model
+    from seqcond.keras3.model import create_seqcond_model
 
     model = create_seqcond_model(
         d_model=get_config_value(config, "d_model"),

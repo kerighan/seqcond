@@ -8,8 +8,12 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 import keras
 from keras import ops
 
-from convert_torch_to_keras import load_torch_checkpoint, build_keras_model, convert_weights
-from seqcond.keras.depth_model import DepthSeqCondModel
+from convert_torch_to_keras import (
+    load_torch_checkpoint,
+    build_keras_model,
+    convert_weights,
+)
+from seqcond.keras3.depth_model import DepthSeqCondModel
 
 
 def main():

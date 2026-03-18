@@ -2108,7 +2108,7 @@ def main():
         description="Reasoning-based evaluation for instruction-tuned models"
     )
     # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_lin5_grpo.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_lin5.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
