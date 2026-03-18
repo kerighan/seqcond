@@ -5,8 +5,7 @@ import argparse
 import pickle
 import os
 import glob
-import jax.numpy as jnp
-from jax import tree_util
+import numpy as np
 
 
 def find_checkpoint(checkpoint_dir: str, step: int) -> str:
@@ -34,15 +33,30 @@ def load_checkpoint(path: str) -> dict:
     return data
 
 
+def _apply_to_leaves(fn, *trees):
+    """Apply fn to leaves of nested dicts/lists (simple tree_map replacement)."""
+    if isinstance(trees[0], dict):
+        return {k: _apply_to_leaves(fn, *(t[k] for t in trees)) for k in trees[0]}
+    elif isinstance(trees[0], (list, tuple)):
+        result = [
+            _apply_to_leaves(fn, *(t[i] for t in trees)) for i in range(len(trees[0]))
+        ]
+        return type(trees[0])(result)
+    else:
+        return fn(*trees)
+
+
 def accumulate_weighted_params(accumulated, new_params, weight):
     """Add weighted params to accumulated result."""
     if accumulated is None:
-        # First checkpoint: multiply by weight
-        return tree_util.tree_map(lambda p: jnp.array(p) * weight, new_params)
+        return _apply_to_leaves(
+            lambda p: np.array(p, dtype=np.float64) * weight, new_params
+        )
     else:
-        # Add weighted params to accumulator
-        return tree_util.tree_map(
-            lambda acc, p: acc + jnp.array(p) * weight, accumulated, new_params
+        return _apply_to_leaves(
+            lambda acc, p: acc + np.array(p, dtype=np.float64) * weight,
+            accumulated,
+            new_params,
         )
 
 
@@ -66,7 +80,7 @@ with weights 1.0, 0.75, 0.5 (L1 normalized to sum to 1).
     parser.add_argument(
         "-d",
         "--checkpoint-dir",
-        default="/media/maixent/2To/seqcond_checkpoints/reasoning_2048",
+        default="/media/maixent/2To/seqcond_checkpoints/reasoning_4096",
         help="Directory containing checkpoints (default: /media/maixent/2To/seqcond_checkpoints)",
     )
     parser.add_argument(

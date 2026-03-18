@@ -437,7 +437,7 @@ def evaluate_gpqa(
                 "\nAnswer only with a letter, like 'A' or 'B'."
             )
             # Truncate prompt if too long (whole prompt, to handle long choices)
-            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = (
                 2 * model_maxlen // 3
             )  # leave half for thinking + answer
@@ -1010,8 +1010,7 @@ def evaluate_mmlupro(
             prompt = (
                 f"{question}\n\n"
                 + "\n".join(
-                    f"{chr(ord('A') + j)}. {c}"
-                    for j, c in enumerate(shuffled_choices)
+                    f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
                 )
                 + "\n\nAnswer with the letter only."
             )
@@ -1679,7 +1678,7 @@ def evaluate_math500(
     gen,
     dataset,
     max_samples=None,
-    max_new_tokens=2048,
+    max_new_tokens=4096,
     batch_size=16,
     verbose_examples=5,
     max_thinking_tokens=None,
@@ -1714,7 +1713,7 @@ def evaluate_math500(
 
             prompt = f"Solve the following math problem. Show your work and give your final answer in \\boxed{{}}.\n\n{problem}"
             # Truncate if too long
-            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = model_maxlen // 2
             prompt_tokens = gen.tokenizer.encode(prompt)
             if len(prompt_tokens) > max_prompt_tokens:
@@ -1832,7 +1831,7 @@ def evaluate_gsm8k(
                 # + "\n\nProvide only the answer."
             )
             # Truncate if too long
-            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = model_maxlen // 2
             prompt_tokens = gen.tokenizer.encode(prompt)
             if len(prompt_tokens) > max_prompt_tokens:
@@ -2025,7 +2024,7 @@ def evaluate_triviaqa(
                 f"Question: {question}\n\nAnswer:"
             )
             # Truncate if too long
-            model_maxlen = getattr(gen.model, "maxlen", 2048)
+            model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = model_maxlen // 2
             prompt_tokens = gen.tokenizer.encode(prompt)
             if len(prompt_tokens) > max_prompt_tokens:
@@ -2108,7 +2107,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reasoning-based evaluation for instruction-tuned models"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
+    # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/seqcond_lin5_grpo.pt")
     parser.add_argument(
         "--benchmark",
         type=str,
@@ -2470,7 +2470,9 @@ def main():
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
         )
         print(f"Dataset loaded: {len(dataset)} examples\n")
-        n_choices = max(len(ex["options"]) for ex in dataset.select(range(min(100, len(dataset)))))
+        n_choices = max(
+            len(ex["options"]) for ex in dataset.select(range(min(100, len(dataset))))
+        )
         accuracy = evaluate_mmlupro(
             gen,
             dataset,

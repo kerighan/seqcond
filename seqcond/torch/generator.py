@@ -193,7 +193,7 @@ class TorchGenerator:
         # Generate
         # if verbose:
         #     print(prompt, end="", flush=True)
-        model_maxlen = getattr(self.model, "maxlen", 2048)
+        model_maxlen = getattr(self.model, "maxlen", 4096)
         for _ in range(max_new_tokens):
             # Safety: stop if we're about to exceed model's max length
             if len(generated) >= model_maxlen:
@@ -394,7 +394,7 @@ class TorchGenerator:
         all_tokens = self.tokenizer(prompts)
         prompt_lens = [len(t) for t in all_tokens]
 
-        model_maxlen = getattr(self.model, "maxlen", 2048)
+        model_maxlen = getattr(self.model, "maxlen", 4096)
 
         # Skip samples whose prompts exceed maxlen (can't prefill)
         skipped = [False] * B

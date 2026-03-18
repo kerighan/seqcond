@@ -23,7 +23,8 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_746k.pt",
+        default="checkpoints/seqcond_torch_762k.pt",
+        # default="checkpoints/seqcond_lin5.pt",
         # default="checkpoints/seqcond_xlarge_init.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
@@ -39,7 +40,7 @@ def main():
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
-        "--temp", type=float, default=0.6, help="Sampling temperature (0.0 for greedy)"
+        "--temp", type=float, default=0.15, help="Sampling temperature (0.0 for greedy)"
     )
     parser.add_argument(
         "--top_p", type=float, default=0.9, help="Nucleus sampling top-p probability"
@@ -56,7 +57,7 @@ def main():
     parser.add_argument(
         "--rep_penalty",
         type=float,
-        default=1.2,
+        default=1.0,
         help="Repetition penalty (1.0 = no penalty, >1.0 penalizes repetition)",
     )
     parser.add_argument(

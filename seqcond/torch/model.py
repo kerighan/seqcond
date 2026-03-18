@@ -99,8 +99,7 @@ class SeqCondModel(nn.Module):
                 self.block_types.append("seqcond")
             self.blocks.append(block)
 
-        # Final norm and head
-        self.final_norm = RMSNorm(d_model)
+        # Output head (no final_norm — matches JAX training model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         # Tie weights
@@ -128,7 +127,6 @@ class SeqCondModel(nn.Module):
             else:
                 x = block(x)
 
-        x = self.final_norm(x)
         return self.lm_head(x)
 
     def prefill(
@@ -180,7 +178,6 @@ class SeqCondModel(nn.Module):
                 x, state = block(x, return_state=True)
                 states.append(state)
 
-        x = self.final_norm(x)
         logits = self.lm_head(x)
 
         # Return only last token logits for generation (default)
@@ -266,22 +263,24 @@ class SeqCondModel(nn.Module):
         cos_t = cos_t.expand(B, 1, self.num_heads, -1)
         sin_t = sin_t.expand(B, 1, self.num_heads, -1)
 
+        # Save initial pos for transformer KV cache writes.
+        # SeqCond blocks increment their own pos in-place during step(),
+        # but all transformer blocks should write at the SAME position
+        # (the current token's position), matching the forward pass behavior.
+        transformer_pos = pos
+
         new_states = []
         for i, (block, block_type, state) in enumerate(
             zip(self.blocks, self.block_types, states)
         ):
             if block_type == "transformer":
-                x, new_state = block.step(x, state, pos, cos_t, sin_t, seq_len=seq_len)
-                # Update pos for next iteration (transformer doesn't update it)
-                if pos is not None:
-                    pos = pos + 1
+                x, new_state = block.step(
+                    x, state, transformer_pos, cos_t, sin_t, seq_len=seq_len
+                )
             else:
                 x, new_state = block.step(x, state, use_triton=use_triton)
-                # SeqCond updates pos in its state, extract it
-                pos = new_state[3]
             new_states.append(new_state)
 
-        x = self.final_norm(x)
         logits = self.lm_head(x)
 
         return logits, new_states
