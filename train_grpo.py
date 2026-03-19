@@ -623,13 +623,14 @@ def gmpo_step(
     *,
     clip_eps: float = 0.4,
 ) -> float:
-    """Compute a GMPO-style loss using a geometric mean of token-level ratios.
+    """Compute a GMPO/GSPO-style loss in log-space.
 
-    This follows the log-space implementation from the GMPO paper/code sketch:
+    We keep the GMPO geometric-mean sequence ratio, but apply clipping at the
+    sequence level in the GSPO spirit:
     - compute token log-probs under an "old" snapshot (no grad)
-    - compute token log-probs under current policy (with grad)
-    - clip signed log-ratio at the token level
-    - exponentiate the mean clipped log-ratio across the completion
+    - average token log-ratios across the completion (length-normalized)
+    - clip the signed sequence log-ratio once per response
+    - exponentiate back to a sequence importance ratio
     """
     prompt_len = len(prompt_tokens)
 
@@ -654,11 +655,16 @@ def gmpo_step(
 
         adv = float(advantages[i])
         sign = 1.0 if adv > 0 else -1.0
-        signed_log_ratio = sign * (new_token_lps - old_lps)
-        clipped_signed_log_ratio = ops.clip(signed_log_ratio, -clip_eps, clip_eps)
-        min_signed_log_ratio = ops.minimum(signed_log_ratio, clipped_signed_log_ratio)
-        clipped_log_ratio = sign * min_signed_log_ratio
-        seq_ratio = ops.exp(ops.mean(clipped_log_ratio))
+        seq_log_ratio = ops.mean(new_token_lps - old_lps)
+        signed_seq_log_ratio = sign * seq_log_ratio
+        clipped_signed_seq_log_ratio = ops.clip(
+            signed_seq_log_ratio, -clip_eps, clip_eps
+        )
+        min_signed_seq_log_ratio = ops.minimum(
+            signed_seq_log_ratio, clipped_signed_seq_log_ratio
+        )
+        clipped_seq_log_ratio = sign * min_signed_seq_log_ratio
+        seq_ratio = ops.exp(clipped_seq_log_ratio)
 
         loss_i = (-adv * seq_ratio) / n
         loss_i.backward()
@@ -685,7 +691,6 @@ def load_model(checkpoint_path: str):
     return model, config, torch_gen
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -693,10 +698,10 @@ def load_model(checkpoint_path: str):
 def evaluate(
     torch_gen,
     examples,
-    max_examples=50,
-    num_completions=4,
+    max_examples=100,
+    num_completions=1,
     max_new_tokens=512,
-    temperature=0.5,
+    temperature=0.0,
     rep_penalty=1.1,
     gen_batch_size=4,
 ):
@@ -733,40 +738,6 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _save_and_upload_gcp(model, config, save_path, step):
-    """Save checkpoint locally and upload to GCS."""
-    import subprocess
-
-    GCS_BUCKET = "gs://telekinesis-43/checkpoints"
-
-    # Save locally
-    pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
-    save_keras_checkpoint(model, config, pkl_path)
-    if save_path.endswith(".pt"):
-        keras_pkl_to_torch_pt(pkl_path, save_path)
-
-    # Upload to GCS
-    try:
-        filename = os.path.basename(save_path)
-        base, ext = os.path.splitext(filename)
-        gcs_filename = f"{base}_step{step}{ext}"
-        gcs_path = f"{GCS_BUCKET}/{gcs_filename}"
-
-        print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
-        result = subprocess.run(
-            ["gsutil", "cp", save_path, gcs_path],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            print("✓")
-        else:
-            print(f"✗ ({result.stderr.strip()[:50]})")
-    except Exception as e:
-        print(f"✗ ({str(e)[:50]})")
-
-
 def train_grpo(
     model,
     config,
@@ -792,7 +763,9 @@ def train_grpo(
     num_steps: int = 250,
     log_every: int = 1,
     eval_every: int = 50,
-    max_eval: int = 50,
+    max_eval: int = 100,
+    eval_num_completions: int = 1,
+    eval_temperature: float = 0.0,
     save_gcp_every: int = 0,
     save_path: str = None,
     seed: int = 42,
@@ -950,9 +923,9 @@ def train_grpo(
                 torch_gen if use_fast_gen else model,
                 examples,
                 max_examples=max_eval,
-                num_completions=4,
+                num_completions=eval_num_completions,
                 max_new_tokens=max_new_tokens,
-                temperature=temperature,
+                temperature=eval_temperature,
                 rep_penalty=rep_penalty,
                 gen_batch_size=gen_batch_size,
             )
@@ -998,7 +971,9 @@ def main():
     p.add_argument("--train_layers", type=int, default=3)
     p.add_argument("--optimizer", default="adamw", choices=["sgd", "adamw"])
     p.add_argument("--eval_every", type=int, default=50)
-    p.add_argument("--max_eval", type=int, default=50)
+    p.add_argument("--max_eval", type=int, default=100)
+    p.add_argument("--eval_num_completions", type=int, default=1)
+    p.add_argument("--eval_temperature", type=float, default=0.0)
     p.add_argument(
         "--save-gcp",
         type=int,
@@ -1034,9 +1009,9 @@ def main():
             torch_gen,
             examples,
             max_examples=args.max_eval,
-            num_completions=4,
+            num_completions=args.eval_num_completions,
             max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
+            temperature=args.eval_temperature,
             rep_penalty=args.rep_penalty,
             gen_batch_size=args.gen_batch_size,
         )
@@ -1069,6 +1044,8 @@ def main():
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_eval=args.max_eval,
+        eval_num_completions=args.eval_num_completions,
+        eval_temperature=args.eval_temperature,
         save_gcp_every=args.save_gcp_every,
         save_path=save_path,
     )
