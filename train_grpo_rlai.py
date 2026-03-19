@@ -790,6 +790,28 @@ def _compute_advantages(rewards):
     return np.zeros_like(r) if std < 1e-8 else (r - r.mean()) / std
 
 
+def _filter_group_by_total_length(
+    prompt_tokens: List[int],
+    texts: List[str],
+    completions_tokens: List[List[int]],
+    max_total_tokens: Optional[int],
+):
+    if not max_total_tokens:
+        return texts, completions_tokens, 0
+
+    kept_texts = []
+    kept_tokens = []
+    skipped = 0
+    prompt_len = len(prompt_tokens)
+    for text, comp in zip(texts, completions_tokens):
+        if prompt_len + len(comp) > max_total_tokens:
+            skipped += 1
+            continue
+        kept_texts.append(text)
+        kept_tokens.append(comp)
+    return kept_texts, kept_tokens, skipped
+
+
 def _compute_gdpo_advantages(score_info, weights):
     component_advantages = {}
     active_weights = {name: weight for name, weight in weights.items() if weight != 0.0}
@@ -1062,6 +1084,7 @@ def train_rlai(
         )
     np.random.seed(seed)
     random.seed(seed)
+    max_total_tokens = int(config.get("maxlen") or 0)
 
     n_blocks = len(model.blocks_list)
     train_layers = min(train_layers, n_blocks)
@@ -1170,6 +1193,20 @@ def train_rlai(
         ids_f = [c for c, v in zip(ids, valid) if v]
         if not texts_f:
             run_skipped += 1
+            continue
+        texts_f, ids_f, skipped_too_long = _filter_group_by_total_length(
+            prompt_tokens,
+            texts_f,
+            ids_f,
+            max_total_tokens,
+        )
+        if skipped_too_long:
+            print(
+                f"  skipped {skipped_too_long} completions exceeding model maxlen={max_total_tokens}"
+            )
+            run_skipped += skipped_too_long
+        if not texts_f:
+            print("  skipped step: all sampled completions exceeded model maxlen")
             continue
 
         # Score
