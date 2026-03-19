@@ -51,8 +51,8 @@ def load_torch_gen_model(config, checkpoint_path):
     import torch
     from seqcond.torch.model import SeqCondModel
 
-    torch_model = SeqCondModel(**config).cuda().eval()
-    data = torch.load(checkpoint_path, map_location="cuda", weights_only=False)
+    torch_model = SeqCondModel(**config).cpu().eval()
+    data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     torch_model.load_state_dict(data["state_dict"], strict=False)
     n = sum(p.numel() for p in torch_model.parameters())
     print(f"Loaded PyTorch gen model ({n:,} params, Triton-accelerated)")
@@ -167,13 +167,18 @@ def generate_completions_torch(
     gen_batch_size: int = 4,
     return_tokens: bool = False,
 ):
-    """Fast generation using PyTorch model with Triton kernels."""
+    """Fast generation using PyTorch model with Triton kernels.
+
+    Moves model to CUDA for generation, then back to CPU to free VRAM.
+    """
     import torch
 
     eos_id = tokenizer.encode("<|im_end|>")[0]
     prompt_toks = tokenizer([prompt])[0]
     all_texts, all_ids = [], []
 
+    # Move gen model to GPU
+    torch_model.cuda()
     input_ids = torch.tensor([prompt_toks], device="cuda")
 
     with torch.no_grad():
@@ -228,6 +233,10 @@ def generate_completions_torch(
                     all_texts.append(tokenizer.decode(ids))
                 except Exception:
                     all_texts.append("")
+
+    # Move gen model back to CPU and free VRAM for training
+    torch_model.cpu()
+    torch.cuda.empty_cache()
 
     return (all_texts, all_ids) if return_tokens else all_texts
 
