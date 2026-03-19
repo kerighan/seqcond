@@ -434,6 +434,27 @@ def load_rlai_examples(
     return examples[:max_examples] if max_examples else examples
 
 
+def _filter_examples_by_prompt_length(examples, tokenizer, max_prompt_tokens=2048):
+    kept = []
+    skipped = 0
+    for ex in examples:
+        prompt = ex.get("prompt") or ""
+        try:
+            prompt_len = len(tokenizer([prompt])[0])
+        except Exception:
+            skipped += 1
+            continue
+        if prompt_len > max_prompt_tokens:
+            skipped += 1
+            continue
+        kept.append(ex)
+    if skipped:
+        print(
+            f"Filtered {skipped} overlong/invalid prompts; kept {len(kept)} examples with prompt_len <= {max_prompt_tokens}"
+        )
+    return kept
+
+
 class RLAIJudgment(BaseModel):
     reasoning_quality: int = Field(ge=0, le=5)
     final_answer_quality: int = Field(ge=0, le=5)
@@ -938,6 +959,9 @@ def evaluate(
     gen_batch_size=4,
 ):
     tokenizer = Tokenizer()
+    examples = _filter_examples_by_prompt_length(
+        examples, tokenizer, max_prompt_tokens=2048
+    )
     examples = examples[:max_examples]
     total_reward = 0.0
     total_overall = 0.0
@@ -1029,6 +1053,13 @@ def train_rlai(
     import torch
 
     tokenizer = Tokenizer()
+    examples = _filter_examples_by_prompt_length(
+        examples, tokenizer, max_prompt_tokens=2048
+    )
+    if not examples:
+        raise ValueError(
+            "No RLAI examples remain after filtering prompts longer than 2048 tokens"
+        )
     np.random.seed(seed)
     random.seed(seed)
 
