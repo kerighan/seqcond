@@ -2109,7 +2109,7 @@ def main():
     )
     # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
     parser.add_argument(
-        "--checkpoint", default="checkpoints/seqcond_lin5_grpo_step300.pt"
+        "--checkpoint", default="checkpoints/seqcond_lin5_grpo_step700.pt"
     )
     parser.add_argument(
         "--benchmark",

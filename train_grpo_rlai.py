@@ -1026,6 +1026,38 @@ def evaluate(
     return mean_reward
 
 
+def _save_and_upload_gcp(model, config, save_path, step):
+    import subprocess
+
+    gcs_bucket = "gs://telekinesis-43/checkpoints"
+
+    pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
+    save_keras_checkpoint(model, config, pkl_path)
+    if save_path.endswith(".pt"):
+        keras_pkl_to_torch_pt(pkl_path, save_path)
+
+    try:
+        filename = os.path.basename(save_path)
+        base, ext = os.path.splitext(filename)
+        gcs_filename = f"{base}_step{step}{ext}"
+        gcs_path = f"{gcs_bucket}/{gcs_filename}"
+
+        print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
+        result = subprocess.run(
+            ["gsutil", "cp", save_path, gcs_path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            print("✓")
+        else:
+            err = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            print(f"✗ ({err[:120]})")
+    except Exception as e:
+        print(f"✗ ({str(e)[:120]})")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
