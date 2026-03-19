@@ -441,7 +441,6 @@ class RLAIJudgment(BaseModel):
     concision: int = Field(ge=0, le=5)
     safety: int = Field(ge=0, le=5)
     overall_score: int = Field(ge=0, le=100)
-    rationale: str = Field(min_length=1, max_length=280)
 
 
 _LLM_SYSTEM = """\
@@ -460,7 +459,7 @@ For mathematical or quantitative questions, if the candidate's final answer is v
 For mathematical or quantitative questions, prioritize the correctness and usability of the final answer over stylistic preferences.
 Reward helpfulness, clear reasoning, directness, and appropriate brevity. Penalize incoherence, verbosity without substance, refusal when unnecessary, or obvious fabrication.
 Return a single JSON object with exactly these keys:
-reasoning_quality, final_answer_quality, instruction_following, concision, safety, overall_score, rationale.
+reasoning_quality, final_answer_quality, instruction_following, concision, safety, overall_score.
 """
 
 
@@ -472,7 +471,6 @@ def _empty_judgment(reason: str) -> RLAIJudgment:
         concision=0,
         safety=0,
         overall_score=0,
-        rationale=reason,
     )
 
 
@@ -631,7 +629,6 @@ def score_output(
             "instruction_following": [j.instruction_following for j in judgments],
             "concision": [j.concision for j in judgments],
             "safety": [j.safety for j in judgments],
-            "rationales": [j.rationale for j in judgments],
         }
     return rewards
 
