@@ -16,12 +16,13 @@ Two functions to modify:
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import re
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -29,6 +30,7 @@ os.environ.setdefault("KERAS_BACKEND", "torch")
 
 import keras
 from keras import ops
+from pydantic import BaseModel, Field
 
 from convert_torch_to_keras import (
     build_keras_model,
@@ -170,69 +172,66 @@ def generate_completions_torch(
     """Fast generation using PyTorch model with Triton kernels.
 
     Moves model to CUDA for generation, then back to CPU to free VRAM.
-    """
-    import torch
+     """
+     import torch
 
-    eos_id = tokenizer.encode("<|im_end|>")[0]
-    prompt_toks = tokenizer([prompt])[0]
-    all_texts, all_ids = [], []
+     eos_id = tokenizer.encode("")[0]
+     prompt_toks = tokenizer([prompt])[0]
+     all_texts, all_ids = [], []
 
-    # Move gen model to GPU
-    torch_model.cuda()
-    input_ids = torch.tensor([prompt_toks], device="cuda")
+     torch_model.cuda()
+     input_ids = torch.tensor([prompt_toks], device="cuda")
 
-    with torch.no_grad():
-        for start in range(0, num_completions, gen_batch_size):
-            B = min(gen_batch_size, num_completions - start)
+     with torch.no_grad():
+         for start in range(0, num_completions, gen_batch_size):
+             B = min(gen_batch_size, num_completions - start)
 
-            # Prefill once
-            logits, states = torch_model.prefill(input_ids)
-            logits = logits.squeeze(1)  # (1, vocab)
+             logits, states = torch_model.prefill(input_ids)
+             logits = logits.squeeze(1)
 
-            # Tile for batch
-            if B > 1:
-                logits = logits.repeat(B, 1)
-                states = [
-                    tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state)
-                    for state in states
-                ]
+             if B > 1:
+                 logits = logits.repeat(B, 1)
+                 states = [
+                     tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state
+                     for state in states
+                 ]
 
-            logits_np = logits.cpu().float().numpy()
-            generated = [[] for _ in range(B)]
-            finished = [False] * B
-            token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
+             logits_np = logits.cpu().float().numpy()
+             generated = [[] for _ in range(B)]
+             finished = [False] * B
+             token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
 
-            for _ in range(max_new_tokens):
-                if rep_penalty != 1.0:
-                    for i in range(B):
-                        for tid in set(generated[i]):
-                            logits_np[i, tid] = (
-                                logits_np[i, tid] / rep_penalty
-                                if logits_np[i, tid] > 0
-                                else logits_np[i, tid] * rep_penalty
-                            )
-                toks = _sample_batch(logits_np, temperature, top_k, top_p)
-                for i in range(B):
-                    if not finished[i]:
-                        generated[i].append(int(toks[i]))
-                        finished[i] = toks[i] == eos_id
-                        token_buf[i, 0] = toks[i]
-                    else:
-                        token_buf[i, 0] = eos_id
-                if all(finished):
-                    break
-                logits, states = torch_model.step(token_buf, states, use_triton=True)
-                logits_np = logits.cpu().float().numpy()
+             for _ in range(max_new_tokens):
+                 if rep_penalty != 1.0:
+                     for i in range(B):
+                         for tid in set(generated[i]):
+                             logits_np[i, tid] = (
+                                 logits_np[i, tid] / rep_penalty
+                                 if logits_np[i, tid] > 0
+                                 else logits_np[i, tid] * rep_penalty
+                             )
+                 toks = _sample_batch(logits_np, temperature, top_k, top_p)
+                 for i in range(B):
+                     if not finished[i]:
+                         generated[i].append(int(toks[i]))
+                         finished[i] = toks[i] == eos_id
+                         token_buf[i, 0] = toks[i]
+                     else:
+                         token_buf[i, 0] = eos_id
+                 if all(finished):
+                     break
+                 logits, states = torch_model.step(token_buf, states, use_triton=True)
+                 logits_np = logits.cpu().float().numpy()
 
-            for i in range(B):
-                ids = generated[i]
-                if ids and ids[-1] == eos_id:
-                    ids = ids[:-1]
-                all_ids.append(list(ids))
-                try:
-                    all_texts.append(tokenizer.decode(ids))
-                except Exception:
-                    all_texts.append("")
+             for i in range(B):
+                 ids = generated[i]
+                 if ids and ids[-1] == eos_id:
+                     ids = ids[:-1]
+                 all_ids.append(list(ids))
+                 try:
+                     all_texts.append(tokenizer.decode(ids))
+                 except Exception:
+                     all_texts.append("")
 
     # Move gen model back to CPU and free VRAM for training
     torch_model.cpu()
@@ -270,154 +269,331 @@ def inference_mode():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def load_gsm8k(split="train", seed=42, max_examples=None):
-    """Load GSM8K and return list of dicts with question/ground_truth/prompt."""
-    from datasets import load_dataset
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    examples = []
-    for ex in ds:
-        m = re.search(r"####\s*(.+)", ex["answer"])
-        if not m:
+
+def _extract_first(row: Dict[str, Any], keys: List[str]) -> str:
+    for key in keys:
+        if key in row:
+            text = _as_text(row.get(key))
+            if text:
+                return text
+    return ""
+
+
+def _messages_to_prompt(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    prompt_messages = messages
+    reference_answer = ""
+    if messages and _as_text(messages[-1].get("role")).lower() == "assistant":
+        prompt_messages = messages[:-1]
+        reference_answer = _as_text(messages[-1].get("content"))
+
+    parts = []
+    for msg in prompt_messages:
+        role = _as_text(msg.get("role") or "user").lower()
+        content = _as_text(msg.get("content"))
+        if not content:
             continue
-        gt = m.group(1).strip().replace(",", "")
-        examples.append(
-            {
-                "question": ex["question"],
-                "ground_truth": gt,
-                "prompt": (
-                    "<|im_start|>user\n"
-                    + ex["question"]
-                    + "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
-                ),
-            }
+        parts.append(f"<|im_start|>{role}\n{content}\n<|im_end|>")
+
+    if not parts:
+        return {"instruction": "", "reference_answer": reference_answer, "prompt": ""}
+
+    prompt = "".join(parts) + "<|im_start|>assistant\n<|think_start|>"
+    instruction = "\n\n".join(
+        _as_text(msg.get("content"))
+        for msg in prompt_messages
+        if _as_text(msg.get("role") or "user").lower() == "user"
+        and _as_text(msg.get("content"))
+    )
+    return {
+        "instruction": instruction,
+        "reference_answer": reference_answer,
+        "prompt": prompt,
+    }
+
+
+def _row_to_rlai_example(
+    row: Dict[str, Any],
+    *,
+    prompt_field: Optional[str] = None,
+    response_field: Optional[str] = None,
+    messages_field: Optional[str] = None,
+    source_field: Optional[str] = None,
+    dataset_source: str = "dataset",
+):
+    msg_field = messages_field
+    if not msg_field:
+        for candidate in ["messages", "conversation", "conversations", "dialogue"]:
+            if candidate in row and isinstance(row[candidate], list):
+                msg_field = candidate
+                break
+
+    if msg_field and isinstance(row.get(msg_field), list):
+        msg_info = _messages_to_prompt(row[msg_field])
+        if not msg_info["prompt"]:
+            return None
+        return {
+            "instruction": msg_info["instruction"],
+            "reference_answer": msg_info["reference_answer"],
+            "prompt": msg_info["prompt"],
+            "source": _extract_first(
+                row,
+                [source_field] if source_field else ["source", "dataset", "origin"],
+            )
+            or dataset_source,
+        }
+
+    prompt_text = _extract_first(
+        row,
+        [prompt_field] if prompt_field else ["prompt", "question", "query", "task"],
+    )
+    instruction = _extract_first(row, ["instruction"])
+    extra_input = _extract_first(row, ["input", "context"])
+    if instruction:
+        prompt_text = instruction if not extra_input else f"{instruction}\n\nContext:\n{extra_input}"
+
+    if not prompt_text:
+        prompt_text = _extract_first(row, ["text"])
+
+    if not prompt_text:
+        return None
+
+    reference_answer = _extract_first(
+        row,
+        [response_field] if response_field else ["response", "output", "answer", "chosen", "completion"],
+    )
+    return {
+        "instruction": prompt_text,
+        "reference_answer": reference_answer,
+        "prompt": f"<|im_start|>user\n{prompt_text}\n<|im_end|><|im_start|>assistant\n<|think_start|>",
+        "source": _extract_first(
+            row,
+            [source_field] if source_field else ["source", "dataset", "origin"],
         )
+        or dataset_source,
+    }
+
+
+def load_rlai_examples(
+    *,
+    dataset_name: Optional[str] = None,
+    dataset_config: Optional[str] = None,
+    dataset_split: str = "train",
+    dataset_path: Optional[str] = None,
+    prompt_field: Optional[str] = None,
+    response_field: Optional[str] = None,
+    messages_field: Optional[str] = None,
+    source_field: Optional[str] = None,
+    seed: int = 42,
+    max_examples: Optional[int] = None,
+):
+    if dataset_path:
+        dataset_source = os.path.basename(dataset_path)
+        if dataset_path.endswith(".jsonl"):
+            with open(dataset_path) as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        else:
+            with open(dataset_path) as f:
+                loaded = json.load(f)
+            rows = loaded if isinstance(loaded, list) else loaded.get("data", [])
+    else:
+        from datasets import load_dataset
+
+        dataset_name = dataset_name or "tatsu-lab/alpaca"
+        rows = load_dataset(dataset_name, dataset_config, split=dataset_split)
+        dataset_source = dataset_name
+
+    examples = []
+    for row in rows:
+        ex = _row_to_rlai_example(
+            dict(row),
+            prompt_field=prompt_field,
+            response_field=response_field,
+            messages_field=messages_field,
+            source_field=source_field,
+            dataset_source=dataset_source,
+        )
+        if ex is not None:
+            examples.append(ex)
+
     random.Random(seed).shuffle(examples)
     return examples[:max_examples] if max_examples else examples
 
 
-def check_answer(text: str, ground_truth: str) -> bool:
-    """Return True if text contains the correct numerical answer."""
-    m = re.search(r"####\s*(.+)", text)
-    if m:
-        return m.group(1).strip().replace(",", "") == ground_truth
-    parts = text.split("<|think_end|>")
-    after = parts[-1].strip() if len(parts) > 1 else text.strip()
-    for num in re.findall(r"-?[\d,]+\.?\d*", after):
-        if num.replace(",", "").rstrip(".") == ground_truth:
-            return True
-    return False
+class RLAIJudgment(BaseModel):
+    reasoning_quality: int = Field(ge=0, le=5)
+    final_answer_quality: int = Field(ge=0, le=5)
+    instruction_following: int = Field(ge=0, le=5)
+    concision: int = Field(ge=0, le=5)
+    safety: int = Field(ge=0, le=5)
+    overall_score: int = Field(ge=0, le=100)
+    rationale: str = Field(min_length=1, max_length=280)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM reasoning scorer  (private — called by score_output)
-# ─────────────────────────────────────────────────────────────────────────────
 
 _LLM_SYSTEM = """\
-You are evaluating the reasoning quality of a math student's solution.
-Score the QUALITY OF REASONING 0-100, independent of whether the final answer is correct.
-90-100: sound approach, clear logic. 60-89: mostly correct with minor errors.
-30-59: partial understanding, key mistakes. 1-29: mostly wrong. 0: gibberish/off-topic.
-Reply with ONLY a single integer 0-100.
-Give extra points to a chain of thought that actually corrects itself.
+You are a strict evaluator for assistant responses.
+Judge the candidate response to the user instruction on five criteria:
+- reasoning_quality: soundness, coherence, and usefulness of the reasoning
+- final_answer_quality: how helpful, correct-seeming, and complete the final answer is
+- instruction_following: how well the response follows the user's request and format
+- concision: whether the response is appropriately concise without omitting key content
+- safety: whether the response avoids harmful or reckless content
+
+Use integer scores from 0 to 5 for each criterion, where 5 is excellent.
+Then provide an overall_score from 0 to 100 reflecting holistic response quality.
+Do not use exact-answer verification. If a reference answer is provided, use it only as soft style/context guidance, not as hard ground truth.
+Reward helpfulness, clear reasoning, directness, and appropriate brevity. Penalize incoherence, verbosity without substance, refusal when unnecessary, or obvious fabrication.
+Return a single JSON object with exactly these keys:
+reasoning_quality, final_answer_quality, instruction_following, concision, safety, overall_score, rationale.
 """
 
 
-async def _score_one(client, question, response, semaphore):
+def _empty_judgment(reason: str) -> RLAIJudgment:
+    return RLAIJudgment(
+        reasoning_quality=0,
+        final_answer_quality=0,
+        instruction_following=0,
+        concision=0,
+        safety=0,
+        overall_score=0,
+        rationale=reason,
+    )
+
+
+def _parse_judgment_json(raw: str) -> RLAIJudgment:
+    payload = raw.strip()
+    start = payload.find("{")
+    end = payload.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        payload = payload[start : end + 1]
+    try:
+        return RLAIJudgment.model_validate_json(payload)
+    except AttributeError:
+        return RLAIJudgment.parse_raw(payload)
+
+
+def _judgment_reward(judgment: RLAIJudgment) -> float:
+    criteria_score = (
+        0.30 * judgment.reasoning_quality
+        + 0.30 * judgment.final_answer_quality
+        + 0.20 * judgment.instruction_following
+        + 0.10 * judgment.concision
+        + 0.10 * judgment.safety
+    ) / 5.0
+    overall_score = judgment.overall_score / 100.0
+    return 0.5 * criteria_score + 0.5 * overall_score
+
+
+async def _score_one(
+    client,
+    instruction,
+    response,
+    reference_answer,
+    semaphore,
+    judge_model,
+):
     async with semaphore:
         try:
+            reference_block = (
+                f"\n\nOptional reference answer for style/context only:\n{reference_answer}"
+                if reference_answer
+                else ""
+            )
             msg = await client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=judge_model,
                 messages=[
                     {"role": "system", "content": _LLM_SYSTEM},
                     {
                         "role": "user",
-                        "content": f"Problem: {question}\n\nStudent response:\n{response}\n\nScore (0-100):",
+                        "content": (
+                            f"User instruction:\n{instruction}\n\n"
+                            f"Candidate response:\n{response}"
+                            f"{reference_block}\n\n"
+                            "Return the JSON judgment now."
+                        ),
                     },
                 ],
-                max_tokens=8,
+                response_format={"type": "json_object"},
+                max_tokens=300,
                 temperature=0.0,
             )
-            raw = msg.choices[0].message.content.strip()
-            return min(max(float(re.search(r"\d+", raw).group()), 0.0), 100.0)
+            raw = (msg.choices[0].message.content or "").strip()
+            return _parse_judgment_json(raw)
         except Exception:
-            return 0.0
+            return _empty_judgment("Judge call failed.")
 
 
-def _llm_bonuses(question, completions, api_key, max_concurrent=8):
-    """Return list of LLM reasoning bonuses in [0, 0.5]."""
+def _llm_judgments(
+    instruction,
+    completions,
+    api_key,
+    *,
+    reference_answer="",
+    judge_model="gpt-4.1-mini",
+    max_concurrent=8,
+):
     from openai import AsyncOpenAI
 
     async def _run():
         client = AsyncOpenAI(api_key=api_key)
         sem = asyncio.Semaphore(max_concurrent)
         scores = await asyncio.gather(
-            *[_score_one(client, question, r, sem) for r in completions]
+            *[
+                _score_one(
+                    client,
+                    instruction,
+                    r,
+                    reference_answer,
+                    sem,
+                    judge_model,
+                )
+                for r in completions
+            ]
         )
         await client.close()
         return scores
 
-    return [s / 200.0 for s in asyncio.run(_run())]  # [0,100] → [0,0.5]
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ★  REWARD FUNCTION  —  modify this to change what the model is rewarded for
-# ═════════════════════════════════════════════════════════════════════════════
+    return asyncio.run(_run())
 
 
 def score_output(
-    question: str,
+    instruction: str,
     completions: List[str],
-    ground_truth: str,
     api_key: str = None,
+    *,
+    reference_answer: str = "",
+    judge_model: str = "gpt-4.1-mini",
+    judge_max_concurrent: int = 8,
     return_components: bool = False,
 ):
-    """Score a group of completions for one question.
-
-    Returns a reward per completion:
-        1.2   correct answer + used <|think_end|> format
-        1.0   correct answer, no CoT separator
-        0.2   wrong answer but used <|think_end|> format  ← keeps format alive
-        0.0   wrong answer, no format
-        +0.5  bonus for good reasoning quality (needs api_key / OPENAI_API_KEY)
-
-    Modify this function to change what the model learns to do.
-    Example ideas:
-        - reward brevity (shorter correct answers score higher)
-        - reward self-correction in chain of thought
-        - drop ground_truth entirely and rely 100% on LLM score (RLAIF)
-        - remove format_bonus if you don't care about the CoT format
-    """
-    FORMAT_BONUS = 0.2  # reward for using <|think_end|> separator
-
-    binary = []
-    format_bonus = []
-    rewards = []
-    for c in completions:
-        correct = 1.0 if check_answer(c, ground_truth) else 0.0
-        fmt = FORMAT_BONUS if "<|think_end|>" in c else 0.0
-        binary.append(correct)
-        format_bonus.append(fmt)
-        rewards.append(correct + fmt)
-
-    llm_bonus = [0.0] * len(completions)
     if not api_key:
-        if return_components:
-            return {
-                "rewards": rewards,
-                "binary": binary,
-                "format_bonus": format_bonus,
-                "llm_bonus": llm_bonus,
-            }
-        return rewards
-    llm_bonus = _llm_bonuses(question, completions, api_key)
-    rewards = [r + bon for r, bon in zip(rewards, llm_bonus)]
+        raise ValueError("RLAI training requires an OpenAI API key for LLM judging.")
+
+    judgments = _llm_judgments(
+        instruction,
+        completions,
+        api_key,
+        reference_answer=reference_answer,
+        judge_model=judge_model,
+        max_concurrent=judge_max_concurrent,
+    )
+    rewards = [_judgment_reward(j) for j in judgments]
     if return_components:
         return {
             "rewards": rewards,
-            "binary": binary,
-            "format_bonus": format_bonus,
-            "llm_bonus": llm_bonus,
+            "overall": [j.overall_score for j in judgments],
+            "reasoning_quality": [j.reasoning_quality for j in judgments],
+            "final_answer_quality": [j.final_answer_quality for j in judgments],
+            "instruction_following": [j.instruction_following for j in judgments],
+            "concision": [j.concision for j in judgments],
+            "safety": [j.safety for j in judgments],
+            "rationales": [j.rationale for j in judgments],
         }
     return rewards
 
@@ -698,6 +874,9 @@ def load_model(checkpoint_path: str):
 def evaluate(
     torch_gen,
     examples,
+    api_key,
+    judge_model="gpt-4.1-mini",
+    judge_max_concurrent=8,
     max_examples=100,
     num_completions=1,
     max_new_tokens=512,
@@ -705,10 +884,10 @@ def evaluate(
     rep_penalty=1.1,
     gen_batch_size=4,
 ):
-    """Evaluate pass@k accuracy on the first max_examples problems."""
     tokenizer = Tokenizer()
     examples = examples[:max_examples]
-    correct = 0
+    total_reward = 0.0
+    total_overall = 0.0
     t0 = time.time()
     for i, ex in enumerate(examples):
         comps = generate_completions_torch(
@@ -721,16 +900,31 @@ def evaluate(
             rep_penalty=rep_penalty,
             gen_batch_size=gen_batch_size,
         )
-        ok = any(check_answer(c, ex["ground_truth"]) for c in comps)
-        correct += int(ok)
-        print(
-            f"  [{i+1}/{len(examples)}] {'✓' if ok else '✗'}  "
-            f"pass@{num_completions}={100*correct/(i+1):.1f}%  "
-            f"gt={ex['ground_truth']}"
+        score_info = score_output(
+            ex["instruction"],
+            comps,
+            api_key,
+            reference_answer=ex.get("reference_answer", ""),
+            judge_model=judge_model,
+            judge_max_concurrent=judge_max_concurrent,
+            return_components=True,
         )
-    acc = correct / len(examples)
-    print(f"\n  pass@{num_completions}: {100*acc:.1f}%  ({time.time()-t0:.0f}s)\n")
-    return acc
+        avg_reward = float(np.mean(score_info["rewards"]))
+        avg_overall = float(np.mean(score_info["overall"]))
+        total_reward += avg_reward
+        total_overall += avg_overall
+        print(
+            f"  [{i+1}/{len(examples)}] reward={avg_reward:.3f}  "
+            f"overall={avg_overall:.1f}/100  "
+            f"source={ex['source']}"
+        )
+    mean_reward = total_reward / max(len(examples), 1)
+    mean_overall = total_overall / max(len(examples), 1)
+    print(
+        f"\n  judge_reward@{num_completions}: {mean_reward:.3f}  "
+        f"overall={mean_overall:.1f}/100  ({time.time()-t0:.0f}s)\n"
+    )
+    return mean_reward
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,39 +932,7 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _save_and_upload_gcp(model, config, save_path, step):
-    import subprocess
-
-    gcs_bucket = "gs://telekinesis-43/checkpoints"
-
-    pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
-    save_keras_checkpoint(model, config, pkl_path)
-    if save_path.endswith(".pt"):
-        keras_pkl_to_torch_pt(pkl_path, save_path)
-
-    try:
-        filename = os.path.basename(save_path)
-        base, ext = os.path.splitext(filename)
-        gcs_filename = f"{base}_step{step}{ext}"
-        gcs_path = f"{gcs_bucket}/{gcs_filename}"
-
-        print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
-        result = subprocess.run(
-            ["gsutil", "cp", save_path, gcs_path],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            print("✓")
-        else:
-            err = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            print(f"✗ ({err[:120]})")
-    except Exception as e:
-        print(f"✗ ({str(e)[:120]})")
-
-
-def train_grpo(
+def train_rlai(
     model,
     config,
     examples,
@@ -792,6 +954,8 @@ def train_grpo(
     warmup_steps: int = 20,
     min_completion_tokens: int = 5,
     llm_api_key: str = None,
+    judge_model: str = "gpt-4.1-mini",
+    judge_max_concurrent: int = 8,
     num_steps: int = 250,
     log_every: int = 1,
     eval_every: int = 50,
@@ -820,22 +984,19 @@ def train_grpo(
 
     use_fast_gen = torch_gen is not None
 
-    objective_name = "GMPO" if use_gmpo else "GRPO"
+    objective_name = "RLAI-GMPO" if use_gmpo else "RLAI-GRPO"
 
     print(
         f"\n── {objective_name}  {num_steps} steps  G={num_completions}  "
-        f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks}  "
+        f"lr={lr}  β={beta}  judge={judge_model}  train_layers={train_layers}/{n_blocks}  "
         f"warmup={warmup_steps}"
         f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
     )
 
     t0 = time.time()
-    run_reward = run_loss = run_correct = run_skipped = 0.0
+    run_reward = run_loss = run_skipped = 0.0
     run_count = run_adv_abs = 0.0
-
-    if save_gcp_every > 0 and save_path:
-        print("  [step 0 backup]")
-        _save_and_upload_gcp(model, config, save_path, 0)
+    run_overall = run_reasoning = run_answer = run_follow = 0.0
 
     for step in range(1, num_steps + 1):
         # Sync torch gen model periodically
@@ -892,27 +1053,34 @@ def train_grpo(
 
         # Score
         score_info = score_output(
-            ex["question"],
+            ex["instruction"],
             texts_f,
-            ex["ground_truth"],
             llm_api_key,
+            reference_answer=ex.get("reference_answer", ""),
+            judge_model=judge_model,
+            judge_max_concurrent=judge_max_concurrent,
             return_components=True,
         )
         rewards = score_info["rewards"]
-        binary = score_info["binary"]
-        llm_bonus = score_info["llm_bonus"]
-        if llm_api_key:
-            print(
-                f"  reward={[f'{r:.2f}' for r in rewards]}  "
-                f"llm_bonus={[f'{b:.2f}' for b in llm_bonus]}  "
-                f"binary={[int(b) for b in binary]}"
-            )
+        overall = score_info["overall"]
+        reasoning = score_info["reasoning_quality"]
+        final_answer = score_info["final_answer_quality"]
+        instruction_following = score_info["instruction_following"]
+        concision = score_info["concision"]
+        print(
+            f"  reward={[f'{r:.2f}' for r in rewards]}  "
+            f"overall={overall}  reason={reasoning}  "
+            f"answer={final_answer}  follow={instruction_following}  concise={concision}"
+        )
 
         advantages = _compute_advantages(rewards)
         run_reward += sum(rewards)
         run_count += len(rewards)
-        run_correct += int(sum(binary))
         run_adv_abs += float(np.mean(np.abs(advantages)))
+        run_overall += sum(overall)
+        run_reasoning += sum(reasoning)
+        run_answer += sum(final_answer)
+        run_follow += sum(instruction_following)
 
         if np.all(advantages == 0):
             run_skipped += 1
@@ -940,16 +1108,23 @@ def train_grpo(
         if step % log_every == 0:
             avg_r = run_reward / max(run_count, 1.0)
             avg_adv = run_adv_abs / log_every
+            avg_overall = run_overall / max(run_count, 1.0)
+            avg_reasoning = run_reasoning / max(run_count, 1.0)
+            avg_answer = run_answer / max(run_count, 1.0)
+            avg_follow = run_follow / max(run_count, 1.0)
             elapsed = time.time() - t0
             eta = elapsed / step * (num_steps - step)
             print(
                 f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} | "
-                f"reward_avg={avg_r:.3f} | adv_abs={avg_adv:.3f} | "
-                f"correct={int(run_correct)}/{int(run_count)} | skip={int(run_skipped)} | "
+                f"reward_avg={avg_r:.3f} | overall_avg={avg_overall:.1f} | "
+                f"reason_avg={avg_reasoning:.2f} | answer_avg={avg_answer:.2f} | "
+                f"follow_avg={avg_follow:.2f} | adv_abs={avg_adv:.3f} | "
+                f"skip={int(run_skipped)} | "
                 f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
             )
-            run_reward = run_loss = run_correct = run_skipped = 0.0
+            run_reward = run_loss = run_skipped = 0.0
             run_count = run_adv_abs = 0.0
+            run_overall = run_reasoning = run_answer = run_follow = 0.0
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
@@ -958,6 +1133,9 @@ def train_grpo(
             evaluate(
                 torch_gen if use_fast_gen else model,
                 examples,
+                api_key=llm_api_key,
+                judge_model=judge_model,
+                judge_max_concurrent=judge_max_concurrent,
                 max_examples=max_eval,
                 num_completions=eval_num_completions,
                 max_new_tokens=max_new_tokens,
@@ -979,13 +1157,21 @@ def train_grpo(
 
 
 def main():
-    p = argparse.ArgumentParser(description="GRPO fine-tuning for SeqCond")
+    p = argparse.ArgumentParser(description="RLAI fine-tuning for SeqCond")
     p.add_argument("--checkpoint", required=True, help="PyTorch .pt checkpoint")
     p.add_argument(
-        "--save", default=None, help="Output .pt path (default: <base>_grpo.pt)"
+        "--save", default=None, help="Output .pt path (default: <base>_rlai.pt)"
     )
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--skip_baseline", action="store_true")
+    p.add_argument("--dataset_name", default="tatsu-lab/alpaca")
+    p.add_argument("--dataset_config", default=None)
+    p.add_argument("--dataset_split", default="train")
+    p.add_argument("--dataset_path", default=None)
+    p.add_argument("--prompt_field", default=None)
+    p.add_argument("--response_field", default=None)
+    p.add_argument("--messages_field", default=None)
+    p.add_argument("--source_field", default=None)
 
     # Generation
     p.add_argument("--num_completions", type=int, default=6)
@@ -1023,8 +1209,10 @@ def main():
     p.add_argument(
         "--openai_api_key",
         default=None,
-        help="OpenAI key for LLM reward (falls back to OPENAI_API_KEY env var)",
+        help="OpenAI key for the RLAI judge (falls back to OPENAI_API_KEY env var)",
     )
+    p.add_argument("--judge_model", default="gpt-4.1-mini")
+    p.add_argument("--judge_max_concurrent", type=int, default=8)
 
     # GMPO
     p.add_argument(
@@ -1036,14 +1224,33 @@ def main():
     args = p.parse_args()
 
     model, config, torch_gen = load_model(args.checkpoint)
-    examples = load_gsm8k(split="train", seed=42, max_examples=args.max_examples)
-    print(f"Dataset: {len(examples)} GSM8K training examples")
+    examples = load_rlai_examples(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        dataset_split=args.dataset_split,
+        dataset_path=args.dataset_path,
+        prompt_field=args.prompt_field,
+        response_field=args.response_field,
+        messages_field=args.messages_field,
+        source_field=args.source_field,
+        seed=42,
+        max_examples=args.max_examples,
+    )
+    print(f"Dataset: {len(examples)} RLAI training examples")
+
+    api_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY") or None
+    if not api_key:
+        raise ValueError("RLAI requires OPENAI_API_KEY or --openai_api_key.")
+    print(f"LLM judge: enabled ({args.judge_model})")
 
     if not args.skip_baseline:
         print("\n── Baseline eval ──")
         evaluate(
             torch_gen,
             examples,
+            api_key=api_key,
+            judge_model=args.judge_model,
+            judge_max_concurrent=args.judge_max_concurrent,
             max_examples=args.max_eval,
             num_completions=args.eval_num_completions,
             max_new_tokens=args.max_new_tokens,
@@ -1052,15 +1259,12 @@ def main():
             gen_batch_size=args.gen_batch_size,
         )
 
-    api_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY") or None
-    print(f"LLM reward: {'enabled (gpt-4.1-mini)' if api_key else 'disabled'}")
-
     save_path = args.save or os.path.join(
         "checkpoints",
-        os.path.splitext(os.path.basename(args.checkpoint))[0] + "_grpo.pt",
+        os.path.splitext(os.path.basename(args.checkpoint))[0] + "_rlai.pt",
     )
 
-    train_grpo(
+    train_rlai(
         model,
         config,
         examples,
@@ -1077,6 +1281,8 @@ def main():
         optimizer_name=args.optimizer,
         train_layers=args.train_layers,
         llm_api_key=api_key,
+        judge_model=args.judge_model,
+        judge_max_concurrent=args.judge_max_concurrent,
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_eval=args.max_eval,
