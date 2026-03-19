@@ -507,6 +507,26 @@ def _judgment_reward(judgment: RLAIJudgment) -> float:
     return 0.5 * criteria_score + 0.5 * overall_score
 
 
+def _judge_messages(instruction, response, reference_answer):
+    reference_block = (
+        f"\n\nOptional reference answer for style/context only:\n{reference_answer}"
+        if reference_answer
+        else ""
+    )
+    return [
+        {"role": "system", "content": _LLM_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"User instruction:\n{instruction}\n\n"
+                f"Candidate response:\n{response}"
+                f"{reference_block}\n\n"
+                "Return the JSON judgment now."
+            ),
+        },
+    ]
+
+
 async def _score_one(
     client,
     instruction,
@@ -516,34 +536,35 @@ async def _score_one(
     judge_model,
 ):
     async with semaphore:
+        messages = _judge_messages(instruction, response, reference_answer)
         try:
-            reference_block = (
-                f"\n\nOptional reference answer for style/context only:\n{reference_answer}"
-                if reference_answer
-                else ""
-            )
-            msg = await client.chat.completions.create(
+            msg = await client.beta.chat.completions.parse(
                 model=judge_model,
-                messages=[
-                    {"role": "system", "content": _LLM_SYSTEM},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"User instruction:\n{instruction}\n\n"
-                            f"Candidate response:\n{response}"
-                            f"{reference_block}\n\n"
-                            "Return the JSON judgment now."
-                        ),
-                    },
-                ],
-                response_format={"type": "json_object"},
+                messages=messages,
+                response_format=RLAIJudgment,
                 max_tokens=300,
                 temperature=0.0,
             )
+            parsed = msg.choices[0].message.parsed
+            if parsed is not None:
+                return parsed
             raw = (msg.choices[0].message.content or "").strip()
             return _parse_judgment_json(raw)
-        except Exception:
-            return _empty_judgment("Judge call failed.")
+        except Exception as first_error:
+            try:
+                msg = await client.chat.completions.create(
+                    model=judge_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=300,
+                    temperature=0.0,
+                )
+                raw = (msg.choices[0].message.content or "").strip()
+                return _parse_judgment_json(raw)
+            except Exception as second_error:
+                return _empty_judgment(
+                    f"Judge call failed: {type(first_error).__name__}: {str(first_error)[:120]} | fallback: {type(second_error).__name__}: {str(second_error)[:120]}"
+                )
 
 
 def _llm_judgments(
@@ -1001,7 +1022,7 @@ def train_rlai(
     num_steps: int = 250,
     log_every: int = 1,
     eval_every: int = 50,
-    max_eval: int = 100,
+    max_eval: int = 20,
     eval_num_completions: int = 1,
     eval_temperature: float = 0.0,
     save_gcp_every: int = 0,
