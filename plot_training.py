@@ -9,19 +9,25 @@ import numpy as np
 
 
 def parse_results(filepath):
-    """Extract step and llm_avg from results file."""
+    """Extract step, reward_avg, and correct ratio from results file."""
     steps = []
-    llm_avgs = []
+    reward_avgs = []
+    correct_rates = []
 
     with open(filepath) as f:
         for line in f:
-            # Match: "Step   42/1000 | loss=... | llm_avg=0.525 | ..."
-            m = re.search(r"Step\s+(\d+)/\d+.*reward_avg=([\d.]+)", line)
+            m = re.search(
+                r"Step\s+(\d+)/\d+.*reward_avg=([\d.]+).*correct=(\d+)/(\d+)",
+                line,
+            )
             if m:
                 steps.append(int(m.group(1)))
-                llm_avgs.append(float(m.group(2)))
+                reward_avgs.append(float(m.group(2)))
+                num_correct = int(m.group(3))
+                num_total = int(m.group(4))
+                correct_rates.append(num_correct / max(num_total, 1))
 
-    return np.array(steps), np.array(llm_avgs)
+    return np.array(steps), np.array(reward_avgs), np.array(correct_rates)
 
 
 def smooth(y, window=5):
@@ -29,10 +35,10 @@ def smooth(y, window=5):
     if len(y) < window:
         return y
     kernel = np.ones(window) / window
-    smoothed = np.convolve(y, kernel, mode="valid")
-    # Pad start to match original length
-    pad = len(y) - len(smoothed)
-    return np.concatenate([y[:pad], smoothed])
+    left = window // 2
+    right = window - 1 - left
+    padded = np.pad(y, (left, right), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def main():
@@ -41,31 +47,53 @@ def main():
         print(f"ERROR: {results_file} not found")
         sys.exit(1)
 
-    steps, llm_avgs = parse_results(results_file)
+    steps, reward_avgs, correct_rates = parse_results(results_file)
     if len(steps) == 0:
         print("ERROR: No training steps found in results.txt")
         sys.exit(1)
 
     print(f"Parsed {len(steps)} steps")
-    print(f"  Min llm_avg: {llm_avgs.min():.3f}")
-    print(f"  Max llm_avg: {llm_avgs.max():.3f}")
-    print(f"  Mean llm_avg: {llm_avgs.mean():.3f}")
+    print(f"  Min reward_avg: {reward_avgs.min():.3f}")
+    print(f"  Max reward_avg: {reward_avgs.max():.3f}")
+    print(f"  Mean reward_avg: {reward_avgs.mean():.3f}")
+    print(f"  Mean correct rate: {correct_rates.mean():.3f}")
     print()
 
-    # Try matplotlib first, fall back to ASCII
     try:
         import matplotlib.pyplot as plt
 
-        smoothed = smooth(llm_avgs, window=10)
+        reward_smoothed = smooth(reward_avgs, window=50)
+        correct_smoothed = smooth(correct_rates, window=50)
 
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.scatter(steps, llm_avgs, alpha=0.3, s=20, label="Raw (noisy)")
-        ax.plot(steps, smoothed, color="red", linewidth=2, label="Smoothed (window=10)")
+        ax2 = ax.twinx()
+
+        ax.scatter(
+            steps, reward_avgs, alpha=0.2, s=20, color="tab:red", label="Reward raw"
+        )
+        reward_line = ax.plot(
+            steps,
+            reward_smoothed,
+            color="tab:red",
+            linewidth=2,
+            label="Reward smooth",
+        )
+        correct_line = ax2.plot(
+            steps,
+            correct_smoothed,
+            color="tab:blue",
+            linewidth=2,
+            label="Correct smooth",
+        )
         ax.set_xlabel("Step")
-        ax.set_ylabel("llm_avg")
-        ax.set_title("Training Progress: LLM Reward Average")
+        ax.set_ylabel("reward_avg", color="tab:red")
+        ax2.set_ylabel("correct rate", color="tab:blue")
+        ax2.set_ylim(0.0, 1.0)
+        ax.set_title("Training Progress: reward_avg and correct rate")
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        handles = reward_line + correct_line
+        labels = [line.get_label() for line in handles]
+        ax.legend(handles, labels)
 
         plt.tight_layout()
         plt.savefig("training_plot.png", dpi=100)
@@ -74,7 +102,11 @@ def main():
     except ImportError:
         print("matplotlib not found, using ASCII plot instead")
         print()
-        ascii_plot(steps, llm_avgs)
+        print("reward_avg")
+        ascii_plot(steps, reward_avgs)
+        print()
+        print("correct rate")
+        ascii_plot(steps, correct_rates)
 
 
 def ascii_plot(steps, values, height=20, width=80):

@@ -1,16 +1,16 @@
 """
-GRPO fine-tuning for SeqCond on GSM8K.
+RLAI fine-tuning for SeqCond with an LLM judge.
 
 Quick start:
-    KERAS_BACKEND=torch python train_grpo.py --checkpoint checkpoints/seqcond_lin5.pt
+    KERAS_BACKEND=torch python train_grpo_rlai.py --checkpoint checkpoints/seqcond_lin5.pt
 
 Colab:
-    !pip install keras datasets openai  # once
+    !pip install keras datasets openai pydantic  # once
     %env KERAS_BACKEND=torch
-    !python train_grpo.py --checkpoint ... --openai_api_key sk-...
+    !python train_grpo_rlai.py --checkpoint ... --openai_api_key sk-...
 
 Two functions to modify:
-    score_output()  — what counts as a good response  (reward design)
+    score_output()  — what counts as a good response  (judge design)
     grpo_step()     — how rewards drive the update     (algorithm)
 """
 
@@ -172,66 +172,66 @@ def generate_completions_torch(
     """Fast generation using PyTorch model with Triton kernels.
 
     Moves model to CUDA for generation, then back to CPU to free VRAM.
-     """
-     import torch
+    """
+    import torch
 
-     eos_id = tokenizer.encode("")[0]
-     prompt_toks = tokenizer([prompt])[0]
-     all_texts, all_ids = [], []
+    eos_id = tokenizer.encode("<|im_end|>")[0]
+    prompt_toks = tokenizer([prompt])[0]
+    all_texts, all_ids = [], []
 
-     torch_model.cuda()
-     input_ids = torch.tensor([prompt_toks], device="cuda")
+    torch_model.cuda()
+    input_ids = torch.tensor([prompt_toks], device="cuda")
 
-     with torch.no_grad():
-         for start in range(0, num_completions, gen_batch_size):
-             B = min(gen_batch_size, num_completions - start)
+    with torch.no_grad():
+        for start in range(0, num_completions, gen_batch_size):
+            B = min(gen_batch_size, num_completions - start)
 
-             logits, states = torch_model.prefill(input_ids)
-             logits = logits.squeeze(1)
+            logits, states = torch_model.prefill(input_ids)
+            logits = logits.squeeze(1)
 
-             if B > 1:
-                 logits = logits.repeat(B, 1)
-                 states = [
-                     tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state
-                     for state in states
-                 ]
+            if B > 1:
+                logits = logits.repeat(B, 1)
+                states = [
+                    tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state)
+                    for state in states
+                ]
 
-             logits_np = logits.cpu().float().numpy()
-             generated = [[] for _ in range(B)]
-             finished = [False] * B
-             token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
+            logits_np = logits.cpu().float().numpy()
+            generated = [[] for _ in range(B)]
+            finished = [False] * B
+            token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
 
-             for _ in range(max_new_tokens):
-                 if rep_penalty != 1.0:
-                     for i in range(B):
-                         for tid in set(generated[i]):
-                             logits_np[i, tid] = (
-                                 logits_np[i, tid] / rep_penalty
-                                 if logits_np[i, tid] > 0
-                                 else logits_np[i, tid] * rep_penalty
-                             )
-                 toks = _sample_batch(logits_np, temperature, top_k, top_p)
-                 for i in range(B):
-                     if not finished[i]:
-                         generated[i].append(int(toks[i]))
-                         finished[i] = toks[i] == eos_id
-                         token_buf[i, 0] = toks[i]
-                     else:
-                         token_buf[i, 0] = eos_id
-                 if all(finished):
-                     break
-                 logits, states = torch_model.step(token_buf, states, use_triton=True)
-                 logits_np = logits.cpu().float().numpy()
+            for _ in range(max_new_tokens):
+                if rep_penalty != 1.0:
+                    for i in range(B):
+                        for tid in set(generated[i]):
+                            logits_np[i, tid] = (
+                                logits_np[i, tid] / rep_penalty
+                                if logits_np[i, tid] > 0
+                                else logits_np[i, tid] * rep_penalty
+                            )
+                toks = _sample_batch(logits_np, temperature, top_k, top_p)
+                for i in range(B):
+                    if not finished[i]:
+                        generated[i].append(int(toks[i]))
+                        finished[i] = toks[i] == eos_id
+                        token_buf[i, 0] = toks[i]
+                    else:
+                        token_buf[i, 0] = eos_id
+                if all(finished):
+                    break
+                logits, states = torch_model.step(token_buf, states, use_triton=True)
+                logits_np = logits.cpu().float().numpy()
 
-             for i in range(B):
-                 ids = generated[i]
-                 if ids and ids[-1] == eos_id:
-                     ids = ids[:-1]
-                 all_ids.append(list(ids))
-                 try:
-                     all_texts.append(tokenizer.decode(ids))
-                 except Exception:
-                     all_texts.append("")
+            for i in range(B):
+                ids = generated[i]
+                if ids and ids[-1] == eos_id:
+                    ids = ids[:-1]
+                all_ids.append(list(ids))
+                try:
+                    all_texts.append(tokenizer.decode(ids))
+                except Exception:
+                    all_texts.append("")
 
     # Move gen model back to CPU and free VRAM for training
     torch_model.cpu()
@@ -356,7 +356,11 @@ def _row_to_rlai_example(
     instruction = _extract_first(row, ["instruction"])
     extra_input = _extract_first(row, ["input", "context"])
     if instruction:
-        prompt_text = instruction if not extra_input else f"{instruction}\n\nContext:\n{extra_input}"
+        prompt_text = (
+            instruction
+            if not extra_input
+            else f"{instruction}\n\nContext:\n{extra_input}"
+        )
 
     if not prompt_text:
         prompt_text = _extract_first(row, ["text"])
@@ -366,7 +370,11 @@ def _row_to_rlai_example(
 
     reference_answer = _extract_first(
         row,
-        [response_field] if response_field else ["response", "output", "answer", "chosen", "completion"],
+        (
+            [response_field]
+            if response_field
+            else ["response", "output", "answer", "chosen", "completion"]
+        ),
     )
     return {
         "instruction": prompt_text,
@@ -448,6 +456,8 @@ Judge the candidate response to the user instruction on five criteria:
 Use integer scores from 0 to 5 for each criterion, where 5 is excellent.
 Then provide an overall_score from 0 to 100 reflecting holistic response quality.
 Do not use exact-answer verification. If a reference answer is provided, use it only as soft style/context guidance, not as hard ground truth.
+For mathematical or quantitative questions, if the candidate's final answer is valid/correct, assign full points (5/5) for final_answer_quality, even if the reasoning style is imperfect.
+For mathematical or quantitative questions, prioritize the correctness and usability of the final answer over stylistic preferences.
 Reward helpfulness, clear reasoning, directness, and appropriate brevity. Penalize incoherence, verbosity without substance, refusal when unnecessary, or obvious fabrication.
 Return a single JSON object with exactly these keys:
 reasoning_quality, final_answer_quality, instruction_following, concision, safety, overall_score, rationale.
@@ -479,13 +489,20 @@ def _parse_judgment_json(raw: str) -> RLAIJudgment:
 
 
 def _judgment_reward(judgment: RLAIJudgment) -> float:
+    criterion_weights = {
+        "reasoning_quality": 0.30,
+        "final_answer_quality": 0.30 * 1.33,
+        "instruction_following": 0.20,
+        "concision": 0.10,
+        "safety": 0.10,
+    }
     criteria_score = (
-        0.30 * judgment.reasoning_quality
-        + 0.30 * judgment.final_answer_quality
-        + 0.20 * judgment.instruction_following
-        + 0.10 * judgment.concision
-        + 0.10 * judgment.safety
-    ) / 5.0
+        criterion_weights["reasoning_quality"] * judgment.reasoning_quality
+        + criterion_weights["final_answer_quality"] * judgment.final_answer_quality
+        + criterion_weights["instruction_following"] * judgment.instruction_following
+        + criterion_weights["concision"] * judgment.concision
+        + criterion_weights["safety"] * judgment.safety
+    ) / (5.0 * sum(criterion_weights.values()))
     overall_score = judgment.overall_score / 100.0
     return 0.5 * criteria_score + 0.5 * overall_score
 
@@ -734,6 +751,24 @@ def _compute_advantages(rewards):
     return np.zeros_like(r) if std < 1e-8 else (r - r.mean()) / std
 
 
+def _compute_gdpo_advantages(score_info, weights):
+    component_advantages = {}
+    active_weights = {name: weight for name, weight in weights.items() if weight != 0.0}
+    scale = float(sum(abs(weight) for weight in active_weights.values()))
+    combined = None
+    for name, weight in active_weights.items():
+        adv = _compute_advantages(score_info[name])
+        component_advantages[name] = adv
+        scaled_weight = weight / scale if scale > 0.0 else 0.0
+        combined = (
+            adv * scaled_weight if combined is None else combined + adv * scaled_weight
+        )
+    if combined is None:
+        rewards = score_info.get("rewards", [])
+        combined = np.zeros(len(rewards), dtype=np.float32)
+    return combined.astype(np.float32), component_advantages
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ★  GRPO FORMULA  —  modify this to change how rewards drive the update
 # ═════════════════════════════════════════════════════════════════════════════
@@ -940,6 +975,7 @@ def train_rlai(
     torch_gen=None,
     sync_every: int = 20,
     use_gmpo: bool = False,
+    use_gdpo: bool = False,
     num_completions: int = 6,
     max_new_tokens: int = 512,
     temperature: float = 0.5,
@@ -956,6 +992,12 @@ def train_rlai(
     llm_api_key: str = None,
     judge_model: str = "gpt-4.1-mini",
     judge_max_concurrent: int = 8,
+    gdpo_overall_weight: float = 0.50,
+    gdpo_reasoning_weight: float = 0.15,
+    gdpo_answer_weight: float = 0.15,
+    gdpo_follow_weight: float = 0.10,
+    gdpo_concision_weight: float = 0.05,
+    gdpo_safety_weight: float = 0.05,
     num_steps: int = 250,
     log_every: int = 1,
     eval_every: int = 50,
@@ -984,19 +1026,49 @@ def train_rlai(
 
     use_fast_gen = torch_gen is not None
 
-    objective_name = "RLAI-GMPO" if use_gmpo else "RLAI-GRPO"
+    advantage_mode = "GDPO" if use_gdpo else "GRPO"
+    gdpo_weights = {
+        "overall": gdpo_overall_weight,
+        "reasoning_quality": gdpo_reasoning_weight,
+        "final_answer_quality": gdpo_answer_weight,
+        "instruction_following": gdpo_follow_weight,
+        "concision": gdpo_concision_weight,
+        "safety": gdpo_safety_weight,
+    }
+
+    if use_gmpo and use_gdpo:
+        objective_name = "RLAI-GMSDPO"
+    elif use_gmpo:
+        objective_name = "RLAI-GMPO"
+    elif use_gdpo:
+        objective_name = "RLAI-GDPO"
+    else:
+        objective_name = "RLAI-GRPO"
 
     print(
         f"\n── {objective_name}  {num_steps} steps  G={num_completions}  "
         f"lr={lr}  β={beta}  judge={judge_model}  train_layers={train_layers}/{n_blocks}  "
-        f"warmup={warmup_steps}"
+        f"warmup={warmup_steps}  advantage={advantage_mode}"
         f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
     )
+    if use_gdpo:
+        print(
+            "  GDPO weights: "
+            f"overall={gdpo_overall_weight:.2f}  "
+            f"reason={gdpo_reasoning_weight:.2f}  "
+            f"answer={gdpo_answer_weight:.2f}  "
+            f"follow={gdpo_follow_weight:.2f}  "
+            f"concise={gdpo_concision_weight:.2f}  "
+            f"safety={gdpo_safety_weight:.2f}\n"
+        )
 
     t0 = time.time()
     run_reward = run_loss = run_skipped = 0.0
     run_count = run_adv_abs = 0.0
     run_overall = run_reasoning = run_answer = run_follow = 0.0
+    run_concision = run_safety = 0.0
+    run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
+    run_adv_follow = run_adv_concision = run_adv_safety = 0.0
 
     for step in range(1, num_steps + 1):
         # Sync torch gen model periodically
@@ -1067,13 +1139,42 @@ def train_rlai(
         final_answer = score_info["final_answer_quality"]
         instruction_following = score_info["instruction_following"]
         concision = score_info["concision"]
+        safety = score_info["safety"]
         print(
             f"  reward={[f'{r:.2f}' for r in rewards]}  "
             f"overall={overall}  reason={reasoning}  "
-            f"answer={final_answer}  follow={instruction_following}  concise={concision}"
+            f"answer={final_answer}  follow={instruction_following}  "
+            f"concise={concision}  safety={safety}"
         )
 
-        advantages = _compute_advantages(rewards)
+        if use_gdpo:
+            advantages, component_advantages = _compute_gdpo_advantages(
+                score_info, gdpo_weights
+            )
+            overall_adv = component_advantages.get("overall", np.zeros_like(advantages))
+            reasoning_adv = component_advantages.get(
+                "reasoning_quality", np.zeros_like(advantages)
+            )
+            answer_adv = component_advantages.get(
+                "final_answer_quality", np.zeros_like(advantages)
+            )
+            follow_adv = component_advantages.get(
+                "instruction_following", np.zeros_like(advantages)
+            )
+            concision_adv = component_advantages.get(
+                "concision", np.zeros_like(advantages)
+            )
+            safety_adv = component_advantages.get("safety", np.zeros_like(advantages))
+            print(
+                f"  gdpo_adv={[f'{a:.2f}' for a in advantages]}  "
+                f"overall_adv={[f'{a:.2f}' for a in overall_adv]}  "
+                f"reason_adv={[f'{a:.2f}' for a in reasoning_adv]}  "
+                f"answer_adv={[f'{a:.2f}' for a in answer_adv]}  "
+                f"follow_adv={[f'{a:.2f}' for a in follow_adv]}"
+            )
+        else:
+            advantages = _compute_advantages(rewards)
+            component_advantages = None
         run_reward += sum(rewards)
         run_count += len(rewards)
         run_adv_abs += float(np.mean(np.abs(advantages)))
@@ -1081,6 +1182,15 @@ def train_rlai(
         run_reasoning += sum(reasoning)
         run_answer += sum(final_answer)
         run_follow += sum(instruction_following)
+        run_concision += sum(concision)
+        run_safety += sum(safety)
+        if component_advantages is not None:
+            run_adv_overall += float(np.mean(np.abs(overall_adv)))
+            run_adv_reasoning += float(np.mean(np.abs(reasoning_adv)))
+            run_adv_answer += float(np.mean(np.abs(answer_adv)))
+            run_adv_follow += float(np.mean(np.abs(follow_adv)))
+            run_adv_concision += float(np.mean(np.abs(concision_adv)))
+            run_adv_safety += float(np.mean(np.abs(safety_adv)))
 
         if np.all(advantages == 0):
             run_skipped += 1
@@ -1112,19 +1222,37 @@ def train_rlai(
             avg_reasoning = run_reasoning / max(run_count, 1.0)
             avg_answer = run_answer / max(run_count, 1.0)
             avg_follow = run_follow / max(run_count, 1.0)
+            avg_concision = run_concision / max(run_count, 1.0)
+            avg_safety = run_safety / max(run_count, 1.0)
             elapsed = time.time() - t0
             eta = elapsed / step * (num_steps - step)
-            print(
+            log_line = (
                 f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} | "
                 f"reward_avg={avg_r:.3f} | overall_avg={avg_overall:.1f} | "
                 f"reason_avg={avg_reasoning:.2f} | answer_avg={avg_answer:.2f} | "
-                f"follow_avg={avg_follow:.2f} | adv_abs={avg_adv:.3f} | "
-                f"skip={int(run_skipped)} | "
+                f"follow_avg={avg_follow:.2f} | concise_avg={avg_concision:.2f} | "
+                f"safety_avg={avg_safety:.2f} | adv_abs={avg_adv:.3f}"
+            )
+            if use_gdpo:
+                log_line += (
+                    f" | adv_overall={run_adv_overall / log_every:.3f}"
+                    f" | adv_reason={run_adv_reasoning / log_every:.3f}"
+                    f" | adv_answer={run_adv_answer / log_every:.3f}"
+                    f" | adv_follow={run_adv_follow / log_every:.3f}"
+                    f" | adv_concise={run_adv_concision / log_every:.3f}"
+                    f" | adv_safety={run_adv_safety / log_every:.3f}"
+                )
+            log_line += (
+                f" | skip={int(run_skipped)} | "
                 f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
             )
+            print(log_line)
             run_reward = run_loss = run_skipped = 0.0
             run_count = run_adv_abs = 0.0
             run_overall = run_reasoning = run_answer = run_follow = 0.0
+            run_concision = run_safety = 0.0
+            run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
+            run_adv_follow = run_adv_concision = run_adv_safety = 0.0
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
@@ -1214,11 +1342,38 @@ def main():
     p.add_argument("--judge_model", default="gpt-4.1-mini")
     p.add_argument("--judge_max_concurrent", type=int, default=8)
 
+    # GDPO
+    p.add_argument(
+        "--use-gdpo",
+        action="store_true",
+        default=True,
+        help="Use decoupled per-criterion normalization before combining advantages",
+    )
+    p.add_argument(
+        "--no-gdpo",
+        action="store_false",
+        dest="use_gdpo",
+        help="Disable GDPO and fall back to standard scalar-reward normalization",
+    )
+    p.add_argument("--gdpo_overall_weight", type=float, default=0.50)
+    p.add_argument("--gdpo_reasoning_weight", type=float, default=0.15)
+    p.add_argument("--gdpo_answer_weight", type=float, default=0.15)
+    p.add_argument("--gdpo_follow_weight", type=float, default=0.10)
+    p.add_argument("--gdpo_concision_weight", type=float, default=0.05)
+    p.add_argument("--gdpo_safety_weight", type=float, default=0.05)
+
     # GMPO
     p.add_argument(
         "--use-gmpo",
         action="store_true",
+        default=True,
         help="Use GMPO objective instead of the default GRPO objective",
+    )
+    p.add_argument(
+        "--no-gmpo",
+        action="store_false",
+        dest="use_gmpo",
+        help="Disable GMPO and use the original GRPO-style policy objective",
     )
 
     args = p.parse_args()
@@ -1248,7 +1403,7 @@ def main():
         evaluate(
             torch_gen,
             examples,
-            api_key=api_key,
+            api_key,
             judge_model=args.judge_model,
             judge_max_concurrent=args.judge_max_concurrent,
             max_examples=args.max_eval,
@@ -1271,6 +1426,7 @@ def main():
         torch_gen=torch_gen,
         sync_every=args.sync_every,
         use_gmpo=args.use_gmpo,
+        use_gdpo=args.use_gdpo,
         num_completions=args.num_completions,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -1283,6 +1439,12 @@ def main():
         llm_api_key=api_key,
         judge_model=args.judge_model,
         judge_max_concurrent=args.judge_max_concurrent,
+        gdpo_overall_weight=args.gdpo_overall_weight,
+        gdpo_reasoning_weight=args.gdpo_reasoning_weight,
+        gdpo_answer_weight=args.gdpo_answer_weight,
+        gdpo_follow_weight=args.gdpo_follow_weight,
+        gdpo_concision_weight=args.gdpo_concision_weight,
+        gdpo_safety_weight=args.gdpo_safety_weight,
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_eval=args.max_eval,

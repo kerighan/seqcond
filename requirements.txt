@@ -6,3 +6,5 @@ wandb
 datasets
 convectors
 tiktoken
+openai
+pydantic
