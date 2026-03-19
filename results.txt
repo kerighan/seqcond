@@ -1,0 +1,67 @@
+  llm=['0.30', '0.30', '0.40', '0.40', '0.40', '0.30']  binary=[0, 0, 0, 0, 0, 0]
+/content/train_grpo.py:387: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  total_loss += float(loss_i)
+  Step    1/1000 | loss=-0.0116 | llm_avg=0.350 | correct=0/6 | skip=0 | ETA 4296:37
+  llm=['0.40', '1.70', '0.40', '1.70', '0.55', '0.40']  binary=[0, 1, 0, 1, 0, 0]
+  Step    2/1000 | loss=-0.1436 | llm_avg=0.858 | correct=2/6 | skip=0 | ETA 3983:04
+  llm=['0.40', '0.68', '0.40', '0.50', '0.68', '1.70']  binary=[0, 0, 0, 0, 0, 1]
+  Step    3/1000 | loss=-0.0162 | llm_avg=0.725 | correct=1/6 | skip=0 | ETA 3747:34
+  llm=['1.70', '1.67', '1.67', '1.70', '1.70', '1.70']  binary=[1, 1, 1, 1, 1, 1]
+  Step    4/1000 | loss=-0.0364 | llm_avg=1.692 | correct=6/6 | skip=0 | ETA 3496:10
+  llm=['0.55', '1.67', '0.55', '1.67', '1.67', '1.67']  binary=[0, 1, 0, 1, 1, 1]
+  Step    5/1000 | loss=0.0077 | llm_avg=1.300 | correct=4/6 | skip=0 | ETA 4742:42
+  llm=['0.30', '0.40', '0.40', '0.40', '0.40', '0.68']  binary=[0, 0, 0, 0, 0, 0]
+  Step    6/1000 | loss=-0.0265 | llm_avg=0.429 | correct=0/6 | skip=0 | ETA 4616:12
+  llm=['0.25', '0.40', '0.25', '0.30', '0.40', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step    7/1000 | loss=-0.0638 | llm_avg=0.333 | correct=0/6 | skip=0 | ETA 4430:19
+  llm=['0.30', '0.55', '1.67', '0.40', '0.57', '0.40']  binary=[0, 0, 1, 0, 0, 0]
+  Step    8/1000 | loss=-0.0374 | llm_avg=0.650 | correct=1/6 | skip=0 | ETA 4676:45
+  llm=['0.55', '0.40', '0.40', '0.40', '0.55', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step    9/1000 | loss=-0.0023 | llm_avg=0.450 | correct=0/6 | skip=0 | ETA 4479:06
+  llm=['0.40', '1.40', '1.35', '0.60', '1.40', '1.30']  binary=[0, 1, 1, 0, 1, 1]
+  Step   10/1000 | loss=0.0265 | llm_avg=1.075 | correct=4/6 | skip=0 | ETA 4634:24
+  llm=['0.40', '0.55', '0.40', '0.40', '0.40', '0.55']  binary=[0, 0, 0, 0, 0, 0]
+  Step   11/1000 | loss=0.0098 | llm_avg=0.450 | correct=0/6 | skip=0 | ETA 4825:50
+  llm=['0.40', '1.67', '1.62', '1.67', '0.40', '1.55']  binary=[0, 1, 1, 1, 0, 1]
+  Step   12/1000 | loss=-0.0065 | llm_avg=1.221 | correct=4/6 | skip=0 | ETA 4903:46
+  llm=['0.45', '1.67', '1.50', '1.70', '0.62', '1.70']  binary=[0, 1, 1, 1, 0, 1]
+  Step   13/1000 | loss=-0.0647 | llm_avg=1.275 | correct=4/6 | skip=0 | ETA 4817:54
+  llm=['0.30', '0.45', '0.25', '0.40', '0.30', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step   14/1000 | loss=0.0590 | llm_avg=0.350 | correct=0/6 | skip=0 | ETA 5091:09
+  llm=['1.62', '1.62', '1.67', '0.60', '0.30', '1.67']  binary=[1, 1, 1, 0, 0, 1]
+  Step   15/1000 | loss=0.0155 | llm_avg=1.250 | correct=4/6 | skip=0 | ETA 5198:42
+  llm=['0.55', '0.35', '0.62', '0.40', '0.30', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step   16/1000 | loss=0.0030 | llm_avg=0.438 | correct=0/6 | skip=0 | ETA 5145:58
+  llm=['1.55', '1.62', '0.40', '1.40', '1.62', '1.40']  binary=[1, 1, 0, 1, 1, 1]
+  Step   17/1000 | loss=-0.0804 | llm_avg=1.333 | correct=5/6 | skip=0 | ETA 5438:37
+  llm=['0.50', '0.70', '0.55', '0.40', '0.30', '0.68']  binary=[0, 0, 0, 0, 0, 0]
+  Step   18/1000 | loss=-0.0380 | llm_avg=0.521 | correct=0/6 | skip=0 | ETA 5768:15
+  llm=['0.25', '0.25', '0.25', '0.30', '0.30', '0.30']  binary=[0, 0, 0, 0, 0, 0]
+  Step   19/1000 | loss=-0.0299 | llm_avg=0.275 | correct=0/6 | skip=0 | ETA 5699:49
+  llm=['0.62', '1.52', '0.62', '0.68', '0.45', '0.70']  binary=[0, 1, 0, 0, 0, 0]
+  Step   20/1000 | loss=0.0753 | llm_avg=0.767 | correct=1/6 | skip=0 | ETA 5854:13
+  llm=['1.67', '0.30', '1.70', '0.40', '0.50', '1.70']  binary=[1, 0, 1, 0, 0, 1]
+  Step   21/1000 | loss=-0.0495 | llm_avg=1.046 | correct=3/6 | skip=0 | ETA 5832:47
+  llm=['0.40', '0.30', '0.40', '0.40', '0.40', '0.30']  binary=[0, 0, 0, 0, 0, 0]
+  Step   22/1000 | loss=0.0498 | llm_avg=0.367 | correct=0/6 | skip=0 | ETA 5880:11
+  llm=['0.40', '0.68', '0.70', '0.62', '0.55', '0.70']  binary=[0, 0, 0, 0, 0, 0]
+  Step   23/1000 | loss=-0.0044 | llm_avg=0.608 | correct=0/6 | skip=0 | ETA 5805:42
+  llm=['0.30', '0.30', '0.30', '0.30', '0.30', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step   24/1000 | loss=0.0001 | llm_avg=0.317 | correct=0/6 | skip=0 | ETA 5848:12
+  llm=['0.40', '1.67', '0.30', '0.40', '0.40', '0.57']  binary=[0, 1, 0, 0, 0, 0]
+  Step   25/1000 | loss=-0.0461 | llm_avg=0.625 | correct=1/6 | skip=0 | ETA 6235:53
+  llm=['0.45', '0.40', '0.62', '0.40', '0.40', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step   26/1000 | loss=-0.0086 | llm_avg=0.446 | correct=0/6 | skip=0 | ETA 6193:18
+  llm=['0.50', '0.30', '0.40', '0.70', '0.43', '0.62']  binary=[0, 0, 0, 0, 0, 0]
+  Step   27/1000 | loss=-0.0055 | llm_avg=0.492 | correct=0/6 | skip=0 | ETA 6315:45
+  llm=['0.30', '0.40', '0.40', '0.40', '0.68', '0.55']  binary=[0, 0, 0, 0, 0, 0]
+  Step   28/1000 | loss=-0.0340 | llm_avg=0.454 | correct=0/6 | skip=0 | ETA 6255:34
+  llm=['0.62', '0.60', '0.30', '0.50', '0.60', '0.40']  binary=[0, 0, 0, 0, 0, 0]
+  Step   29/1000 | loss=0.0146 | llm_avg=0.504 | correct=0/6 | skip=0 | ETA 6209:02
+  llm=['0.30', '0.30', '0.40', '0.62', '0.50', '0.30']  binary=[0, 0, 0, 0, 0, 0]
+  Step   30/1000 | loss=-0.0489 | llm_avg=0.404 | correct=0/6 | skip=0 | ETA 6198:37
+  llm=['0.40', '0.30', '0.25', '0.30', '0.30', '0.55']  binary=[0, 0, 0, 0, 0, 0]
+  Step   31/1000 | loss=0.0121 | llm_avg=0.350 | correct=0/6 | skip=0 | ETA 6321:07
+  llm=['0.70', '0.50', '0.40', '0.55', '0.55', '0.45']  binary=[0, 0, 0, 0, 0, 0]
+  Step   32/1000 | loss=-0.0388 | llm_avg=0.525 | correct=0/6 | skip=0 | ETA 6253:57

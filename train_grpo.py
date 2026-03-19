@@ -370,7 +370,8 @@ def score_output(
     completions: List[str],
     ground_truth: str,
     api_key: str = None,
-) -> List[float]:
+    return_components: bool = False,
+):
     """Score a group of completions for one question.
 
     Returns a reward per completion:
@@ -389,16 +390,36 @@ def score_output(
     """
     FORMAT_BONUS = 0.2  # reward for using <|think_end|> separator
 
+    binary = []
+    format_bonus = []
     rewards = []
     for c in completions:
         correct = 1.0 if check_answer(c, ground_truth) else 0.0
         fmt = FORMAT_BONUS if "<|think_end|>" in c else 0.0
+        binary.append(correct)
+        format_bonus.append(fmt)
         rewards.append(correct + fmt)
 
+    llm_bonus = [0.0] * len(completions)
     if not api_key:
+        if return_components:
+            return {
+                "rewards": rewards,
+                "binary": binary,
+                "format_bonus": format_bonus,
+                "llm_bonus": llm_bonus,
+            }
         return rewards
-    bonuses = _llm_bonuses(question, completions, api_key)
-    return [r + bon for r, bon in zip(rewards, bonuses)]
+    llm_bonus = _llm_bonuses(question, completions, api_key)
+    rewards = [r + bon for r, bon in zip(rewards, llm_bonus)]
+    if return_components:
+        return {
+            "rewards": rewards,
+            "binary": binary,
+            "format_bonus": format_bonus,
+            "llm_bonus": llm_bonus,
+        }
+    return rewards
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,12 +539,16 @@ def generate_completions(
 
 def _seq_log_prob(model, input_ids, prompt_len):
     """Sum of per-token log probs for the completion portion of input_ids."""
+    return ops.sum(_seq_token_log_probs(model, input_ids, prompt_len))
+
+
+def _seq_token_log_probs(model, input_ids, prompt_len):
+    """Per-token log probs for the completion portion of input_ids."""
     logits = model(input_ids)
     log_probs = ops.log_softmax(logits, axis=-1)
     shift = log_probs[0, prompt_len - 1 : -1, :]
     targets = ops.expand_dims(ops.cast(input_ids[0, prompt_len:], "int32"), -1)
-    per_tok = ops.squeeze(ops.take_along_axis(shift, targets, axis=-1), axis=-1)
-    return ops.sum(per_tok)
+    return ops.squeeze(ops.take_along_axis(shift, targets, axis=-1), axis=-1)
 
 
 def _compute_advantages(rewards):
@@ -585,7 +610,59 @@ def grpo_step(
         kl = avg_lp - ref_lps[i]
         loss_i = (-advantages[i] * avg_lp + beta * kl) / n
         loss_i.backward()
-        total_loss += float(loss_i)
+        total_loss += float(to_numpy(loss_i))
+
+    return total_loss
+
+
+def gmpo_step(
+    model,
+    prompt_tokens: List[int],
+    completions_tokens: List[List[int]],
+    advantages: np.ndarray,
+    *,
+    clip_eps: float = 0.4,
+) -> float:
+    """Compute a GMPO-style loss using a geometric mean of token-level ratios.
+
+    This follows the log-space implementation from the GMPO paper/code sketch:
+    - compute token log-probs under an "old" snapshot (no grad)
+    - compute token log-probs under current policy (with grad)
+    - clip signed log-ratio at the token level
+    - exponentiate the mean clipped log-ratio across the completion
+    """
+    prompt_len = len(prompt_tokens)
+
+    old_token_lps = []
+    with inference_mode():
+        for comp in completions_tokens:
+            if len(comp) == 0:
+                old_token_lps.append(None)
+                continue
+            ids = np.array([prompt_tokens + comp], dtype=np.int32)
+            old_token_lps.append(_seq_token_log_probs(model, ids, prompt_len))
+
+    total_loss = 0.0
+    n = len(completions_tokens)
+    for i, comp in enumerate(completions_tokens):
+        if len(comp) == 0 or advantages[i] == 0:
+            continue
+
+        ids = np.array([prompt_tokens + comp], dtype=np.int32)
+        new_token_lps = _seq_token_log_probs(model, ids, prompt_len)
+        old_lps = old_token_lps[i]
+
+        adv = float(advantages[i])
+        sign = 1.0 if adv > 0 else -1.0
+        signed_log_ratio = sign * (new_token_lps - old_lps)
+        clipped_signed_log_ratio = ops.clip(signed_log_ratio, -clip_eps, clip_eps)
+        min_signed_log_ratio = ops.minimum(signed_log_ratio, clipped_signed_log_ratio)
+        clipped_log_ratio = sign * min_signed_log_ratio
+        seq_ratio = ops.exp(ops.mean(clipped_log_ratio))
+
+        loss_i = (-adv * seq_ratio) / n
+        loss_i.backward()
+        total_loss += float(to_numpy(loss_i))
 
     return total_loss
 
@@ -697,6 +774,7 @@ def train_grpo(
     *,
     torch_gen=None,
     sync_every: int = 20,
+    use_gmpo: bool = False,
     num_completions: int = 6,
     max_new_tokens: int = 512,
     temperature: float = 0.5,
@@ -737,8 +815,10 @@ def train_grpo(
 
     use_fast_gen = torch_gen is not None
 
+    objective_name = "GMPO" if use_gmpo else "GRPO"
+
     print(
-        f"\n── GRPO  {num_steps} steps  G={num_completions}  "
+        f"\n── {objective_name}  {num_steps} steps  G={num_completions}  "
         f"lr={lr}  β={beta}  train_layers={train_layers}/{n_blocks}  "
         f"warmup={warmup_steps}"
         f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
@@ -746,6 +826,7 @@ def train_grpo(
 
     t0 = time.time()
     run_reward = run_loss = run_correct = run_skipped = 0.0
+    run_count = run_adv_abs = 0.0
 
     for step in range(1, num_steps + 1):
         # Sync torch gen model periodically
@@ -801,16 +882,28 @@ def train_grpo(
             continue
 
         # Score
-        rewards = score_output(ex["question"], texts_f, ex["ground_truth"], llm_api_key)
-        binary = [1.0 if check_answer(t, ex["ground_truth"]) else 0.0 for t in texts_f]
+        score_info = score_output(
+            ex["question"],
+            texts_f,
+            ex["ground_truth"],
+            llm_api_key,
+            return_components=True,
+        )
+        rewards = score_info["rewards"]
+        binary = score_info["binary"]
+        llm_bonus = score_info["llm_bonus"]
         if llm_api_key:
             print(
-                f"  llm={[f'{r:.2f}' for r in rewards]}  binary={[int(b) for b in binary]}"
+                f"  reward={[f'{r:.2f}' for r in rewards]}  "
+                f"llm_bonus={[f'{b:.2f}' for b in llm_bonus]}  "
+                f"binary={[int(b) for b in binary]}"
             )
 
         advantages = _compute_advantages(rewards)
         run_reward += sum(rewards)
+        run_count += len(rewards)
         run_correct += int(sum(binary))
+        run_adv_abs += float(np.mean(np.abs(advantages)))
 
         if np.all(advantages == 0):
             run_skipped += 1
@@ -824,26 +917,30 @@ def train_grpo(
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-            # GRPO update
+            # Policy update
             optimizer.zero_grad()
-            loss = grpo_step(model, prompt_tokens, ids_f, advantages, beta=beta)
+            if use_gmpo:
+                loss = gmpo_step(model, prompt_tokens, ids_f, advantages)
+            else:
+                loss = grpo_step(model, prompt_tokens, ids_f, advantages, beta=beta)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             run_loss += loss
 
         # Log
         if step % log_every == 0:
-            n = num_completions * log_every
-            avg_r = run_reward / n
+            avg_r = run_reward / max(run_count, 1.0)
+            avg_adv = run_adv_abs / log_every
             elapsed = time.time() - t0
             eta = elapsed / step * (num_steps - step)
-            llm_str = f" llm_avg={avg_r:.3f} |" if llm_api_key else ""
             print(
-                f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} |{llm_str} "
-                f"correct={int(run_correct)}/{n} | skip={int(run_skipped)} | "
+                f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} | "
+                f"reward_avg={avg_r:.3f} | adv_abs={avg_adv:.3f} | "
+                f"correct={int(run_correct)}/{int(run_count)} | skip={int(run_skipped)} | "
                 f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
             )
             run_reward = run_loss = run_correct = run_skipped = 0.0
+            run_count = run_adv_abs = 0.0
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
@@ -864,7 +961,7 @@ def train_grpo(
         if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
             _save_and_upload_gcp(model, config, save_path, step)
 
-    print(f"\n── GRPO complete ({time.time()-t0:.0f}s) ──\n")
+    print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -918,6 +1015,13 @@ def main():
         help="OpenAI key for LLM reward (falls back to OPENAI_API_KEY env var)",
     )
 
+    # GMPO
+    p.add_argument(
+        "--use-gmpo",
+        action="store_true",
+        help="Use GMPO objective instead of the default GRPO objective",
+    )
+
     args = p.parse_args()
 
     model, config, torch_gen = load_model(args.checkpoint)
@@ -951,6 +1055,7 @@ def main():
         examples,
         torch_gen=torch_gen,
         sync_every=args.sync_every,
+        use_gmpo=args.use_gmpo,
         num_completions=args.num_completions,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
