@@ -16,6 +16,7 @@ Two functions to modify:
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import random
@@ -842,6 +843,8 @@ def grpo_step(
     advantages: np.ndarray,
     *,
     beta: float = 0.1,
+    ref_model=None,
+    grad_scale: float = 1.0,
 ) -> float:
     """Compute GRPO loss and accumulate gradients for one group of completions.
 
@@ -860,7 +863,8 @@ def grpo_step(
     """
     prompt_len = len(prompt_tokens)
 
-    # Reference log probs (no grad — current model snapshot before this step)
+    # Reference log probs (frozen initial model, or current snapshot if no ref)
+    ref = ref_model if ref_model is not None else model
     ref_lps = []
     with inference_mode():
         for comp in completions_tokens:
@@ -868,7 +872,7 @@ def grpo_step(
                 ref_lps.append(0.0)
                 continue
             ids = np.array([prompt_tokens + comp], dtype=np.int32)
-            ref_lps.append(float(_seq_log_prob(model, ids, prompt_len)) / len(comp))
+            ref_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
 
     # Policy gradient with grad accumulation
     total_loss = 0.0
@@ -881,7 +885,7 @@ def grpo_step(
         avg_lp = policy_lp / len(comp)
         kl = avg_lp - ref_lps[i]
         loss_i = (-advantages[i] * avg_lp + beta * kl) / n
-        loss_i.backward()
+        (loss_i * grad_scale).backward()
         total_loss += float(to_numpy(loss_i))
 
     return total_loss
@@ -894,6 +898,7 @@ def gmpo_step(
     advantages: np.ndarray,
     *,
     clip_eps: float = 0.4,
+    grad_scale: float = 1.0,
 ) -> float:
     """Compute a GMPO/GSPO-style loss in log-space.
 
@@ -939,7 +944,7 @@ def gmpo_step(
         seq_ratio = ops.exp(clipped_seq_log_ratio)
 
         loss_i = (-adv * seq_ratio) / n
-        loss_i.backward()
+        (loss_i * grad_scale).backward()
         total_loss += float(to_numpy(loss_i))
 
     return total_loss
@@ -1102,6 +1107,7 @@ def train_rlai(
     eval_temperature: float = 0.0,
     save_gcp_every: int = 0,
     save_path: str = None,
+    grad_accum_steps: int = 4,
     seed: int = 42,
 ):
     import torch
@@ -1130,6 +1136,14 @@ def train_rlai(
 
     use_fast_gen = torch_gen is not None
 
+    # Frozen reference model for KL penalty (anchors to initial policy)
+    ref_model = copy.deepcopy(model)
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+
     advantage_mode = "GDPO" if use_gdpo else "GRPO"
     gdpo_weights = {
         "overall": gdpo_overall_weight,
@@ -1152,7 +1166,7 @@ def train_rlai(
     print(
         f"\n── {objective_name}  {num_steps} steps  G={num_completions}  "
         f"lr={lr}  β={beta}  judge={judge_model}  train_layers={train_layers}/{n_blocks}  "
-        f"warmup={warmup_steps}  advantage={advantage_mode}"
+        f"warmup={warmup_steps}  accum={grad_accum_steps}  advantage={advantage_mode}"
         f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
     )
     if use_gdpo:
@@ -1169,6 +1183,8 @@ def train_rlai(
     t0 = time.time()
     run_reward = run_loss = run_skipped = 0.0
     run_count = run_adv_abs = 0.0
+    pending_grad_steps = 0
+    optimizer.zero_grad()
     run_overall = run_reasoning = run_answer = run_follow = 0.0
     run_concision = run_safety = 0.0
     run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
@@ -1322,15 +1338,35 @@ def train_rlai(
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-            # Policy update
-            optimizer.zero_grad()
+            # Policy update (gradients accumulate across steps)
             if use_gmpo:
-                loss = gmpo_step(model, prompt_tokens, ids_f, advantages)
+                loss = gmpo_step(
+                    model,
+                    prompt_tokens,
+                    ids_f,
+                    advantages,
+                    grad_scale=1.0 / grad_accum_steps,
+                )
             else:
-                loss = grpo_step(model, prompt_tokens, ids_f, advantages, beta=beta)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            optimizer.step()
+                loss = grpo_step(
+                    model,
+                    prompt_tokens,
+                    ids_f,
+                    advantages,
+                    beta=beta,
+                    ref_model=ref_model,
+                    grad_scale=1.0 / grad_accum_steps,
+                )
+            pending_grad_steps += 1
             run_loss += loss
+
+            if pending_grad_steps >= grad_accum_steps:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+                pending_grad_steps = 0
 
         # Log
         if step % log_every == 0:
@@ -1372,6 +1408,13 @@ def train_rlai(
             run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
             run_adv_follow = run_adv_concision = run_adv_safety = 0.0
 
+        # Flush pending gradients before eval
+        if eval_every > 0 and step % eval_every == 0 and pending_grad_steps > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            pending_grad_steps = 0
+
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
             if use_fast_gen:
@@ -1390,9 +1433,27 @@ def train_rlai(
                 gen_batch_size=gen_batch_size,
             )
 
+        # Flush pending gradients before backup
+        if (
+            save_gcp_every > 0
+            and step % save_gcp_every == 0
+            and save_path
+            and pending_grad_steps > 0
+        ):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            pending_grad_steps = 0
+
         # Periodic GCP backup
         if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
             _save_and_upload_gcp(model, config, save_path, step)
+
+    # Flush any remaining accumulated gradients
+    if pending_grad_steps > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
 
     print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
 
@@ -1442,6 +1503,12 @@ def main():
     p.add_argument("--max_eval", type=int, default=100)
     p.add_argument("--eval_num_completions", type=int, default=1)
     p.add_argument("--eval_temperature", type=float, default=0.0)
+    p.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=4,
+        help="Accumulate gradients over N steps before optimizer update",
+    )
     p.add_argument(
         "--save-gcp",
         type=int,
@@ -1570,6 +1637,7 @@ def main():
         eval_temperature=args.eval_temperature,
         save_gcp_every=args.save_gcp_every,
         save_path=save_path,
+        grad_accum_steps=args.grad_accum_steps,
     )
 
     # Save: .pkl intermediary → .pt with correct PyTorch key mapping
