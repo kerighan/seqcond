@@ -16,7 +16,6 @@ Two functions to modify:
 
 import argparse
 import asyncio
-import copy
 import json
 import os
 import random
@@ -1137,7 +1136,10 @@ def train_rlai(
     use_fast_gen = torch_gen is not None
 
     # Frozen reference model for KL penalty (anchors to initial policy)
-    ref_model = copy.deepcopy(model)
+    ref_model = build_keras_model(config)
+    ref_model(np.zeros((1, 1), dtype=np.int32))  # ensure built
+    for ref_w, src_w in zip(ref_model.weights, model.weights):
+        ref_w.assign(src_w)
     for p in ref_model.parameters():
         p.requires_grad = False
 
