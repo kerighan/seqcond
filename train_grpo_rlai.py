@@ -1229,13 +1229,10 @@ def train_rlai(
     run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
     run_adv_follow = run_adv_concision = 0.0
 
-    for step in range(1, num_steps + 1):
-        # Sync torch gen model periodically
-        if use_fast_gen and (step == 1 or step % sync_every == 0):
-            sync_keras_to_torch(model, torch_gen, config)
-            if step > 1:
-                print(f"  [sync weights → torch gen model at step {step}]")
+    if use_fast_gen:
+        sync_keras_to_torch(model, torch_gen, config)
 
+    for step in range(1, num_steps + 1):
         # Randomly unfreeze train_layers blocks (+ embedding)
         for p in model.parameters():
             p.requires_grad = False
@@ -1417,6 +1414,9 @@ def train_rlai(
                     model.parameters(), max_norm=max_grad_norm
                 )
                 optimizer.step()
+                if use_fast_gen and step % sync_every == 0:
+                    sync_keras_to_torch(model, torch_gen, config)
+                    print(f"  [sync weights → torch gen model at step {step}]")
                 optimizer.zero_grad()
                 pending_grad_steps = 0
                 print(f"  [optimizer.step | train_step={step}]")
@@ -1468,14 +1468,15 @@ def train_rlai(
         if eval_every > 0 and step % eval_every == 0 and pending_grad_steps > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            if use_fast_gen:
+                sync_keras_to_torch(model, torch_gen, config)
+                print(f"  [sync weights → torch gen model at step {step} | flush=eval]")
             optimizer.zero_grad()
             pending_grad_steps = 0
             print(f"  [optimizer.step | train_step={step} | flush=eval]")
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
-            if use_fast_gen:
-                sync_keras_to_torch(model, torch_gen, config)
             evaluate(
                 torch_gen if use_fast_gen else model,
                 examples,
@@ -1499,6 +1500,9 @@ def train_rlai(
         ):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            if use_fast_gen:
+                sync_keras_to_torch(model, torch_gen, config)
+                print(f"  [sync weights → torch gen model at step {step} | flush=save]")
             optimizer.zero_grad()
             pending_grad_steps = 0
             print(f"  [optimizer.step | train_step={step} | flush=save]")
@@ -1511,6 +1515,9 @@ def train_rlai(
     if pending_grad_steps > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
+        if use_fast_gen:
+            sync_keras_to_torch(model, torch_gen, config)
+            print(f"  [sync weights → torch gen model at step {num_steps} | flush=final]")
         optimizer.zero_grad()
         print(f"  [optimizer.step | train_step={num_steps} | flush=final]")
 
