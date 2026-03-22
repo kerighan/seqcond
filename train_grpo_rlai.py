@@ -1227,19 +1227,22 @@ def train_rlai(
     run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
     run_adv_follow = run_adv_concision = 0.0
 
-    if use_fast_gen:
-        sync_keras_to_torch(model, torch_gen, config)
-
-    for step in range(1, num_steps + 1):
-        # Randomly unfreeze train_layers blocks (+ embedding)
+    def _set_active_trainable_blocks(block_indices):
         for p in model.parameters():
             p.requires_grad = False
-        for idx in random.sample(range(n_blocks), train_layers):
+        for idx in block_indices:
             for p in model.blocks_list[idx].parameters():
                 p.requires_grad = True
         for p in model.token_embedding.parameters():
             p.requires_grad = True
 
+    active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
+    _set_active_trainable_blocks(active_block_indices)
+
+    if use_fast_gen:
+        sync_keras_to_torch(model, torch_gen, config)
+
+    for step in range(1, num_steps + 1):
         ex = random.choice(examples)
         prompt_tokens = tokenizer([ex["prompt"]])[0]
 
@@ -1412,12 +1415,14 @@ def train_rlai(
                     model.parameters(), max_norm=max_grad_norm
                 )
                 optimizer.step()
+                print(f"  [optimizer.step | train_step={step}]")
                 if use_fast_gen:
                     sync_keras_to_torch(model, torch_gen, config)
                     print(f"  [sync weights → torch gen model at step {step}]")
                 optimizer.zero_grad()
                 pending_grad_steps = 0
-                print(f"  [optimizer.step | train_step={step}]")
+                active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
+                _set_active_trainable_blocks(active_block_indices)
 
         # Log
         if step % log_every == 0:
@@ -1466,12 +1471,14 @@ def train_rlai(
         if eval_every > 0 and step % eval_every == 0 and pending_grad_steps > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            print(f"  [optimizer.step | train_step={step} | flush=eval]")
             if use_fast_gen:
                 sync_keras_to_torch(model, torch_gen, config)
                 print(f"  [sync weights → torch gen model at step {step} | flush=eval]")
             optimizer.zero_grad()
             pending_grad_steps = 0
-            print(f"  [optimizer.step | train_step={step} | flush=eval]")
+            active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
+            _set_active_trainable_blocks(active_block_indices)
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
@@ -1498,12 +1505,14 @@ def train_rlai(
         ):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            print(f"  [optimizer.step | train_step={step} | flush=save]")
             if use_fast_gen:
                 sync_keras_to_torch(model, torch_gen, config)
                 print(f"  [sync weights → torch gen model at step {step} | flush=save]")
             optimizer.zero_grad()
             pending_grad_steps = 0
-            print(f"  [optimizer.step | train_step={step} | flush=save]")
+            active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
+            _set_active_trainable_blocks(active_block_indices)
 
         # Periodic GCP backup
         if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
@@ -1513,11 +1522,11 @@ def train_rlai(
     if pending_grad_steps > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
+        print(f"  [optimizer.step | train_step={num_steps} | flush=final]")
         if use_fast_gen:
             sync_keras_to_torch(model, torch_gen, config)
             print(f"  [sync weights → torch gen model at step {num_steps} | flush=final]")
         optimizer.zero_grad()
-        print(f"  [optimizer.step | train_step={num_steps} | flush=final]")
 
     print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
 
