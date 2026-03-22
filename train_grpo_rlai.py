@@ -1099,7 +1099,6 @@ def train_rlai(
     examples,
     *,
     torch_gen=None,
-    sync_every: int = 20,
     use_gmpo: bool = False,
     use_gdpo: bool = False,
     num_completions: int = 6,
@@ -1201,8 +1200,7 @@ def train_rlai(
     print(
         f"\n── {objective_name}  {num_steps} steps  G={num_completions}  "
         f"lr={lr}  β={beta}  judge={judge_model}  train_layers={train_layers}/{n_blocks}  "
-        f"warmup={warmup_steps}  accum={grad_accum_steps}  advantage={advantage_mode}"
-        f"{'  sync_every=' + str(sync_every) if use_fast_gen else ''} ──\n"
+        f"warmup={warmup_steps}  accum={grad_accum_steps}  advantage={advantage_mode} ──\n"
     )
     if use_gdpo:
         print(
@@ -1414,7 +1412,7 @@ def train_rlai(
                     model.parameters(), max_norm=max_grad_norm
                 )
                 optimizer.step()
-                if use_fast_gen and step % sync_every == 0:
+                if use_fast_gen:
                     sync_keras_to_torch(model, torch_gen, config)
                     print(f"  [sync weights → torch gen model at step {step}]")
                 optimizer.zero_grad()
@@ -1554,12 +1552,6 @@ def main():
     p.add_argument("--gen_batch_size", type=int, default=4)
 
     # Training
-    p.add_argument(
-        "--sync_every",
-        type=int,
-        default=20,
-        help="Sync torch gen model weights every N steps (default: 20)",
-    )
     p.add_argument("--num_steps", type=int, default=250)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.04)
@@ -1698,7 +1690,6 @@ def main():
         config,
         examples,
         torch_gen=torch_gen,
-        sync_every=args.sync_every,
         use_gmpo=args.use_gmpo,
         use_gdpo=args.use_gdpo,
         num_completions=args.num_completions,
