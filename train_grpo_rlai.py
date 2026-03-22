@@ -161,7 +161,7 @@ def generate_completions_torch(
     tokenizer,
     prompt: str,
     num_completions: int = 4,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 4096,
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.95,
@@ -460,27 +460,30 @@ class RLAIJudgment(BaseModel):
     final_answer_quality: int = Field(ge=0, le=5)
     instruction_following: int = Field(ge=0, le=5)
     concision: int = Field(ge=0, le=5)
-    safety: int = Field(ge=0, le=5)
     overall_score: int = Field(ge=0, le=100)
 
 
 _LLM_SYSTEM = """\
 You are a strict evaluator for assistant responses.
-Judge the candidate response to the user instruction on five criteria:
-- reasoning_quality: soundness, coherence, and usefulness of the reasoning
-- final_answer_quality: how helpful, correct-seeming, and complete the final answer is
+Judge the candidate response to the user instruction on four criteria:
+- reasoning_quality: soundness, coherence, and usefulness of the reasoning chain
+- final_answer_quality: how helpful, correct, and complete the final answer is
 - instruction_following: how well the response follows the user's request and format
 - concision: whether the response is appropriately concise without omitting key content
-- safety: whether the response avoids harmful or reckless content
 
 Use integer scores from 0 to 5 for each criterion, where 5 is excellent.
 Then provide an overall_score from 0 to 100 reflecting holistic response quality.
-Do not use exact-answer verification. If a reference answer is provided, use it only as soft style/context guidance, not as hard ground truth.
-For mathematical or quantitative questions, if the candidate's final answer is valid/correct, assign full points (5/5) for final_answer_quality, even if the reasoning style is imperfect.
-For mathematical or quantitative questions, prioritize the correctness and usability of the final answer over stylistic preferences.
-Reward helpfulness, clear reasoning, directness, and appropriate brevity. Penalize incoherence, verbosity without substance, refusal when unnecessary, or obvious fabrication.
+
+Scoring rules:
+- Do not use exact-answer verification. If a reference answer is provided, use it only as soft style/context guidance, not as hard ground truth.
+- For mathematical or quantitative questions, if the candidate's final answer is valid/correct, assign full points (5/5) for final_answer_quality, even if the reasoning style is imperfect.
+- For mathematical or quantitative questions, prioritize the correctness and usability of the final answer over stylistic preferences.
+- Reward helpfulness, clear reasoning, directness, and appropriate brevity.
+- Penalize incoherence, verbosity without substance, refusal when unnecessary, or obvious fabrication.
+- Strongly penalise repetitive responses: if the response repeats the same phrase, sentence, or idea more than once without adding new content, reduce reasoning_quality and final_answer_quality by at least 2 points, and reduce overall_score significantly.
+
 Return a single JSON object with exactly these keys:
-reasoning_quality, final_answer_quality, instruction_following, concision, safety, overall_score.
+reasoning_quality, final_answer_quality, instruction_following, concision, overall_score.
 """
 
 
@@ -490,7 +493,6 @@ def _empty_judgment(reason: str) -> RLAIJudgment:
         final_answer_quality=0,
         instruction_following=0,
         concision=0,
-        safety=0,
         overall_score=0,
     )
 
@@ -510,17 +512,15 @@ def _parse_judgment_json(raw: str) -> RLAIJudgment:
 def _judgment_reward(judgment: RLAIJudgment) -> float:
     criterion_weights = {
         "reasoning_quality": 0.30,
-        "final_answer_quality": 0.30 * 1.33,
-        "instruction_following": 0.20,
-        "concision": 0.10,
-        "safety": 0.10,
+        "final_answer_quality": 0.50,
+        "instruction_following": 0.15,
+        "concision": 0.05,
     }
     criteria_score = (
         criterion_weights["reasoning_quality"] * judgment.reasoning_quality
         + criterion_weights["final_answer_quality"] * judgment.final_answer_quality
         + criterion_weights["instruction_following"] * judgment.instruction_following
         + criterion_weights["concision"] * judgment.concision
-        + criterion_weights["safety"] * judgment.safety
     ) / (5.0 * sum(criterion_weights.values()))
     overall_score = judgment.overall_score / 100.0
     return 0.5 * criteria_score + 0.5 * overall_score
@@ -649,7 +649,6 @@ def score_output(
             "final_answer_quality": [j.final_answer_quality for j in judgments],
             "instruction_following": [j.instruction_following for j in judgments],
             "concision": [j.concision for j in judgments],
-            "safety": [j.safety for j in judgments],
         }
     return rewards
 
@@ -783,11 +782,42 @@ def _seq_token_log_probs(model, input_ids, prompt_len):
     return ops.squeeze(ops.take_along_axis(shift, targets, axis=-1), axis=-1)
 
 
-def _compute_advantages(rewards):
-    """Group-relative advantages: (r - mean) / (std + eps)."""
+def _compute_entropy(model, input_ids, prompt_len: int) -> float:
+    """Mean entropy (nats) of the policy's next-token distribution over the completion."""
+    logits = model(input_ids)
+    log_probs = ops.log_softmax(logits, axis=-1)
+    shift = log_probs[0, prompt_len - 1 : -1, :]
+    probs = ops.exp(shift)
+    entropy_per_token = -ops.sum(probs * shift, axis=-1)
+    return float(to_numpy(ops.mean(entropy_per_token)))
+
+
+def _overlong_penalty(comp_len: int, max_new_tokens: int, cache_tokens: int) -> float:
+    """Soft penalty for completions approaching the generation length budget.
+
+    Returns 0.0 if comp_len < max_new_tokens - cache_tokens,
+    linearly ramps to -1.0 as comp_len approaches max_new_tokens,
+    and returns -1.0 if comp_len >= max_new_tokens.
+    """
+    if cache_tokens <= 0:
+        return 0.0
+    cache_tokens = min(cache_tokens, max_new_tokens)
+    threshold = max_new_tokens - cache_tokens
+    if comp_len < threshold:
+        return 0.0
+    if comp_len >= max_new_tokens:
+        return -1.0
+    return -(comp_len - threshold) / cache_tokens
+
+
+def _compute_advantages(rewards, normalize_std: bool = True):
+    """Group-relative advantages: (r - mean) / (std + eps), or just (r - mean) with normalize_std=False (Dr. GRPO)."""
     r = np.array(rewards, dtype=np.float32)
+    centered = r - r.mean()
+    if not normalize_std:
+        return centered
     std = r.std()
-    return np.zeros_like(r) if std < 1e-8 else (r - r.mean()) / std
+    return np.zeros_like(r) if std < 1e-8 else centered / std
 
 
 def _filter_group_by_total_length(
@@ -812,13 +842,13 @@ def _filter_group_by_total_length(
     return kept_texts, kept_tokens, skipped
 
 
-def _compute_gdpo_advantages(score_info, weights):
+def _compute_gdpo_advantages(score_info, weights, normalize_std: bool = True):
     component_advantages = {}
     active_weights = {name: weight for name, weight in weights.items() if weight != 0.0}
     scale = float(sum(abs(weight) for weight in active_weights.values()))
     combined = None
     for name, weight in active_weights.items():
-        adv = _compute_advantages(score_info[name])
+        adv = _compute_advantages(score_info[name], normalize_std=normalize_std)
         component_advantages[name] = adv
         scaled_weight = weight / scale if scale > 0.0 else 0.0
         combined = (
@@ -847,43 +877,42 @@ def grpo_step(
 ) -> float:
     """Compute GRPO loss and accumulate gradients for one group of completions.
 
+    Uses token-level loss normalization (DAPO / Dr. GRPO): the loss is divided
+    by the total number of tokens across all completions in the group, giving
+    each token equal weight regardless of sequence length.
+
     For each completion i with non-zero advantage:
-        loss_i = -advantage_i * avg_log_prob_i  +  β * KL(π || π_ref)
-
-    where KL is approximated as (log π - log π_ref) per token, averaged.
-
-    Returns total accumulated loss (float, for logging only).
-
-    Modify this function to experiment with the RL algorithm, e.g.:
-        - remove KL penalty (set beta=0 or delete the kl term)
-        - use clipped surrogate (PPO-style): clip advantage * ratio
-        - weight by completion length
-        - add entropy bonus
+        loss_i = -advantage_i * sum_log_prob_i  +  β * KL(π || π_ref) * len(comp_i)
+    Total loss is divided by total_tokens (sum of all completion lengths).
     """
     prompt_len = len(prompt_tokens)
+    total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
+    if total_tokens == 0:
+        return 0.0
 
     # Reference log probs (frozen initial model, or current snapshot if no ref)
     ref = ref_model if ref_model is not None else model
-    ref_lps = []
+    ref_avg_lps = []
     with inference_mode():
         for comp in completions_tokens:
             if len(comp) == 0:
-                ref_lps.append(0.0)
+                ref_avg_lps.append(0.0)
                 continue
             ids = np.array([prompt_tokens + comp], dtype=np.int32)
-            ref_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
+            ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
 
-    # Policy gradient with grad accumulation
+    # Policy gradient with token-level normalization
     total_loss = 0.0
-    n = len(completions_tokens)
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0:
             continue
         ids = np.array([prompt_tokens + comp], dtype=np.int32)
-        policy_lp = _seq_log_prob(model, ids, prompt_len)
+        policy_lp = _seq_log_prob(model, ids, prompt_len)  # sum over tokens
         avg_lp = policy_lp / len(comp)
-        kl = avg_lp - ref_lps[i]
-        loss_i = (-advantages[i] * avg_lp + beta * kl) / n
+        kl = avg_lp - ref_avg_lps[i]
+        # Token-level normalization: weight each completion by its token count
+        token_weight = len(comp) / total_tokens
+        loss_i = (-advantages[i] * avg_lp + beta * kl) * token_weight
         (loss_i * grad_scale).backward()
         total_loss += float(to_numpy(loss_i))
 
@@ -899,16 +928,18 @@ def gmpo_step(
     clip_eps: float = 0.4,
     grad_scale: float = 1.0,
 ) -> float:
-    """Compute a GMPO/GSPO-style loss in log-space.
+    """Compute GMPO loss (true geometric-mean policy optimization).
 
-    We keep the GMPO geometric-mean sequence ratio, but apply clipping at the
-    sequence level in the GSPO spirit:
-    - compute token log-probs under an "old" snapshot (no grad)
-    - average token log-ratios across the completion (length-normalized)
-    - clip the signed sequence log-ratio once per response
-    - exponentiate back to a sequence importance ratio
+    Each token's log importance-ratio is clipped independently to [-clip_eps, +clip_eps]
+    BEFORE taking the mean (= geometric mean in linear space). This prevents outlier
+    tokens from dominating the sequence ratio, which was the bug in the previous
+    sequence-level clipping approach. Token-level normalization is used (same as
+    grpo_step) so every token contributes equally regardless of sequence length.
     """
     prompt_len = len(prompt_tokens)
+    total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
+    if total_tokens == 0:
+        return 0.0
 
     old_token_lps = []
     with inference_mode():
@@ -920,7 +951,6 @@ def gmpo_step(
             old_token_lps.append(_seq_token_log_probs(model, ids, prompt_len))
 
     total_loss = 0.0
-    n = len(completions_tokens)
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0:
             continue
@@ -930,19 +960,15 @@ def gmpo_step(
         old_lps = old_token_lps[i]
 
         adv = float(advantages[i])
-        sign = 1.0 if adv > 0 else -1.0
-        seq_log_ratio = ops.mean(new_token_lps - old_lps)
-        signed_seq_log_ratio = sign * seq_log_ratio
-        clipped_signed_seq_log_ratio = ops.clip(
-            signed_seq_log_ratio, -clip_eps, clip_eps
-        )
-        min_signed_seq_log_ratio = ops.minimum(
-            signed_seq_log_ratio, clipped_signed_seq_log_ratio
-        )
-        clipped_seq_log_ratio = sign * min_signed_seq_log_ratio
-        seq_ratio = ops.exp(clipped_seq_log_ratio)
+        # Clip each token log-ratio individually, then take geometric mean
+        token_log_ratios = new_token_lps - old_lps
+        clipped_log_ratios = ops.clip(token_log_ratios, -clip_eps, clip_eps)
+        mean_clipped_log_ratio = ops.mean(clipped_log_ratios)
+        seq_ratio = ops.exp(mean_clipped_log_ratio)
 
-        loss_i = (-adv * seq_ratio) / n
+        # Token-level normalization: weight by this completion's share of total tokens
+        token_weight = len(comp) / total_tokens
+        loss_i = (-adv * seq_ratio) * token_weight
         (loss_i * grad_scale).backward()
         total_loss += float(to_numpy(loss_i))
 
@@ -1097,7 +1123,6 @@ def train_rlai(
     gdpo_answer_weight: float = 0.15,
     gdpo_follow_weight: float = 0.10,
     gdpo_concision_weight: float = 0.05,
-    gdpo_safety_weight: float = 0.05,
     num_steps: int = 250,
     log_every: int = 1,
     eval_every: int = 50,
@@ -1108,6 +1133,8 @@ def train_rlai(
     save_path: str = None,
     grad_accum_steps: int = 4,
     seed: int = 42,
+    use_dr_grpo: bool = True,
+    overlong_cache_tokens: int = 0,
 ):
     import torch
 
@@ -1146,6 +1173,12 @@ def train_rlai(
     if grad_accum_steps < 1:
         raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
 
+    effective_overlong_cache_tokens = (
+        overlong_cache_tokens
+        if overlong_cache_tokens > 0
+        else max(64, max_new_tokens // 8)
+    )
+
     advantage_mode = "GDPO" if use_gdpo else "GRPO"
     gdpo_weights = {
         "overall": gdpo_overall_weight,
@@ -1153,7 +1186,7 @@ def train_rlai(
         "final_answer_quality": gdpo_answer_weight,
         "instruction_following": gdpo_follow_weight,
         "concision": gdpo_concision_weight,
-        "safety": gdpo_safety_weight,
+        "overlong": gdpo_concision_weight,
     }
 
     if use_gmpo and use_gdpo:
@@ -1179,18 +1212,22 @@ def train_rlai(
             f"answer={gdpo_answer_weight:.2f}  "
             f"follow={gdpo_follow_weight:.2f}  "
             f"concise={gdpo_concision_weight:.2f}  "
-            f"safety={gdpo_safety_weight:.2f}\n"
+            f"overlong={gdpo_concision_weight:.2f}  "
+            f"overlong_cache={effective_overlong_cache_tokens}\n"
         )
 
     t0 = time.time()
-    run_reward = run_loss = run_skipped = 0.0
+    run_reward = run_skipped = 0.0
     run_count = run_adv_abs = 0.0
+    run_entropy = 0.0
+    run_gen_tokens = 0.0
+    entropy_steps = 0
     pending_grad_steps = 0
     optimizer.zero_grad()
     run_overall = run_reasoning = run_answer = run_follow = 0.0
-    run_concision = run_safety = 0.0
+    run_concision = 0.0
     run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
-    run_adv_follow = run_adv_concision = run_adv_safety = 0.0
+    run_adv_follow = run_adv_concision = 0.0
 
     for step in range(1, num_steps + 1):
         # Sync torch gen model periodically
@@ -1269,23 +1306,32 @@ def train_rlai(
             judge_max_concurrent=judge_max_concurrent,
             return_components=True,
         )
-        rewards = score_info["rewards"]
+        rewards = list(score_info["rewards"])
+        overlong_penalties = []
+        for _i in range(len(ids_f)):
+            _pen = _overlong_penalty(
+                len(ids_f[_i]), max_new_tokens, effective_overlong_cache_tokens
+            )
+            overlong_penalties.append(_pen)
+            if _pen != 0.0:
+                rewards[_i] = rewards[_i] + _pen
+        score_info["rewards"] = rewards
+        score_info["overlong"] = overlong_penalties
         overall = score_info["overall"]
         reasoning = score_info["reasoning_quality"]
         final_answer = score_info["final_answer_quality"]
         instruction_following = score_info["instruction_following"]
         concision = score_info["concision"]
-        safety = score_info["safety"]
         print(
             f"  reward={[f'{r:.2f}' for r in rewards]}  "
             f"overall={overall}  reason={reasoning}  "
             f"answer={final_answer}  follow={instruction_following}  "
-            f"concise={concision}  safety={safety}"
+            f"concise={concision}"
         )
 
         if use_gdpo:
             advantages, component_advantages = _compute_gdpo_advantages(
-                score_info, gdpo_weights
+                score_info, gdpo_weights, normalize_std=not use_dr_grpo
             )
             overall_adv = component_advantages.get("overall", np.zeros_like(advantages))
             reasoning_adv = component_advantages.get(
@@ -1300,7 +1346,6 @@ def train_rlai(
             concision_adv = component_advantages.get(
                 "concision", np.zeros_like(advantages)
             )
-            safety_adv = component_advantages.get("safety", np.zeros_like(advantages))
             print(
                 f"  gdpo_adv={[f'{a:.2f}' for a in advantages]}  "
                 f"overall_adv={[f'{a:.2f}' for a in overall_adv]}  "
@@ -1309,24 +1354,30 @@ def train_rlai(
                 f"follow_adv={[f'{a:.2f}' for a in follow_adv]}"
             )
         else:
-            advantages = _compute_advantages(rewards)
+            advantages = _compute_advantages(rewards, normalize_std=not use_dr_grpo)
             component_advantages = None
         run_reward += sum(rewards)
         run_count += len(rewards)
+        run_gen_tokens += float(sum(len(c) for c in ids_f))
         run_adv_abs += float(np.mean(np.abs(advantages)))
         run_overall += sum(overall)
         run_reasoning += sum(reasoning)
         run_answer += sum(final_answer)
         run_follow += sum(instruction_following)
         run_concision += sum(concision)
-        run_safety += sum(safety)
         if component_advantages is not None:
             run_adv_overall += float(np.mean(np.abs(overall_adv)))
             run_adv_reasoning += float(np.mean(np.abs(reasoning_adv)))
             run_adv_answer += float(np.mean(np.abs(answer_adv)))
             run_adv_follow += float(np.mean(np.abs(follow_adv)))
             run_adv_concision += float(np.mean(np.abs(concision_adv)))
-            run_adv_safety += float(np.mean(np.abs(safety_adv)))
+
+        # Entropy health check (one forward pass on the first completion)
+        with inference_mode():
+            if ids_f:
+                _ent_ids = np.array([prompt_tokens + ids_f[0]], dtype=np.int32)
+                run_entropy += _compute_entropy(model, _ent_ids, len(prompt_tokens))
+                entropy_steps += 1
 
         if np.all(advantages == 0):
             run_skipped += 1
@@ -1360,7 +1411,6 @@ def train_rlai(
                     grad_scale=1.0 / grad_accum_steps,
                 )
             pending_grad_steps += 1
-            run_loss += loss
 
             if pending_grad_steps >= grad_accum_steps:
                 torch.nn.utils.clip_grad_norm_(
@@ -1369,25 +1419,27 @@ def train_rlai(
                 optimizer.step()
                 optimizer.zero_grad()
                 pending_grad_steps = 0
+                print(f"  [optimizer.step | train_step={step}]")
 
         # Log
         if step % log_every == 0:
             avg_r = run_reward / max(run_count, 1.0)
-            avg_adv = run_adv_abs / log_every
+            avg_adv = run_adv_abs / max(log_every, 1)
+            avg_entropy = run_entropy / max(entropy_steps, 1)
+            avg_gen_len = run_gen_tokens / max(run_count, 1.0)
             avg_overall = run_overall / max(run_count, 1.0)
             avg_reasoning = run_reasoning / max(run_count, 1.0)
             avg_answer = run_answer / max(run_count, 1.0)
             avg_follow = run_follow / max(run_count, 1.0)
             avg_concision = run_concision / max(run_count, 1.0)
-            avg_safety = run_safety / max(run_count, 1.0)
             elapsed = time.time() - t0
             eta = elapsed / step * (num_steps - step)
             log_line = (
-                f"  Step {step:4d}/{num_steps} | loss={run_loss:.4f} | "
+                f"  Step {step:4d}/{num_steps} | "
                 f"reward_avg={avg_r:.3f} | overall_avg={avg_overall:.1f} | "
                 f"reason_avg={avg_reasoning:.2f} | answer_avg={avg_answer:.2f} | "
                 f"follow_avg={avg_follow:.2f} | concise_avg={avg_concision:.2f} | "
-                f"safety_avg={avg_safety:.2f} | adv_abs={avg_adv:.3f}"
+                f"adv_abs={avg_adv:.3f} | entropy={avg_entropy:.3f} | gen_len={avg_gen_len:.1f}"
             )
             if use_gdpo:
                 log_line += (
@@ -1396,19 +1448,21 @@ def train_rlai(
                     f" | adv_answer={run_adv_answer / log_every:.3f}"
                     f" | adv_follow={run_adv_follow / log_every:.3f}"
                     f" | adv_concise={run_adv_concision / log_every:.3f}"
-                    f" | adv_safety={run_adv_safety / log_every:.3f}"
                 )
             log_line += (
                 f" | skip={int(run_skipped)} | "
                 f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
             )
             print(log_line)
-            run_reward = run_loss = run_skipped = 0.0
+            run_reward = run_skipped = 0.0
             run_count = run_adv_abs = 0.0
+            run_entropy = 0.0
+            run_gen_tokens = 0.0
+            entropy_steps = 0
             run_overall = run_reasoning = run_answer = run_follow = 0.0
-            run_concision = run_safety = 0.0
+            run_concision = 0.0
             run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
-            run_adv_follow = run_adv_concision = run_adv_safety = 0.0
+            run_adv_follow = run_adv_concision = 0.0
 
         # Flush pending gradients before eval
         if eval_every > 0 and step % eval_every == 0 and pending_grad_steps > 0:
@@ -1416,6 +1470,7 @@ def train_rlai(
             optimizer.step()
             optimizer.zero_grad()
             pending_grad_steps = 0
+            print(f"  [optimizer.step | train_step={step} | flush=eval]")
 
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
@@ -1446,6 +1501,7 @@ def train_rlai(
             optimizer.step()
             optimizer.zero_grad()
             pending_grad_steps = 0
+            print(f"  [optimizer.step | train_step={step} | flush=save]")
 
         # Periodic GCP backup
         if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
@@ -1456,6 +1512,7 @@ def train_rlai(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         optimizer.zero_grad()
+        print(f"  [optimizer.step | train_step={num_steps} | flush=final]")
 
     print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
 
@@ -1484,9 +1541,9 @@ def main():
 
     # Generation
     p.add_argument("--num_completions", type=int, default=6)
-    p.add_argument("--max_new_tokens", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.5)
-    p.add_argument("--rep_penalty", type=float, default=1.1)
+    p.add_argument("--max_new_tokens", type=int, default=3000)
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--rep_penalty", type=float, default=1.)
     p.add_argument("--gen_batch_size", type=int, default=4)
 
     # Training
@@ -1497,7 +1554,7 @@ def main():
         help="Sync torch gen model weights every N steps (default: 20)",
     )
     p.add_argument("--num_steps", type=int, default=250)
-    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.04)
     p.add_argument("--train_layers", type=int, default=3)
     p.add_argument("--optimizer", default="adamw", choices=["sgd", "adamw"])
@@ -1547,7 +1604,6 @@ def main():
     p.add_argument("--gdpo_answer_weight", type=float, default=0.15)
     p.add_argument("--gdpo_follow_weight", type=float, default=0.10)
     p.add_argument("--gdpo_concision_weight", type=float, default=0.05)
-    p.add_argument("--gdpo_safety_weight", type=float, default=0.05)
 
     # GMPO
     p.add_argument(
@@ -1561,6 +1617,30 @@ def main():
         action="store_false",
         dest="use_gmpo",
         help="Disable GMPO and use the original GRPO-style policy objective",
+    )
+
+    # Dr. GRPO
+    p.add_argument(
+        "--use-dr-grpo",
+        action="store_true",
+        default=True,
+        dest="use_dr_grpo",
+        help="Remove std from advantage denominator (Dr. GRPO) to fix difficulty bias",
+    )
+    p.add_argument(
+        "--no-dr-grpo",
+        action="store_false",
+        dest="use_dr_grpo",
+        help="Use standard (r - mean) / std advantage normalization",
+    )
+
+    # Overlong penalty
+    p.add_argument(
+        "--overlong_cache_tokens",
+        type=int,
+        default=0,
+        help="Soft penalty ramp length (tokens) before max_new_tokens. "
+        "If 0, uses an automatic value of max(64, max_new_tokens // 8).",
     )
 
     args = p.parse_args()
@@ -1631,7 +1711,6 @@ def main():
         gdpo_answer_weight=args.gdpo_answer_weight,
         gdpo_follow_weight=args.gdpo_follow_weight,
         gdpo_concision_weight=args.gdpo_concision_weight,
-        gdpo_safety_weight=args.gdpo_safety_weight,
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_eval=args.max_eval,
@@ -1640,6 +1719,8 @@ def main():
         save_gcp_every=args.save_gcp_every,
         save_path=save_path,
         grad_accum_steps=args.grad_accum_steps,
+        use_dr_grpo=args.use_dr_grpo,
+        overlong_cache_tokens=args.overlong_cache_tokens,
     )
 
     # Save: .pkl intermediary → .pt with correct PyTorch key mapping
