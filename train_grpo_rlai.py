@@ -1222,6 +1222,7 @@ def train_rlai(
     entropy_steps = 0
     pending_grad_steps = 0
     optimizer.zero_grad()
+    run_skipped_mastered = 0.0
     run_overall = run_reasoning = run_answer = run_follow = 0.0
     run_concision = 0.0
     run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
@@ -1370,6 +1371,22 @@ def train_rlai(
             run_adv_follow += float(np.mean(np.abs(follow_adv)))
             run_adv_concision += float(np.mean(np.abs(concision_adv)))
 
+        mean_abs_adv = float(np.mean(np.abs(advantages)))
+        avg_overall_group = float(np.mean(overall)) if overall else 0.0
+        min_overall_group = float(min(overall)) if overall else 0.0
+        skip_mastered_group = (
+            avg_overall_group >= 95.0
+            and min_overall_group >= 90.0
+            and mean_abs_adv <= 0.25
+        )
+        if skip_mastered_group:
+            run_skipped_mastered += 1
+            print(
+                "  [skip mastered group | "
+                f"overall_avg={avg_overall_group:.1f} min_overall={min_overall_group:.1f} "
+                f"adv_abs={mean_abs_adv:.3f}]"
+            )
+
         # Entropy health check (one forward pass on the first completion)
         with inference_mode():
             if ids_f:
@@ -1377,7 +1394,7 @@ def train_rlai(
                 run_entropy += _compute_entropy(model, _ent_ids, len(prompt_tokens))
                 entropy_steps += 1
 
-        if np.all(advantages == 0):
+        if skip_mastered_group or np.all(advantages == 0):
             run_skipped += 1
         else:
             # LR warmup: linear ramp for first warmup_steps
@@ -1453,7 +1470,7 @@ def train_rlai(
                     f" | adv_concise={run_adv_concision / log_every:.3f}"
                 )
             log_line += (
-                f" | skip={int(run_skipped)} | "
+                f" | skip={int(run_skipped)} | skip_mastered={int(run_skipped_mastered)} | "
                 f"ETA {int(eta//60):02d}:{int(eta%60):02d}"
             )
             print(log_line)
@@ -1462,6 +1479,7 @@ def train_rlai(
             run_entropy = 0.0
             run_gen_tokens = 0.0
             entropy_steps = 0
+            run_skipped_mastered = 0.0
             run_overall = run_reasoning = run_answer = run_follow = 0.0
             run_concision = 0.0
             run_adv_overall = run_adv_reasoning = run_adv_answer = 0.0
