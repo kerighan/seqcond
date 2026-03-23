@@ -1073,19 +1073,27 @@ def _save_and_upload_gcp(model, config, save_path, step):
         gcs_path = f"{gcs_bucket}/{gcs_filename}"
 
         print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
-        result = subprocess.run(
+        # Try gcloud storage cp first (faster, better auth on Colab),
+        # fall back to gsutil cp
+        for cmd in [
+            ["gcloud", "storage", "cp", save_path, gcs_path],
             ["gsutil", "cp", save_path, gcs_path],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            print("✓")
-        else:
+        ]:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if result.returncode == 0:
+                print(f"✓ ({cmd[0]})")
+                break
             err = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            print(f"✗ ({err[:120]})")
+            print(f"\n    {cmd[0]} failed: {err[:500]}")
+        else:
+            print(f"  ✗ upload failed for {gcs_path}")
     except Exception as e:
-        print(f"✗ ({str(e)[:120]})")
+        print(f"✗ ({str(e)[:500]})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1134,6 +1142,7 @@ def train_rlai(
     seed: int = 42,
     use_dr_grpo: bool = True,
     overlong_cache_tokens: int = 0,
+    clip_adv: float = 0.0,
 ):
     import torch
 
@@ -1335,6 +1344,8 @@ def train_rlai(
                 advantages, component_advantages = _compute_gdpo_advantages(
                     score_info, gdpo_weights, normalize_std=not use_dr_grpo
                 )
+                if clip_adv > 0:
+                    advantages = np.clip(advantages, -clip_adv, clip_adv)
                 overall_adv = component_advantages.get(
                     "overall", np.zeros_like(advantages)
                 )
@@ -1359,6 +1370,8 @@ def train_rlai(
                 )
             else:
                 advantages = _compute_advantages(rewards, normalize_std=not use_dr_grpo)
+                if clip_adv > 0:
+                    advantages = np.clip(advantages, -clip_adv, clip_adv)
                 component_advantages = None
             run_reward += sum(rewards)
             run_count += len(rewards)
@@ -1380,8 +1393,8 @@ def train_rlai(
             avg_overall_group = float(np.mean(overall)) if overall else 0.0
             min_overall_group = float(min(overall)) if overall else 0.0
             skip_mastered_group = (
-                avg_overall_group >= 95.0
-                and min_overall_group >= 90.0
+                avg_overall_group >= 90.0
+                and min_overall_group >= 85.0
                 and mean_abs_adv <= 0.25
             )
             if skip_mastered_group:
@@ -1671,6 +1684,15 @@ def main():
         help="Use standard (r - mean) / std advantage normalization",
     )
 
+    # Advantage clipping
+    p.add_argument(
+        "--clip-adv",
+        type=float,
+        default=5.0,
+        dest="clip_adv",
+        help="Clip advantages to [-x, x] after normalization (0=disabled)",
+    )
+
     # Overlong penalty
     p.add_argument(
         "--overlong_cache_tokens",
@@ -1757,6 +1779,7 @@ def main():
         grad_accum_steps=args.grad_accum_steps,
         use_dr_grpo=args.use_dr_grpo,
         overlong_cache_tokens=args.overlong_cache_tokens,
+        clip_adv=args.clip_adv,
     )
 
     # Save: .pkl intermediary → .pt with correct PyTorch key mapping
