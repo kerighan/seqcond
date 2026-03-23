@@ -1277,169 +1277,178 @@ def train_rlai(
         valid = [len(c) >= min_completion_tokens for c in ids]
         texts_f = [t for t, v in zip(texts, valid) if v]
         ids_f = [c for c, v in zip(ids, valid) if v]
-        if not texts_f:
+        step_valid = bool(texts_f)
+        if not step_valid:
             run_skipped += 1
-            continue
-        texts_f, ids_f, skipped_too_long = _filter_group_by_total_length(
-            prompt_tokens,
-            texts_f,
-            ids_f,
-            max_total_tokens,
-        )
-        if skipped_too_long:
+
+        if step_valid:
+            texts_f, ids_f, skipped_too_long = _filter_group_by_total_length(
+                prompt_tokens,
+                texts_f,
+                ids_f,
+                max_total_tokens,
+            )
+            if skipped_too_long:
+                print(
+                    f"  skipped {skipped_too_long} completions exceeding model maxlen={max_total_tokens}"
+                )
+                run_skipped += skipped_too_long
+            if not texts_f:
+                print("  skipped step: all sampled completions exceeded model maxlen")
+                step_valid = False
+
+        if step_valid:
+            # Score
+            score_info = score_output(
+                ex["instruction"],
+                texts_f,
+                llm_api_key,
+                reference_answer=ex.get("reference_answer", ""),
+                judge_model=judge_model,
+                judge_max_concurrent=judge_max_concurrent,
+                return_components=True,
+            )
+            rewards = list(score_info["rewards"])
+            overlong_penalties = []
+            for _i in range(len(ids_f)):
+                _pen = _overlong_penalty(
+                    len(ids_f[_i]), max_new_tokens, effective_overlong_cache_tokens
+                )
+                overlong_penalties.append(_pen)
+                if _pen != 0.0:
+                    rewards[_i] = rewards[_i] + _pen
+            score_info["rewards"] = rewards
+            score_info["overlong"] = overlong_penalties
+            overall = score_info["overall"]
+            reasoning = score_info["reasoning_quality"]
+            final_answer = score_info["final_answer_quality"]
+            instruction_following = score_info["instruction_following"]
+            concision = score_info["concision"]
             print(
-                f"  skipped {skipped_too_long} completions exceeding model maxlen={max_total_tokens}"
-            )
-            run_skipped += skipped_too_long
-        if not texts_f:
-            print("  skipped step: all sampled completions exceeded model maxlen")
-            continue
-
-        # Score
-        score_info = score_output(
-            ex["instruction"],
-            texts_f,
-            llm_api_key,
-            reference_answer=ex.get("reference_answer", ""),
-            judge_model=judge_model,
-            judge_max_concurrent=judge_max_concurrent,
-            return_components=True,
-        )
-        rewards = list(score_info["rewards"])
-        overlong_penalties = []
-        for _i in range(len(ids_f)):
-            _pen = _overlong_penalty(
-                len(ids_f[_i]), max_new_tokens, effective_overlong_cache_tokens
-            )
-            overlong_penalties.append(_pen)
-            if _pen != 0.0:
-                rewards[_i] = rewards[_i] + _pen
-        score_info["rewards"] = rewards
-        score_info["overlong"] = overlong_penalties
-        overall = score_info["overall"]
-        reasoning = score_info["reasoning_quality"]
-        final_answer = score_info["final_answer_quality"]
-        instruction_following = score_info["instruction_following"]
-        concision = score_info["concision"]
-        print(
-            f"  reward={[f'{r:.2f}' for r in rewards]}  "
-            f"overall={overall}  reason={reasoning}  "
-            f"answer={final_answer}  follow={instruction_following}  "
-            f"concise={concision}"
-        )
-
-        if use_gdpo:
-            advantages, component_advantages = _compute_gdpo_advantages(
-                score_info, gdpo_weights, normalize_std=not use_dr_grpo
-            )
-            overall_adv = component_advantages.get("overall", np.zeros_like(advantages))
-            reasoning_adv = component_advantages.get(
-                "reasoning_quality", np.zeros_like(advantages)
-            )
-            answer_adv = component_advantages.get(
-                "final_answer_quality", np.zeros_like(advantages)
-            )
-            follow_adv = component_advantages.get(
-                "instruction_following", np.zeros_like(advantages)
-            )
-            concision_adv = component_advantages.get(
-                "concision", np.zeros_like(advantages)
-            )
-            print(
-                f"  gdpo_adv={[f'{a:.2f}' for a in advantages]}  "
-                f"overall_adv={[f'{a:.2f}' for a in overall_adv]}  "
-                f"reason_adv={[f'{a:.2f}' for a in reasoning_adv]}  "
-                f"answer_adv={[f'{a:.2f}' for a in answer_adv]}  "
-                f"follow_adv={[f'{a:.2f}' for a in follow_adv]}"
-            )
-        else:
-            advantages = _compute_advantages(rewards, normalize_std=not use_dr_grpo)
-            component_advantages = None
-        run_reward += sum(rewards)
-        run_count += len(rewards)
-        run_gen_tokens += float(sum(len(c) for c in ids_f))
-        run_adv_abs += float(np.mean(np.abs(advantages)))
-        run_overall += sum(overall)
-        run_reasoning += sum(reasoning)
-        run_answer += sum(final_answer)
-        run_follow += sum(instruction_following)
-        run_concision += sum(concision)
-        if component_advantages is not None:
-            run_adv_overall += float(np.mean(np.abs(overall_adv)))
-            run_adv_reasoning += float(np.mean(np.abs(reasoning_adv)))
-            run_adv_answer += float(np.mean(np.abs(answer_adv)))
-            run_adv_follow += float(np.mean(np.abs(follow_adv)))
-            run_adv_concision += float(np.mean(np.abs(concision_adv)))
-
-        mean_abs_adv = float(np.mean(np.abs(advantages)))
-        avg_overall_group = float(np.mean(overall)) if overall else 0.0
-        min_overall_group = float(min(overall)) if overall else 0.0
-        skip_mastered_group = (
-            avg_overall_group >= 95.0
-            and min_overall_group >= 90.0
-            and mean_abs_adv <= 0.25
-        )
-        if skip_mastered_group:
-            run_skipped_mastered += 1
-            print(
-                "  [skip mastered group | "
-                f"overall_avg={avg_overall_group:.1f} min_overall={min_overall_group:.1f} "
-                f"adv_abs={mean_abs_adv:.3f}]"
+                f"  reward={[f'{r:.2f}' for r in rewards]}  "
+                f"overall={overall}  reason={reasoning}  "
+                f"answer={final_answer}  follow={instruction_following}  "
+                f"concise={concision}"
             )
 
-        # Entropy health check (one forward pass on the first completion)
-        with inference_mode():
-            if ids_f:
-                _ent_ids = np.array([prompt_tokens + ids_f[0]], dtype=np.int32)
-                run_entropy += _compute_entropy(model, _ent_ids, len(prompt_tokens))
-                entropy_steps += 1
-
-        if skip_mastered_group or np.all(advantages == 0):
-            run_skipped += 1
-        else:
-            # LR warmup: linear ramp for first warmup_steps
-            if warmup_steps > 0 and step <= warmup_steps:
-                scale = step / warmup_steps
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr * scale
-            elif warmup_steps > 0 and step == warmup_steps + 1:
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr
-
-            # Policy update (gradients accumulate across steps)
-            if use_gmpo:
-                loss = gmpo_step(
-                    model,
-                    prompt_tokens,
-                    ids_f,
-                    advantages,
-                    grad_scale=1.0 / grad_accum_steps,
+            if use_gdpo:
+                advantages, component_advantages = _compute_gdpo_advantages(
+                    score_info, gdpo_weights, normalize_std=not use_dr_grpo
+                )
+                overall_adv = component_advantages.get(
+                    "overall", np.zeros_like(advantages)
+                )
+                reasoning_adv = component_advantages.get(
+                    "reasoning_quality", np.zeros_like(advantages)
+                )
+                answer_adv = component_advantages.get(
+                    "final_answer_quality", np.zeros_like(advantages)
+                )
+                follow_adv = component_advantages.get(
+                    "instruction_following", np.zeros_like(advantages)
+                )
+                concision_adv = component_advantages.get(
+                    "concision", np.zeros_like(advantages)
+                )
+                print(
+                    f"  gdpo_adv={[f'{a:.2f}' for a in advantages]}  "
+                    f"overall_adv={[f'{a:.2f}' for a in overall_adv]}  "
+                    f"reason_adv={[f'{a:.2f}' for a in reasoning_adv]}  "
+                    f"answer_adv={[f'{a:.2f}' for a in answer_adv]}  "
+                    f"follow_adv={[f'{a:.2f}' for a in follow_adv]}"
                 )
             else:
-                loss = grpo_step(
-                    model,
-                    prompt_tokens,
-                    ids_f,
-                    advantages,
-                    beta=beta,
-                    ref_model=ref_model,
-                    grad_scale=1.0 / grad_accum_steps,
-                )
-            pending_grad_steps += 1
+                advantages = _compute_advantages(rewards, normalize_std=not use_dr_grpo)
+                component_advantages = None
+            run_reward += sum(rewards)
+            run_count += len(rewards)
+            run_gen_tokens += float(sum(len(c) for c in ids_f))
+            run_adv_abs += float(np.mean(np.abs(advantages)))
+            run_overall += sum(overall)
+            run_reasoning += sum(reasoning)
+            run_answer += sum(final_answer)
+            run_follow += sum(instruction_following)
+            run_concision += sum(concision)
+            if component_advantages is not None:
+                run_adv_overall += float(np.mean(np.abs(overall_adv)))
+                run_adv_reasoning += float(np.mean(np.abs(reasoning_adv)))
+                run_adv_answer += float(np.mean(np.abs(answer_adv)))
+                run_adv_follow += float(np.mean(np.abs(follow_adv)))
+                run_adv_concision += float(np.mean(np.abs(concision_adv)))
 
-            if pending_grad_steps >= grad_accum_steps:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=max_grad_norm
+            mean_abs_adv = float(np.mean(np.abs(advantages)))
+            avg_overall_group = float(np.mean(overall)) if overall else 0.0
+            min_overall_group = float(min(overall)) if overall else 0.0
+            skip_mastered_group = (
+                avg_overall_group >= 95.0
+                and min_overall_group >= 90.0
+                and mean_abs_adv <= 0.25
+            )
+            if skip_mastered_group:
+                run_skipped_mastered += 1
+                print(
+                    "  [skip mastered group | "
+                    f"overall_avg={avg_overall_group:.1f} min_overall={min_overall_group:.1f} "
+                    f"adv_abs={mean_abs_adv:.3f}]"
                 )
-                optimizer.step()
-                print(f"  [optimizer.step | train_step={step}]")
-                if use_fast_gen:
-                    sync_keras_to_torch(model, torch_gen, config)
-                    print(f"  [sync weights → torch gen model at step {step}]")
-                optimizer.zero_grad()
-                pending_grad_steps = 0
-                active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
-                _set_active_trainable_blocks(active_block_indices)
+
+            # Entropy health check (one forward pass on the first completion)
+            with inference_mode():
+                if ids_f:
+                    _ent_ids = np.array([prompt_tokens + ids_f[0]], dtype=np.int32)
+                    run_entropy += _compute_entropy(model, _ent_ids, len(prompt_tokens))
+                    entropy_steps += 1
+
+            if skip_mastered_group or np.all(advantages == 0):
+                run_skipped += 1
+            else:
+                # LR warmup: linear ramp for first warmup_steps
+                if warmup_steps > 0 and step <= warmup_steps:
+                    scale = step / warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = lr * scale
+                elif warmup_steps > 0 and step == warmup_steps + 1:
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = lr
+
+                # Policy update (gradients accumulate across steps)
+                if use_gmpo:
+                    loss = gmpo_step(
+                        model,
+                        prompt_tokens,
+                        ids_f,
+                        advantages,
+                        grad_scale=1.0 / grad_accum_steps,
+                    )
+                else:
+                    loss = grpo_step(
+                        model,
+                        prompt_tokens,
+                        ids_f,
+                        advantages,
+                        beta=beta,
+                        ref_model=ref_model,
+                        grad_scale=1.0 / grad_accum_steps,
+                    )
+                pending_grad_steps += 1
+
+                if pending_grad_steps >= grad_accum_steps:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=max_grad_norm
+                    )
+                    optimizer.step()
+                    print(f"  [optimizer.step | train_step={step}]")
+                    if use_fast_gen:
+                        sync_keras_to_torch(model, torch_gen, config)
+                        print(f"  [sync weights → torch gen model at step {step}]")
+                    optimizer.zero_grad()
+                    pending_grad_steps = 0
+                    active_block_indices = sorted(
+                        random.sample(range(n_blocks), train_layers)
+                    )
+                    _set_active_trainable_blocks(active_block_indices)
+
+        # ── Always-run section (log / eval / save) ─────────────────────
 
         # Log
         if step % log_every == 0:
@@ -1543,7 +1552,9 @@ def train_rlai(
         print(f"  [optimizer.step | train_step={num_steps} | flush=final]")
         if use_fast_gen:
             sync_keras_to_torch(model, torch_gen, config)
-            print(f"  [sync weights → torch gen model at step {num_steps} | flush=final]")
+            print(
+                f"  [sync weights → torch gen model at step {num_steps} | flush=final]"
+            )
         optimizer.zero_grad()
 
     print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
@@ -1575,7 +1586,7 @@ def main():
     p.add_argument("--num_completions", type=int, default=6)
     p.add_argument("--max_new_tokens", type=int, default=3000)
     p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--rep_penalty", type=float, default=1.)
+    p.add_argument("--rep_penalty", type=float, default=1.0)
     p.add_argument("--gen_batch_size", type=int, default=4)
 
     # Training
@@ -1757,6 +1768,10 @@ def main():
         print(f"Saved: {save_path}")
     except OSError as e:
         print(f"WARNING: could not save ({e})")
+
+    # Upload final checkpoint to GCP
+    if args.save_gcp_every > 0 and save_path:
+        _save_and_upload_gcp(model, config, save_path, step="final")
 
 
 if __name__ == "__main__":

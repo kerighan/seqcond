@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/seqcond_torch_762k.pt",
+        default="checkpoints/seqcond_lin5_rlai_step700.pt",
         # default="checkpoints/seqcond_lin5.pt",
         # default="checkpoints/seqcond_xlarge_init.pt",
         # default="checkpoints/thin_torch.pt",
