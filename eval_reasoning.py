@@ -2109,7 +2109,7 @@ def main():
     )
     # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
     parser.add_argument(
-        "--checkpoint", default="checkpoints/seqcond_lin5_rlai_step700.pt"
+        "--checkpoint", default="checkpoints/seqcond_lin5_rlai_step128.pt"
     )
     parser.add_argument(
         "--benchmark",
