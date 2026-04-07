@@ -332,7 +332,8 @@ class TorchGenerator:
                 logits = self._static_logits_dict[seq_len]
             else:
                 logits, states = self.model.step(
-                    token_tensor, states, use_triton=use_triton
+                    token_tensor, states, seq_len=len(generated),
+                    use_triton=use_triton,
                 )
 
         try:
@@ -358,15 +359,110 @@ class TorchGenerator:
         return batched
 
     @torch.no_grad()
+    def generate_group(
+        self,
+        prompt: str,
+        n: int,
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        use_synth_template: bool = False,
+        use_triton: bool = True,
+    ):
+        """Generate n completions for the same prompt in parallel.
+
+        1 prefill → tile states ×n → decode n sequences in lockstep.
+        Much more memory-efficient than generate_batch([prompt]*n) which
+        would accumulate n separate prefill states before stacking.
+
+        Returns (texts, token_ids):
+            texts:     List[str]       — n decoded completions
+            token_ids: List[List[int]] — n completion token id lists (prompt excluded)
+        """
+        if use_synth_template:
+            prompt = (
+                "<|im_start|>user\n" + prompt +
+                "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
+            )
+        tokens = self.tokenizer([prompt])[0]
+        model_maxlen = getattr(self.model, "maxlen", 4096)
+        max_new_tokens = min(max_new_tokens, model_maxlen - len(tokens) - 1)
+        if max_new_tokens <= 0:
+            return [""] * n, [[]] * n
+
+        # 1 prefill, then tile to n
+        input_ids = torch.tensor([tokens], device=self.device)
+        logits, states = self.model.prefill(input_ids)
+        logits = logits.squeeze(1).repeat(n, 1)              # (n, vocab)
+        states = [
+            tuple(s.repeat(n, *([1] * (s.ndim - 1))) for s in state)
+            for state in states
+        ]
+
+        generated  = [[] for _ in range(n)]
+        finished   = [False] * n
+        active_map = list(range(n))
+        token_buf  = torch.zeros((n, 1), dtype=torch.long, device=self.device)
+        seq_len    = len(tokens)
+
+        for _ in range(max_new_tokens):
+            B_cur = len(active_map)
+            if temperature == 0:
+                next_tokens = torch.argmax(logits, dim=-1)
+            else:
+                probs = F.softmax(logits / temperature, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+            newly_done = set()
+            for bi in range(B_cur):
+                oi  = active_map[bi]
+                tok = next_tokens[bi].item()
+                generated[oi].append(tok)
+                if tok == self.eos_token_id:
+                    finished[oi] = True
+                    newly_done.add(bi)
+                else:
+                    token_buf[bi, 0] = tok
+
+            if all(finished):
+                break
+
+            if newly_done:
+                keep = [bi for bi in range(B_cur) if bi not in newly_done]
+                if not keep:
+                    break
+                keep_idx   = torch.tensor(keep, device=self.device)
+                token_buf  = token_buf[keep_idx].contiguous()
+                states     = [tuple(s[keep_idx].contiguous() for s in st) for st in states]
+                active_map = [active_map[bi] for bi in keep]
+
+            seq_len += 1
+            logits, states = self.model.step(
+                token_buf, states, seq_len=seq_len, use_triton=use_triton,
+            )
+
+        texts, token_ids = [], []
+        for toks in generated:
+            if toks and toks[-1] == self.eos_token_id:
+                toks = toks[:-1]
+            token_ids.append(list(toks))
+            try:
+                texts.append(self.tokenizer.decode(toks))
+            except Exception:
+                texts.append("")
+        return texts, token_ids
+
+    @torch.no_grad()
     def generate_batch(
         self,
         prompts: List[str],
         max_new_tokens: int = 100,
         temperature: float = 0.0,
+        repetition_penalty: float = 1.0,
         use_synth_template: bool = True,
         max_thinking_tokens: Optional[int] = None,
         output_constraints: Optional[List[str]] = None,
         use_triton: bool = True,
+        return_token_ids: bool = False,
     ) -> List[str]:
         """Generate completions for a batch of prompts in parallel.
 
@@ -462,115 +558,150 @@ class TorchGenerator:
         constraint_pos = [-1] * B
         # Which constraints are still viable for each sample
         constraint_viable = [None] * B
-        token_tensor = torch.zeros((B, 1), dtype=torch.long, device=self.device)
+        current_seq_len = max(prompt_lens[i] for i in active_indices)
+        # active_map[bi] = original sample index for compact batch index bi
+        active_map = [i for i in range(B) if not finished[i]]
+        # Compact states/logits upfront to exclude skipped samples
+        if len(active_map) < B:
+            keep_idx = torch.tensor(active_map, device=self.device)
+            logits = logits[keep_idx]
+            states = [
+                tuple(s[keep_idx].contiguous() for s in state)
+                for state in states
+            ]
+        token_tensor = torch.zeros((len(active_map), 1), dtype=torch.long, device=self.device)
 
         for step_idx in range(max_new_tokens):
+            B_cur = len(active_map)
+            if B_cur == 0:
+                break
+
             # Apply constraint masking before sampling
             if constraint_token_seqs is not None:
-                for i in range(B):
-                    pos = constraint_pos[i]
-                    if pos >= 0 and not finished[i]:
-                        # Mask logits: only allow tokens that are valid at this position
-                        viable = constraint_viable[i]
+                for bi in range(B_cur):
+                    oi = active_map[bi]
+                    pos = constraint_pos[oi]
+                    if pos >= 0:
+                        viable = constraint_viable[oi]
                         allowed_tokens = set()
                         for ci in viable:
                             seq = constraint_token_seqs[ci]
                             if pos < len(seq):
                                 allowed_tokens.add(seq[pos])
                         if allowed_tokens:
-                            mask = torch.full_like(logits[i], float("-inf"))
+                            mask = torch.full_like(logits[bi], float("-inf"))
                             for t in allowed_tokens:
                                 mask[t] = 0.0
-                            logits[i] = logits[i] + mask
+                            logits[bi] = logits[bi] + mask
+
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for bi in range(B_cur):
+                    oi = active_map[bi]
+                    for token_id in set(generated[oi]):
+                        if 0 <= token_id < self.model.vocab_size:
+                            logits[bi][token_id] /= repetition_penalty
 
             # Greedy or temperature sampling
             if temperature == 0:
-                next_tokens = torch.argmax(logits, dim=-1)  # (B,)
+                next_tokens = torch.argmax(logits, dim=-1)  # (B_cur,)
             else:
                 logits_scaled = logits / temperature
                 probs = F.softmax(logits_scaled, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
             # Record tokens and check EOS
-            for i in range(B):
-                if not finished[i]:
-                    tok = next_tokens[i].item()
+            newly_done = set()
+            for bi in range(B_cur):
+                oi = active_map[bi]
+                tok = next_tokens[bi].item()
 
-                    # Track thinking state
-                    if tok == self.think_end_id:
-                        in_thinking[i] = False
-                        # Activate constraint forcing on the next token
-                        if constraint_token_seqs is not None and constraint_pos[i] < 0:
-                            constraint_pos[i] = 0
-                            constraint_viable[i] = list(
-                                range(len(constraint_token_seqs))
-                            )
-                    elif tok == self.think_start_id:
-                        in_thinking[i] = True
-                        thinking_counts[i] = 0
+                # Track thinking state
+                if tok == self.think_end_id:
+                    in_thinking[oi] = False
+                    if constraint_token_seqs is not None and constraint_pos[oi] < 0:
+                        constraint_pos[oi] = 0
+                        constraint_viable[oi] = list(
+                            range(len(constraint_token_seqs))
+                        )
+                elif tok == self.think_start_id:
+                    in_thinking[oi] = True
+                    thinking_counts[oi] = 0
 
-                    if in_thinking[i]:
-                        thinking_counts[i] += 1
+                if in_thinking[oi]:
+                    thinking_counts[oi] += 1
 
-                    # Inject <|think_end|> if thinking budget exhausted
-                    if (
-                        per_sample_max_thinking[i] is not None
-                        and in_thinking[i]
-                        and thinking_counts[i] >= per_sample_max_thinking[i]
-                        and not think_end_injected[i]
+                # Inject <|think_end|> if thinking budget exhausted
+                if (
+                    per_sample_max_thinking[oi] is not None
+                    and in_thinking[oi]
+                    and thinking_counts[oi] >= per_sample_max_thinking[oi]
+                    and not think_end_injected[oi]
+                ):
+                    tok = self.think_end_id
+                    next_tokens[bi] = tok
+                    in_thinking[oi] = False
+                    think_end_injected[oi] = True
+                    if constraint_token_seqs is not None and constraint_pos[oi] < 0:
+                        constraint_pos[oi] = 0
+                        constraint_viable[oi] = list(
+                            range(len(constraint_token_seqs))
+                        )
+
+                # Advance constraint state
+                if constraint_pos[oi] >= 0 and tok != self.think_end_id:
+                    pos = constraint_pos[oi]
+                    constraint_viable[oi] = [
+                        ci
+                        for ci in constraint_viable[oi]
+                        if pos < len(constraint_token_seqs[ci])
+                        and constraint_token_seqs[ci][pos] == tok
+                    ]
+                    constraint_pos[oi] = pos + 1
+                    if not constraint_viable[oi] or all(
+                        constraint_pos[oi] >= len(constraint_token_seqs[ci])
+                        for ci in constraint_viable[oi]
                     ):
-                        tok = self.think_end_id
-                        next_tokens[i] = tok
-                        in_thinking[i] = False
-                        think_end_injected[i] = True
-                        # Activate constraint forcing on the next token
-                        if constraint_token_seqs is not None and constraint_pos[i] < 0:
-                            constraint_pos[i] = 0
-                            constraint_viable[i] = list(
-                                range(len(constraint_token_seqs))
-                            )
+                        constraint_pos[oi] = -1
 
-                    # Advance constraint state
-                    if constraint_pos[i] >= 0 and tok != self.think_end_id:
-                        # Narrow viable set based on emitted token
-                        pos = constraint_pos[i]
-                        constraint_viable[i] = [
-                            ci
-                            for ci in constraint_viable[i]
-                            if pos < len(constraint_token_seqs[ci])
-                            and constraint_token_seqs[ci][pos] == tok
-                        ]
-                        constraint_pos[i] = pos + 1
-                        # Check if any constraint is fully emitted
-                        if not constraint_viable[i] or all(
-                            constraint_pos[i] >= len(constraint_token_seqs[ci])
-                            for ci in constraint_viable[i]
-                        ):
-                            constraint_pos[i] = -1  # done, resume free generation
-
-                    generated[i].append(tok)
-                    if tok == self.eos_token_id:
-                        finished[i] = True
+                generated[oi].append(tok)
+                if tok == self.eos_token_id:
+                    finished[oi] = True
+                    newly_done.add(bi)
+                else:
+                    token_tensor[bi, 0] = tok
 
             if all(finished):
                 break
 
-            # For finished samples, feed EOS to keep states in sync
-            next_tokens[torch.tensor(finished, device=self.device)] = self.eos_token_id
-            token_tensor[:, 0] = next_tokens
+            # Compact batch: remove finished samples
+            if newly_done:
+                keep = [bi for bi in range(B_cur) if bi not in newly_done]
+                if not keep:
+                    break
+                keep_idx = torch.tensor(keep, device=self.device)
+                token_tensor = token_tensor[keep_idx].contiguous()
+                states = [
+                    tuple(s[keep_idx].contiguous() for s in state)
+                    for state in states
+                ]
+                active_map = [active_map[bi] for bi in keep]
 
+            current_seq_len += 1
             logits, states = self.model.step(
-                token_tensor, states, use_triton=use_triton
+                token_tensor, states, seq_len=current_seq_len, use_triton=use_triton
             )
 
         # Decode each sample's generated tokens (strip trailing EOS)
         results = []
+        all_token_ids = []
         for i in range(B):
             toks = generated[i]
             if toks and toks[-1] == self.eos_token_id:
                 toks = toks[:-1]
+            all_token_ids.append(list(toks))
             try:
                 results.append(self.tokenizer.decode(toks))
             except Exception:
                 results.append("")
-        return results
+        return (results, all_token_ids) if return_token_ids else results

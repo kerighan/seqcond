@@ -359,19 +359,19 @@ class SeqCondAttention(nn.Module):
         # Use Triton kernels if requested and available
         if use_triton and TRITON_AVAILABLE and seqcond_step_triton is not None:
             out_re, out_im = seqcond_step_triton(
-                k_val.contiguous(),
-                s_raw.contiguous(),
-                q_re.squeeze(2).contiguous(),
-                q_im.squeeze(2).contiguous(),
+                k_val,
+                s_raw,
+                q_re.squeeze(2),
+                q_im.squeeze(2),
                 re_acc,
                 im_acc,
                 den_acc,
-                theta.contiguous(),
-                w_int.contiguous(),
+                theta,
+                w_int,
                 self.phase_scale,
                 self.score_scale,
                 self.score_bias,
-                log_time_weight.contiguous(),
+                log_time_weight,
             )
             out_complex = torch.cat([out_re, out_im], dim=-1)
         else:

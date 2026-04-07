@@ -321,7 +321,7 @@ class SeqCondAttention(layers.Layer):
         out_normed = gated_rmsnorm(out_flat, gate, self.gated_norm_weight)
         out_complex = ops.reshape(out_normed, (B, L, K, 2 * H))
 
-        y_raw = ops.einsum("blkf,kfn->blkn", out_complex, self.W_readout)
+        y_raw = ops.einsum("blkf,kfn->blkn", out_complex, ops.cast(self.W_readout, out_complex.dtype))
         y_val, y_gate = ops.split(y_raw, 2, axis=-1)
         y_act = y_val * ops.sigmoid(y_gate)
 
@@ -476,7 +476,7 @@ class SeqCondAttention(layers.Layer):
         out_complex = ops.reshape(out_normed, (B, self.K, 2 * self.H))
 
         # W_readout + SwiGLU
-        y_spec_raw = ops.einsum("bkf,kfn->bkn", out_complex, self.W_readout)
+        y_spec_raw = ops.einsum("bkf,kfn->bkn", out_complex, ops.cast(self.W_readout, out_complex.dtype))
         y_val, y_gate = ops.split(y_spec_raw, 2, axis=-1)
         y_act = y_val * ops.sigmoid(y_gate)
 

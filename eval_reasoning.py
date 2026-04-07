@@ -81,6 +81,7 @@ def _generate_for_batch(
     batch_size,
     max_new_tokens=512,
     temperature=0.0,
+    repetition_penalty=1.0,
     use_triton=False,
     use_cuda_graph=False,
     max_thinking_tokens=None,
@@ -100,6 +101,7 @@ def _generate_for_batch(
                 use_triton=use_triton,
                 use_cuda_graph=use_cuda_graph,
                 max_thinking_tokens=max_thinking_tokens,
+                repetition_penalty=repetition_penalty,
                 **kwargs,
             )
             outputs.append(output)
@@ -110,6 +112,7 @@ def _generate_for_batch(
             prompts,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            repetition_penalty=repetition_penalty,
             max_thinking_tokens=max_thinking_tokens,
             output_constraints=output_constraints,
         )
@@ -254,6 +257,8 @@ def evaluate_winogrande(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on Winogrande using batched generative reasoning."""
     correct = 0
@@ -312,10 +317,11 @@ def evaluate_winogrande(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
@@ -323,7 +329,8 @@ def evaluate_winogrande(
             outputs = gen.generate_batch(
                 prompts,
                 max_new_tokens=max_new_tokens,
-                temperature=0.0,
+                temperature=temperature,
+                # repetition_penalty=repetition_penalty,
                 max_thinking_tokens=max_thinking_tokens,
                 output_constraints=output_constraints,
             )
@@ -388,6 +395,8 @@ def evaluate_gpqa(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on GPQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -456,10 +465,11 @@ def evaluate_gpqa(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
@@ -467,7 +477,8 @@ def evaluate_gpqa(
             outputs = gen.generate_batch(
                 prompts,
                 max_new_tokens=max_new_tokens,
-                temperature=0.0,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
                 max_thinking_tokens=max_thinking_tokens,
                 output_constraints=output_constraints,
             )
@@ -530,6 +541,8 @@ def evaluate_openbookqa(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on OpenBookQA using batched generative reasoning (4-choice)."""
     correct = 0
@@ -603,21 +616,33 @@ def evaluate_openbookqa(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
-            # Use generate_batch() for larger batches
-            outputs = gen.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                max_thinking_tokens=max_thinking_tokens,
-                output_constraints=output_constraints,
-            )
+            try:
+                # Use generate_batch() for larger batches
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
+            except:
+                # Fallback without repetition_penalty if model doesn't support it
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -692,6 +717,8 @@ def evaluate_commonsenseqa(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on CommonsenseQA using batched generative reasoning (5-choice)."""
     correct = 0
@@ -755,21 +782,33 @@ def evaluate_commonsenseqa(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
             # Use generate_batch() for larger batches
-            outputs = gen.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                max_thinking_tokens=max_thinking_tokens,
-                output_constraints=output_constraints,
-            )
+            try:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
+            except:
+                # Fallback without repetition_penalty if model doesn't support it
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
 
         for i, (output, (prompt, choices, correct_letter)) in enumerate(
             zip(outputs, metadata)
@@ -840,6 +879,8 @@ def evaluate_mmlu(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on MMLU using batched generative reasoning (4-choice)."""
     correct = 0
@@ -893,7 +934,8 @@ def evaluate_mmlu(
             prompts,
             batch_size,
             max_new_tokens=max_new_tokens,
-            temperature=0.0,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
             use_triton=use_triton,
             use_cuda_graph=use_cuda_graph,
             max_thinking_tokens=max_thinking_tokens,
@@ -969,6 +1011,8 @@ def evaluate_mmlupro(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on MMLU-Pro using batched generative reasoning (up to 10 choices, A-J)."""
     correct = 0
@@ -1023,7 +1067,8 @@ def evaluate_mmlupro(
             prompts,
             batch_size,
             max_new_tokens=max_new_tokens,
-            temperature=0.0,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
             use_triton=use_triton,
             use_cuda_graph=use_cuda_graph,
             max_thinking_tokens=max_thinking_tokens,
@@ -1098,6 +1143,8 @@ def evaluate_hellaswag(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on HellaSwag using batched generative reasoning (4-choice) with 5-shot examples."""
     correct = 0
@@ -1196,10 +1243,11 @@ def evaluate_hellaswag(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
@@ -1207,7 +1255,8 @@ def evaluate_hellaswag(
             outputs = gen.generate_batch(
                 prompts,
                 max_new_tokens=max_new_tokens,
-                temperature=0.0,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
                 max_thinking_tokens=max_thinking_tokens,
                 output_constraints=output_constraints,
             )
@@ -1265,6 +1314,8 @@ def evaluate_piqa(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on PIQA using batched generative reasoning (2-choice)."""
     correct = 0
@@ -1318,10 +1369,11 @@ def evaluate_piqa(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
@@ -1329,7 +1381,8 @@ def evaluate_piqa(
             outputs = gen.generate_batch(
                 prompts,
                 max_new_tokens=max_new_tokens,
-                temperature=0.0,
+                temperature=temperature,
+                # repetition_penalty=repetition_penalty,
                 max_thinking_tokens=max_thinking_tokens,
                 output_constraints=output_constraints,
             )
@@ -1398,6 +1451,8 @@ def evaluate_arc(
     output_constraints=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on ARC using batched generative reasoning (3-5 choices)."""
     correct = 0
@@ -1459,21 +1514,33 @@ def evaluate_arc(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
             # Use generate_batch() for larger batches
-            outputs = gen.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                max_thinking_tokens=max_thinking_tokens,
-                output_constraints=output_constraints,
-            )
+            try:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
+            except:
+                # Fallback without repetition_penalty if model doesn't support it
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    max_thinking_tokens=max_thinking_tokens,
+                    output_constraints=output_constraints,
+                )
 
         for i, (output, (choices, correct_letter)) in enumerate(zip(outputs, metadata)):
             idx = batch_start + i
@@ -1685,6 +1752,8 @@ def evaluate_math500(
     use_triton=False,
     use_cuda_graph=False,
     answer_last=None,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on MATH-500 using batched generative reasoning (free-form math answers)."""
     correct = 0
@@ -1728,17 +1797,19 @@ def evaluate_math500(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
             outputs = gen.generate_batch(
                 prompts,
                 max_new_tokens=max_new_tokens,
-                temperature=0.0,
+                temperature=temperature,
+                # repetition_penalty=repetition_penalty,
                 max_thinking_tokens=max_thinking_tokens,
             )
 
@@ -1794,6 +1865,8 @@ def evaluate_gsm8k(
     use_triton=False,
     use_cuda_graph=False,
     answer_last=None,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on GSM8K using batched generative reasoning (numerical answer)."""
     import re
@@ -1847,20 +1920,30 @@ def evaluate_gsm8k(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
             # Use generate_batch() for larger batches
-            outputs = gen.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                max_thinking_tokens=max_thinking_tokens,
-            )
+            try:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+            except TypeError:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
 
         for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
             idx = batch_start + i
@@ -1993,6 +2076,8 @@ def evaluate_triviaqa(
     max_thinking_tokens=None,
     use_triton=False,
     use_cuda_graph=False,
+    temperature=0.0,
+    repetition_penalty=1.0,
 ):
     """Evaluate on TriviaQA using batched generative reasoning (open-domain QA)."""
     correct = 0
@@ -2039,19 +2124,29 @@ def evaluate_triviaqa(
                     gen,
                     prompt,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.0,
+                    temperature=temperature,
                     use_triton=use_triton,
                     use_cuda_graph=use_cuda_graph,
                     max_thinking_tokens=max_thinking_tokens,
+                    repetition_penalty=repetition_penalty,
                 )
                 outputs.append(output)
         else:
-            outputs = gen.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                max_thinking_tokens=max_thinking_tokens,
-            )
+            try:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
+            except TypeError:
+                outputs = gen.generate_batch(
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    max_thinking_tokens=max_thinking_tokens,
+                )
 
         for i, (output, answer_obj) in enumerate(zip(outputs, ref_answers)):
             idx = batch_start + i
@@ -2109,7 +2204,8 @@ def main():
     )
     # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
     parser.add_argument(
-        "--checkpoint", default="checkpoints/seqcond_lin5_rlai_step128.pt"
+        "--checkpoint", default="checkpoints/graft/seqcond_lin5_rlai_step1216_graft_step0002.pt"
+        # "--checkpoint", default="checkpoints/sft/seqcond_lin5_sft_step00050.pt"
     )
     parser.add_argument(
         "--benchmark",
@@ -2127,7 +2223,7 @@ def main():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=4096,
+        default=1096,
         help="Max tokens to generate per sample (includes reasoning)",
     )
     parser.add_argument(
@@ -2180,6 +2276,8 @@ def main():
         action="store_true",
         help="Disable CUDA Graphs optimization",
     )
+    parser.add_argument("--temperature", type=float, default=0.0, help="Generation temperature (0=greedy)")
+    parser.add_argument("--rep_penalty", type=float, default=1.0, help="Repetition penalty (1.0=disabled)")
     parser.add_argument(
         "--answer_last",
         action="store_true",
@@ -2224,6 +2322,8 @@ def main():
             output_constraints=_make_constraints(2),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2247,6 +2347,8 @@ def main():
             output_constraints=_make_constraints(4),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2275,6 +2377,8 @@ def main():
             output_constraints=_make_constraints(5),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2302,6 +2406,8 @@ def main():
             output_constraints=_make_constraints(2),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"PIQA (reasoning): {accuracy:.2f}%")
@@ -2323,6 +2429,8 @@ def main():
             output_constraints=_make_constraints(4),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2353,6 +2461,8 @@ def main():
                 output_constraints=_make_constraints(4),
                 use_triton=args.use_triton,
                 use_cuda_graph=not args.no_cuda_graph,
+                temperature=args.temperature,
+                repetition_penalty=args.rep_penalty,
             )
             accuracies[subset] = accuracy
             print(f"\nARC-{subset} Final Accuracy: {accuracy:.2f}%")
@@ -2383,6 +2493,8 @@ def main():
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
             answer_last=args.answer_last,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GSM8K (reasoning): {accuracy:.2f}%")
@@ -2403,6 +2515,8 @@ def main():
             max_thinking_tokens=args.max_thinking_tokens,
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2441,12 +2555,14 @@ def main():
             output_constraints=_make_constraints(4),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"GPQA (reasoning): {accuracy:.2f}%")
     elif args.benchmark == "mmlu":
         print(f"\nLoading MMLU dataset (split={args.split})...")
-        dataset = load_dataset("cais/mmlu", "all", split=args.split)
+        dataset = load_dataset("cais/mmlu", "all", split="test")
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
         )
@@ -2462,6 +2578,8 @@ def main():
             output_constraints=_make_constraints(4),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification("Évaluation terminée", f"MMLU (reasoning): {accuracy:.2f}%")
@@ -2486,6 +2604,8 @@ def main():
             output_constraints=_make_constraints(n_choices),
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(
@@ -2508,6 +2628,8 @@ def main():
             max_thinking_tokens=args.max_thinking_tokens,
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
+            temperature=args.temperature,
+            repetition_penalty=args.rep_penalty,
         )
         print(f"\nFinal Accuracy: {accuracy:.2f}%")
         _send_notification(

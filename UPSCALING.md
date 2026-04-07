@@ -35,7 +35,7 @@ python upscale_head_aware.py \
 
 #    Avec antipodal noise (recommandé pour le training, voir section dédiée) :
 python upscale_head_aware.py \
-  --checkpoint checkpoints/seqcond_torch_640k.pt \
+  --checkpoint checkpoints/seqcond_lin5.pt \
   --target-config target_config_xlarge.json \
   --output checkpoints/seqcond_xlarge_init.pt \
   --noise-scale 0.02

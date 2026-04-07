@@ -55,7 +55,7 @@ def build_keras_model(config):
         conv_kernel_size=get_config_value(config, "conv_kernel_size", 4),
         expand_factor=get_config_value(config, "expand_factor", 1),
         out_expand_factor=get_config_value(config, "out_expand_factor", 3),
-        use_square_matrix=False,
+        use_square_matrix=True,
     )
     # Build by running a dummy forward pass
     dummy = np.ones((1, 16), dtype=np.int32)
