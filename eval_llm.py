@@ -22,6 +22,7 @@ from eval_reasoning import (
     evaluate_gsm8k,
     evaluate_triviaqa,
     evaluate_math500,
+    evaluate_mmlu,
     evaluate_mmlupro,
     _maybe_shuffle_dataset,
     _send_notification,
@@ -202,6 +203,7 @@ class HFGenerator:
         temperature: float = 0.0,
         max_thinking_tokens: int = None,
         output_constraints: str = None,
+        **kwargs,
     ) -> list[str]:
         """Generate responses for a batch of prompts.
 
@@ -417,6 +419,11 @@ def main():
         default=None,
         help="GSM8K: extract the last number in the answer instead of the first",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="GSM8K only: parse only the final answer line/segment, disabling permissive whole-response numeric fallback",
+    )
 
     args = parser.parse_args()
 
@@ -616,6 +623,7 @@ def main():
                 batch_size=args.batch_size,
                 verbose_examples=args.verbose_examples,
                 answer_last=args.answer_last,
+                strict=args.strict,
             )
             results["gsm8k"] = acc
 
@@ -631,6 +639,19 @@ def main():
                 verbose_examples=args.verbose_examples,
             )
             results["math500"] = acc
+
+        elif bench == "mmlu":
+            dataset = load_dataset("cais/mmlu", "all", split="test")
+            dataset = _maybe_shuffle_dataset(dataset, seed=42)
+            acc = evaluate_mmlu(
+                gen,
+                dataset,
+                max_samples=args.max_samples,
+                max_new_tokens=args.max_new_tokens,
+                batch_size=args.batch_size,
+                verbose_examples=args.verbose_examples,
+            )
+            results["mmlu"] = acc
 
         elif bench == "mmlupro":
             dataset = load_dataset("TIGER-Lab/MMLU-Pro", split="test")

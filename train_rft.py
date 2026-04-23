@@ -2,32 +2,42 @@
 train_rft.py — One batch: generate → score → gradient step → verify.
 
 Usage:
-    KERAS_BACKEND=torch python train_rft.py --checkpoint checkpoints/seqcond_lin5.pt --n 4 --g 16
+    python train_rft.py --checkpoint checkpoints/seqcond_lin5.pt --n 4 --g 16
 """
-import argparse, os, random, textwrap
+import argparse, copy, math, os, random, re, textwrap
+from contextlib import nullcontext
 import numpy as np
 import torch
-
-os.environ.setdefault("KERAS_BACKEND", "torch")
-import keras
-from keras import ops
+import torch.nn.functional as F
 
 from seqcond.torch.generator import TorchGenerator
-from convert_torch_to_keras import (
-    build_keras_model, convert_weights,
-)
 from train_grpo import (
     load_gsm8k, check_answer, _partial_answer_score,
+    _extract_numeric_answer,
     _compute_advantages, _repetition_penalty,
-    _seq_token_log_probs, sync_keras_to_torch,
+)
+from collect_cot import (
+    _extract_math_answer, _math_answers_equal, _extract_answer_after_thinking,
 )
 import time
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
-def load_train_test(seed=42):
-    """Load GSM8K; return (train_examples, test_examples) shuffled with seed."""
+def load_train_test(seed=42, dataset="gsm8k", local_file=None):
+    """Load train/test examples; return (train_examples, test_examples) shuffled with seed."""
+    if dataset == "local_math":
+        import json
+        with open(local_file) as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        random.shuffle(rows)
+        examples = []
+        for row in rows:
+            query = row["query"]
+            gt    = str(row.get("ground_truth", row.get("answer", "")))
+            examples.append({"prompt": query, "question": query, "ground_truth": gt})
+        split = int(len(examples) * 0.9)
+        return examples[:split], examples[split:]
     train = load_gsm8k(split="train", seed=seed)
     test  = load_gsm8k(split="test",  seed=seed)
     return train, test
@@ -35,7 +45,8 @@ def load_train_test(seed=42):
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
-def generate_groups(torch_gen: TorchGenerator, examples, G, max_tokens, temperature):
+def generate_groups(torch_gen: TorchGenerator, examples, G, max_tokens, temperature,
+                    use_synth_template=False):
     """Generate G completions for each example using TorchGenerator.generate_group.
 
     Returns list of dicts:
@@ -54,7 +65,7 @@ def generate_groups(torch_gen: TorchGenerator, examples, G, max_tokens, temperat
             n=G,
             max_new_tokens=max_tokens,
             temperature=temperature,
-            use_synth_template=False,  # prompt already formatted by load_gsm8k
+            use_synth_template=use_synth_template,
         )
         results.append({
             "example":       ex,
@@ -67,6 +78,81 @@ def generate_groups(torch_gen: TorchGenerator, examples, G, max_tokens, temperat
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
+_THINK_END_TOKEN = "<|think_end|>"
+_THINK_FORMAT_RE = re.compile(r"(?s)^(.*?)<\|think_end\|>\s*(.+?)\s*$")
+
+
+def _extract_structured_answer(text):
+    stripped = text.strip()
+    if stripped.count(_THINK_END_TOKEN) != 1:
+        return None
+    match = _THINK_FORMAT_RE.fullmatch(stripped)
+    if match is None:
+        return None
+    answer = match.group(2).strip()
+    return answer if answer else None
+
+
+def _format_reward(text):
+    if _extract_structured_answer(text) is not None:
+        return 3.0
+    return 0.5 if text.count(_THINK_END_TOKEN) == 1 else -1.0
+
+
+def _answer_reward(text, ground_truth, r_max=5.0, r_floor=0.1, sigma=0.5):
+    """Continuous Gaussian reward based on numeric distance.
+
+    - Exact match           → r_max
+    - Numeric guess found   → r_max * exp(-(log(guess/gt))² / (2σ²))
+    - No number extracted   → r_floor
+    Never negative — negatives come only from advantage mean-centering.
+    """
+    # Exact match shortcut
+    if check_answer(text, ground_truth):
+        return r_max
+
+    # Try to extract a numeric guess
+    answer = _extract_structured_answer(text)
+    if answer is not None:
+        guess_str = _extract_numeric_answer(answer, answer_last=True)
+    else:
+        guess_str = _extract_numeric_answer(text)
+
+    if guess_str is None:
+        return r_floor
+
+    try:
+        guess_val = float(guess_str)
+        true_val  = float(ground_truth)
+    except ValueError:
+        return r_floor
+
+    if true_val == 0.0:
+        # Can't compute log-ratio; use absolute distance fallback
+        dist = abs(guess_val)
+        return r_max * math.exp(-dist * dist / 2.0) if dist < 10.0 else r_floor
+
+    if guess_val == 0.0:
+        return r_floor
+
+    # Gaussian on log-ratio: symmetric (×2 and ÷2 same distance)
+    log_ratio = math.log(abs(guess_val / true_val))
+    reward = r_max * math.exp(-log_ratio * log_ratio / (2.0 * sigma * sigma))
+
+    # Sign mismatch penalty (halve reward if signs differ)
+    if (guess_val > 0) != (true_val > 0):
+        reward *= 0.5
+
+    return max(reward, r_floor)
+
+def _is_correct(text, gt, dataset="gsm8k"):
+    if dataset == "local_math":
+        answer_text = _extract_answer_after_thinking(text)
+        predicted   = _extract_math_answer(answer_text)
+        return _math_answers_equal(predicted, gt)
+    return check_answer(text, gt)
+
+
 def score_group(group, conciseness_alpha=0.05):
     """Binary reward 1/0, conciseness-scaled for correct completions.
 
@@ -74,9 +160,9 @@ def score_group(group, conciseness_alpha=0.05):
         r *= exp(-alpha * (len - mu) / sigma)
     """
     texts, comp_ids, gt = group["texts"], group["comp_ids"], group["example"]["ground_truth"]
-    binary  = [1.0 if check_answer(t, gt) else 0.0 for t in texts]
-    rewards = [b if b > 0 else _partial_answer_score(t, gt)
-               for t, b in zip(texts, binary)]
+    dataset = group["example"].get("dataset", "gsm8k")
+    binary = [1.0 if _is_correct(t, gt, dataset) else 0.0 for t in texts]
+    rewards = [_format_reward(t) + _answer_reward(t, gt) for t in texts]
 
     # Repetition penalty
     for i, ids in enumerate(comp_ids):
@@ -124,18 +210,87 @@ def select_pairs(texts, comp_ids, advantages, binary):
 
 # ── Log-prob helpers ──────────────────────────────────────────────────────────
 
-def seq_avg_logprob(model, prompt_tokens, comp_tokens):
+def _model_device(model):
+    return next(model.parameters()).device
+
+
+def _autocast_context(use_mixed_bfloat16):
+    if use_mixed_bfloat16 and torch.cuda.is_available():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def _seq_token_log_probs(model, input_ids, prompt_len, use_mixed_bfloat16=False):
+    device = _model_device(model)
+    if torch.is_tensor(input_ids):
+        ids = input_ids.to(device=device, dtype=torch.long)
+    else:
+        ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+    with _autocast_context(use_mixed_bfloat16):
+        logits = model(ids)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    shift = log_probs[0, prompt_len - 1 : -1, :]
+    targets = ids[0, prompt_len:].unsqueeze(-1)
+    return torch.gather(shift, dim=-1, index=targets).squeeze(-1)
+
+def seq_avg_logprob(model, prompt_tokens, comp_tokens, use_mixed_bfloat16=False):
     """Mean per-token log-prob for comp_tokens (no grad, purely cosmetic)."""
-    import torch
-    ids = np.array([prompt_tokens + comp_tokens], dtype=np.int32)
+    ids = torch.tensor([prompt_tokens + comp_tokens], dtype=torch.long, device=_model_device(model))
     with torch.no_grad():
-        token_lps = _seq_token_log_probs(model, ids, len(prompt_tokens))
-    return float(ops.mean(token_lps))
+        token_lps = _seq_token_log_probs(
+            model, ids, len(prompt_tokens), use_mixed_bfloat16=use_mixed_bfloat16
+        )
+    return float(torch.mean(token_lps))
+
+
+def _cache_old_policy_lps(model, scored_groups, use_mixed_bfloat16=False):
+    for g in scored_groups:
+        pt = g["prompt_tokens"]
+        old_mean_lps = {}
+        for idx, comp in enumerate(g["comp_ids"]):
+            if comp:
+                old_mean_lps[idx] = seq_avg_logprob(
+                    model, pt, comp, use_mixed_bfloat16=use_mixed_bfloat16
+                )
+        g["old_mean_lps"] = old_mean_lps
+
+
+def _set_trainable_parameters(model, target):
+    if target == "all":
+        for param in model.parameters():
+            param.requires_grad = True
+        return []
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    unfrozen_names = []
+    for idx, (btype, block) in enumerate(zip(model.block_types, model.blocks)):
+        block_name = f"block{idx:02d}"
+        if target in ("transformer", "seqcond") and btype == target:
+            for param in block.parameters():
+                param.requires_grad = True
+            unfrozen_names.append(f"{btype}:{block_name}")
+        elif target == "mlp" or target == f"{btype}-mlp":
+            if btype == "transformer":
+                for sub in (block.norm2, block.ff_in, block.ff_out):
+                    for param in sub.parameters():
+                        param.requires_grad = True
+                unfrozen_names.append(f"transformer-mlp:{block_name}")
+            elif btype == "seqcond":
+                attn = block.attn
+                for sub in (attn.gate_proj, attn.out_proj, attn.gated_norm):
+                    for param in sub.parameters():
+                        param.requires_grad = True
+                attn.W_readout.requires_grad = True
+                unfrozen_names.append(f"seqcond-mlp:{block_name}")
+    return unfrozen_names
 
 
 # ── Gradient step ─────────────────────────────────────────────────────────────
 
-def _apply_gradient_softmax(keras_model, optimizer, scored_groups, softmax_temp=1.0):
+def _apply_gradient_softmax(model, optimizer, scored_groups, softmax_temp=1.0,
+                            use_mixed_bfloat16=False):
     """SFT pur avec pondération softmax des rewards par groupe.
 
     Pour un groupe avec k positifs et rewards [r1, …, rk] :
@@ -178,14 +333,18 @@ def _apply_gradient_softmax(keras_model, optimizer, scored_groups, softmax_temp=
 
     total_tokens = sum(len(it["ids"]) - it["pl"] for it in all_items)
     total_loss_val = 0.0
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
     for item in all_items:
-        ids       = np.array([item["ids"]], dtype=np.int32)
-        token_lps = _seq_token_log_probs(keras_model, ids, item["pl"])
-        loss      = (-item["w"] * ops.sum(token_lps) / total_tokens) / total_n_pos
+        ids = torch.tensor([item["ids"]], dtype=torch.long, device=_model_device(model))
+        token_lps = _seq_token_log_probs(
+            model, ids, item["pl"], use_mixed_bfloat16=use_mixed_bfloat16
+        )
+        loss = (-item["w"] * torch.sum(token_lps) / total_tokens) / total_n_pos
         loss.backward()
         total_loss_val += float(loss.detach())
 
-    trainable = [p for p in keras_model.parameters() if p.requires_grad]
+    trainable = [p for p in model.parameters() if p.requires_grad]
     gnorm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0))
     optimizer.step()
     return total_loss_val, gnorm
@@ -193,51 +352,117 @@ def _apply_gradient_softmax(keras_model, optimizer, scored_groups, softmax_temp=
 
 _GRAD_CHECKED = False  # print grad diagnostics once
 
-def _apply_gradient(keras_model, optimizer, scored_groups, micro_batch_size=2,
-                    neg_weight=1.0, kl_beta=0.0, ref_model=None):
-    global _GRAD_CHECKED
-    optimizer.zero_grad()
 
-    all_items = []
+def _apply_gradient(model, optimizer, scored_groups, micro_batch_size=2,
+                    neg_scale=0.0, kl_beta=0.0, ref_model=None,
+                    use_mixed_bfloat16=False, on_policy=False):
+    global _GRAD_CHECKED
+    model.train()
+    trainable = [p for p in model.parameters() if p.requires_grad]
+
+    # Build item lists
+    pos_items, neg_items = [], []
     for g in scored_groups:
         pt = g["prompt_tokens"]
-        for (_, _, comp, adv) in g["positives"] + g["negatives"]:
-            if comp:
-                w = neg_weight if adv < 0 else 1.0
-                all_items.append({"ids": pt + comp, "pl": len(pt), "adv": adv, "w": w})
+        for (idx, _, comp, adv) in g["positives"] + g["negatives"]:
+            if not comp:
+                continue
+            if adv > 0:
+                pos_items.append({
+                    "ids": pt + comp,
+                    "pl": len(pt),
+                    "adv": adv,
+                    "old_mean_lp": g.get("old_mean_lps", {}).get(idx),
+                })
+            elif adv < 0 and neg_scale > 0:
+                neg_items.append({
+                    "ids": pt + comp,
+                    "pl": len(pt),
+                    "adv": adv,
+                    "old_mean_lp": g.get("old_mean_lps", {}).get(idx),
+                })
 
-    # keep only items that contribute gradient (w > 0)
-    all_items = [it for it in all_items if it["w"] > 0]
+    if not pos_items and not neg_items:
+        return 0.0, 0.0, 0.0
+
+    all_items = pos_items + neg_items
     n_terms = len(all_items)
-    if n_terms == 0: return 0.0, 0.0
-
     total_tokens = sum(len(it["ids"]) - it["pl"] for it in all_items)
+
+    # ── Estimate effective neg weight via micro-batched grad norms ────────────
+    # neg_scale controls negative gradient magnitude relative to positive:
+    #   neg_scale=0   → no negatives
+    #   neg_scale=0.5 → neg gradient = 50% of pos gradient magnitude
+    #   neg_scale=1.0 → balanced (equal magnitudes)
+    effective_neg_weight = 0.0
+    if neg_scale > 0 and neg_items and pos_items:
+        def _micro_grad_norm(items):
+            optimizer.zero_grad(set_to_none=True)
+            for i in range(0, len(items), micro_batch_size):
+                batch_loss = None
+                for item in items[i : i + micro_batch_size]:
+                    ids = torch.tensor([item["ids"]], dtype=torch.long,
+                                       device=_model_device(model))
+                    token_lps = _seq_token_log_probs(
+                        model, ids, item["pl"], use_mixed_bfloat16=use_mixed_bfloat16
+                    )
+                    token_weight = (len(item["ids"]) - item["pl"]) / total_tokens
+                    if on_policy and item["old_mean_lp"] is not None:
+                        cur_mean_lp = torch.mean(token_lps)
+                        log_ratio = cur_mean_lp - float(item["old_mean_lp"])
+                        ratio = torch.exp(torch.clamp(log_ratio, min=-0.2, max=0.2))
+                        item_loss = (-item["adv"] * ratio * token_weight) / n_terms
+                    else:
+                        item_loss = (-item["adv"] * torch.sum(token_lps) / total_tokens) / n_terms
+                    batch_loss = item_loss if batch_loss is None else batch_loss + item_loss
+                if batch_loss is not None:
+                    batch_loss.backward()
+            return sum(float(torch.sum(p.grad.float() ** 2))
+                       for p in trainable if p.grad is not None) ** 0.5
+
+        pos_norm = _micro_grad_norm(pos_items)
+        neg_norm = _micro_grad_norm(neg_items)
+        if pos_norm > 1e-8 and neg_norm > 1e-8:
+            effective_neg_weight = min(neg_scale * pos_norm / neg_norm, 10.0)
+
+    # ── Final gradient step ───────────────────────────────────────────────────
+    optimizer.zero_grad(set_to_none=True)
     total_loss_val = 0.0
     for i in range(0, n_terms, micro_batch_size):
-        batch_loss = 0
+        batch_loss = None
         for item in all_items[i : i + micro_batch_size]:
-            ids = np.array([item["ids"]], dtype=np.int32)
-            token_lps = _seq_token_log_probs(keras_model, ids, item["pl"])
-            w = item["w"]
-            loss = (-w * item["adv"] * ops.sum(token_lps) / total_tokens) / n_terms
+            ids = torch.tensor([item["ids"]], dtype=torch.long, device=_model_device(model))
+            token_lps = _seq_token_log_probs(
+                model, ids, item["pl"], use_mixed_bfloat16=use_mixed_bfloat16
+            )
+            w = effective_neg_weight if item["adv"] < 0 else 1.0
+            if on_policy and item["old_mean_lp"] is not None:
+                cur_mean_lp = torch.mean(token_lps)
+                token_weight = (len(item["ids"]) - item["pl"]) / total_tokens
+                log_ratio = cur_mean_lp - float(item["old_mean_lp"])
+                ratio = torch.exp(torch.clamp(log_ratio, min=-0.2, max=0.2))
+                loss = (-w * item["adv"] * ratio * token_weight) / n_terms
+            else:
+                loss = (-w * item["adv"] * torch.sum(token_lps) / total_tokens) / n_terms
             if kl_beta > 0 and ref_model is not None:
                 with torch.no_grad():
-                    ref_lps = _seq_token_log_probs(ref_model, ids, item["pl"])
-                kl = ops.sum(token_lps.float() - ref_lps.float()) / total_tokens
-                loss = loss + (kl_beta * kl) / n_terms
-            batch_loss     += loss
+                    ref_lps = _seq_token_log_probs(
+                        ref_model, ids, item["pl"], use_mixed_bfloat16=use_mixed_bfloat16
+                    )
+                log_ratio = token_lps.float() - ref_lps.float()
+                kl_k3 = torch.exp(log_ratio) - 1 - log_ratio  # K3: unbiased, low-variance
+                loss = loss + (kl_beta * torch.sum(kl_k3) / total_tokens) / n_terms
+            batch_loss = loss if batch_loss is None else batch_loss + loss
             total_loss_val += float(loss.detach())
-        if isinstance(batch_loss, int):
-            continue
-        batch_loss.backward()
+        if batch_loss is not None:
+            batch_loss.backward()
 
-    trainable = [p for p in keras_model.parameters() if p.requires_grad]
     gnorm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0))
 
     if not _GRAD_CHECKED:
         _GRAD_CHECKED = True
-        has_grad  = [p for p in trainable if p.grad is not None]
-        nonzero   = [p for p in has_grad  if p.grad.abs().max() > 0]
+        has_grad = [p for p in trainable if p.grad is not None]
+        nonzero  = [p for p in has_grad  if p.grad.abs().max() > 0]
         ref_param = trainable[0]
         val_before = ref_param.data.float().mean().item()
         optimizer.step()
@@ -247,43 +472,10 @@ def _apply_gradient(keras_model, optimizer, scored_groups, micro_batch_size=2,
     else:
         optimizer.step()
 
-    return total_loss_val, gnorm
+    return total_loss_val, gnorm, effective_neg_weight
 
 
-def _apply_gradient_2(keras_model, optimizer, scored_groups, **kwargs):
-    """One gradient update on all groups.  CE is recomputed from scratch.
-
-    Loss: mean_over_sequences( -adv * mean_token_log_prob )
-      adv > 0 → SFT (push log-prob up)
-      adv < 0 → gradient ascent (push log-prob down)
-    No padding: input_ids = prompt + comp (exact length); only completion
-    tokens contribute via the _seq_token_log_probs slice.
-    """
-    optimizer.zero_grad()
-    all_comps = []
-    for g in scored_groups:
-        pt = g["prompt_tokens"]
-        pl = len(pt)
-        for (_, _, comp, adv) in g["positives"] + g["negatives"]:
-            if not comp:
-                continue
-            all_comps.append({"ids": pt + comp, "pl": pl, "adv": adv})
-    n_terms = len(all_comps)
-    if n_terms == 0:
-        optimizer.step()
-        return 0.0
-    total_tokens = sum(len(it["ids"]) - it["pl"] for it in all_comps)
-    total_loss = torch.tensor(0.0, device="cuda")
-    for item in all_comps:
-        ids = np.array([item["ids"]], dtype=np.int32)
-        token_lps = _seq_token_log_probs(keras_model, ids, item["pl"])
-        total_loss += (-item["adv"] * ops.sum(token_lps) / total_tokens)
-    (total_loss / n_terms).backward()
-    optimizer.step()
-    return float(total_loss / n_terms)
-
-
-def gradient_step(keras_model, optimizer, scored_groups, sft_steps=1):
+def gradient_step(model, optimizer, scored_groups, sft_steps=1, use_mixed_bfloat16=False):
     """sft_steps gradient updates on the same pos/neg batch.
 
     CE is recomputed at each step (no IS ratio — fine for on-policy SFT).
@@ -295,11 +487,15 @@ def gradient_step(keras_model, optimizer, scored_groups, sft_steps=1):
     for gi, g in enumerate(scored_groups):
         pt = g["prompt_tokens"]
         for (idx, _, comp, _) in g["positives"] + g["negatives"]:
-            lps_before[(gi, idx)] = seq_avg_logprob(keras_model, pt, comp)
+            lps_before[(gi, idx)] = seq_avg_logprob(
+                model, pt, comp, use_mixed_bfloat16=use_mixed_bfloat16
+            )
 
     # ── sft_steps gradient updates ────────────────────────────────────────────
     for step_i in range(sft_steps):
-        loss = _apply_gradient(keras_model, optimizer, scored_groups)
+        loss = _apply_gradient(
+            model, optimizer, scored_groups, use_mixed_bfloat16=use_mixed_bfloat16
+        )
         print(f"  gradient step {step_i + 1}/{sft_steps}  loss={loss:.4f}")
 
     # ── After log-probs (no grad) ─────────────────────────────────────────────
@@ -307,7 +503,9 @@ def gradient_step(keras_model, optimizer, scored_groups, sft_steps=1):
     for gi, g in enumerate(scored_groups):
         pt = g["prompt_tokens"]
         for (idx, _, comp, _) in g["positives"] + g["negatives"]:
-            lps_after[(gi, idx)] = seq_avg_logprob(keras_model, pt, comp)
+            lps_after[(gi, idx)] = seq_avg_logprob(
+                model, pt, comp, use_mixed_bfloat16=use_mixed_bfloat16
+            )
 
     return lps_before, lps_after
 
@@ -454,42 +652,77 @@ def save_checkpoint(torch_gen: TorchGenerator, config, save_path, step):
     print(f"  checkpoint saved → {save_path}  ({len(sd)} tensors, step={step})")
 
 
+def refresh_reference_model(ref_model, model):
+    sd = {k: v for k, v in model.state_dict().items()
+          if not any(k.endswith(sfx) for sfx in _CACHE_PREFIXES)}
+    ref_model.load_state_dict(sd, strict=False)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
+
+def snapshot_training_state(model, optimizer):
+    model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
+    for state in optimizer_state.get("state", {}).values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.detach().cpu().clone()
+    return model_state, optimizer_state
+
+
+def _optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def restore_training_state(model, optimizer, model_state, optimizer_state):
+    model.load_state_dict(model_state)
+    optimizer.load_state_dict(optimizer_state)
+    _optimizer_to_device(optimizer, _model_device(model))
+
+
+def eval_score_sigma(score, n_examples):
+    if n_examples <= 0:
+        return 0.0
+    p = min(max(float(score), 0.0), 1.0)
+    return float(np.sqrt(max(p * (1.0 - p), 0.0) / n_examples))
+
+
 # ── Eval ──────────────────────────────────────────────────────────────────────
 
-def eval_pass_at_k(torch_gen: TorchGenerator, keras_model, examples, k,
-                   max_tokens, temperature, gen_batch_size=8):
+def eval_pass_at_k(torch_gen: TorchGenerator, examples, k,
+                   max_tokens, temperature, gen_batch_size=8, use_synth_template=False):
     """pass@k via TorchGenerator.generate_batch, batching gen_batch_size prompts.
-
-    keras_model is moved to CPU before generation (free VRAM) and back after.
     """
-    keras_model.cpu()
-    torch.cuda.empty_cache()
+    model = torch_gen.model
+    was_training = model.training
+    model.eval()
 
     n_correct = 0
     prompts = [ex["prompt"] for ex in examples]
     for start in range(0, len(prompts), gen_batch_size):
         batch_prompts = prompts[start : start + gen_batch_size]
-        # k passes over the same batch of prompts
+        batch_exs     = examples[start : start + gen_batch_size]
         batch_correct = [False] * len(batch_prompts)
         for _ in range(k):
             texts = torch_gen.generate_batch(
                 batch_prompts,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
-                use_synth_template=False,
+                use_synth_template=use_synth_template,
             )
-            for j, (text, ex) in enumerate(
-                zip(texts, examples[start : start + gen_batch_size])
-            ):
-                if not batch_correct[j] and check_answer(text, ex["ground_truth"]):
+            for j, (text, ex) in enumerate(zip(texts, batch_exs)):
+                if not batch_correct[j] and _is_correct(
+                    text, ex["ground_truth"], ex.get("dataset", "gsm8k")
+                ):
                     batch_correct[j] = True
         n_correct += sum(batch_correct)
 
-    keras_model.cuda()
-    # Warm up CUDA kernels so the next training step isn't 3× slower
-    dummy = np.ones((1, 4), dtype=np.int32)
-    with torch.no_grad():
-        keras_model(dummy, training=False)
+    if was_training:
+        model.train()
     return n_correct / len(examples)
 
 
@@ -498,26 +731,37 @@ def eval_pass_at_k(torch_gen: TorchGenerator, keras_model, examples, k,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint",  default="./checkpoints/seqcond_lin5.pt")
+    p.add_argument("--dataset",      default="gsm8k", choices=["gsm8k", "local_math"],
+                   help="dataset source (gsm8k | local_math)")
+    p.add_argument("--local_file",   default=None,
+                   help="chemin JSONL local {query, ground_truth|answer} (requis pour local_math)")
     p.add_argument("--n",           type=int,   default=4,    help="prompts per step")
     p.add_argument("--g",           type=int,   default=16,   help="completions per prompt")
     p.add_argument("--temperature",      type=float, default=0.7)
     p.add_argument("--eval_temperature", type=float, default=None, help="eval temperature (default: same as --temperature)")
     p.add_argument("--max_tokens",  type=int,   default=1000)
     p.add_argument("--lr",          type=float, default=1e-5)
-    p.add_argument("--sft_steps",   type=int,   default=1,    help="gradient steps per batch")
-    p.add_argument("--neg_weight",        type=float, default=2,     help="scale factor for negative gradient ascent (1.0 = symmetric)")
+    p.add_argument("--sft_steps",        type=int,   default=1,    help="gradient steps per batch")
+    p.add_argument("--micro_batch_size", type=int,   default=24,    help="sequences per backward call (lower = less GPU memory)")
+    p.add_argument("--neg_scale",         type=float, default=0.0,   help="negative gradient magnitude relative to positive (0=off, 0.5=half, 1=balanced)")
     p.add_argument("--conciseness_alpha", type=float, default=0.02,  help="force du bonus/malus de concision (0=désactivé, 0.05=fort)")
     p.add_argument("--kl_beta",           type=float, default=0.0,   help="KL penalty weight against reference policy (0 = disabled)")
-    p.add_argument("--softmax_weighted",  action="store_true",        help="pondération softmax des rewards par groupe (remplace neg_weight)")
+    p.add_argument("--softmax_weighted",  action="store_true",        help="pondération softmax des rewards par groupe (remplace neg_scale)")
     p.add_argument("--softmax_temp",      type=float, default=1.0,   help="température du softmax (haute=uniforme, basse=winner-take-all)")
     p.add_argument("--float32",          action="store_true",        help="use float32 compute instead of mixed float16 (more stable, more memory)")
+    p.add_argument("--on_policy",        action="store_true",        help="apply an old-policy importance ratio on repeated updates over the same sampled batch")
+    p.add_argument("--refresh_kl_ref_on_best_eval", action="store_true", help="refresh the KL reference model whenever eval reaches a new best score")
+    p.add_argument("--rollback_on_eval_drop", action="store_true", help="restore the best model if eval falls too far below the best score")
+    p.add_argument("--rollback_sigma", type=float, default=2.0, help="rollback threshold in binomial sigma units below the best eval score")
+    p.add_argument("--train",             default="all",              help="all | transformer | seqcond | mlp | transformer-mlp | seqcond-mlp")
     p.add_argument("--transformer_only", action="store_true",        help="freeze seqcond blocks, train only transformer blocks")
     p.add_argument("--epochs",      type=float, default=1.0,  help="epochs over train set (float ok)")
     p.add_argument("--eval_every",  type=int,   default=20,   help="eval frequency (steps)")
     p.add_argument("--eval_n",      type=int,   default=50,  help="test examples for eval")
     p.add_argument("--eval_k",      type=int,   default=1,    help="completions per problem for pass@k")
-    p.add_argument("--eval_batch",  type=int,   default=8,    help="prompts per generation batch during eval")
+    p.add_argument("--eval_batch",  type=int,   default=30,    help="prompts per generation batch during eval")
     p.add_argument("--save_path",   type=str,   default=None, help="override default save dir (checkpoints/graft/)")
+    p.add_argument("--save_best",   action="store_true",     help="save the current best eval model to a dedicated *_best.pt checkpoint")
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--overfit_n",   type=int,   default=None, help="overfit sanity check: train+eval on the same N train examples")
     args = p.parse_args()
@@ -528,51 +772,48 @@ def main():
     if args.save_path is None:
         base = os.path.splitext(os.path.basename(args.checkpoint))[0]
         args.save_path = os.path.join("checkpoints", "graft", f"{base}_graft.pt")
+    save_base, save_ext = os.path.splitext(args.save_path)
+    best_save_path = f"{save_base}_best{save_ext}"
 
     # ── Load models ───────────────────────────────────────────────────────────
-    torch_gen  = TorchGenerator(args.checkpoint, device="cuda")
-    config     = torch_gen.config
-    state_dict = {k: v.detach().cpu().float().numpy()
-                  for k, v in torch_gen.model.state_dict().items()}
+    torch_gen = TorchGenerator(args.checkpoint, device="cuda")
+    config = torch_gen.config
+    model = torch_gen.model
+    use_mixed_bfloat16 = not args.float32
+    precision = "mixed_bfloat16 autocast" if use_mixed_bfloat16 else "float32"
+    print(f"  using native Torch model ({precision})")
 
-    if not args.float32:
-        keras.mixed_precision.set_global_policy("mixed_bfloat16")
-    keras_model = build_keras_model(config)
-    convert_weights(config, state_dict, keras_model)
-    keras_model.cuda()
+    train_target = "transformer" if args.transformer_only else args.train
 
     # ── Reference model for KL penalty (frozen, kept on CPU) ──────────────────
     ref_model = None
     if args.kl_beta > 0:
-        ref_model = build_keras_model(config)
-        convert_weights(config, state_dict, ref_model)
-        ref_model.cpu()
-        ref_model.cuda()
+        ref_model = copy.deepcopy(model).cuda().eval()
         for p in ref_model.parameters():
             p.requires_grad = False
         print(f"  KL penalty enabled  β={args.kl_beta}")
 
-    if args.transformer_only:
-        for btype, block in zip(keras_model.block_types, keras_model.blocks_list):
-            if btype != "transformer":
-                for p in block.parameters():
-                    p.requires_grad = False
-        for p in keras_model.token_embedding.parameters():
-            p.requires_grad = False
-        n_transformer = sum(1 for t in keras_model.block_types if t == "transformer")
-        n_total       = len(keras_model.block_types)
-        print(f"  trainable: transformer blocks only ({n_transformer}/{n_total} blocks, embeddings frozen)")
+    unfrozen_names = _set_trainable_parameters(model, train_target)
+    if train_target != "all":
+        print(f"  [freeze] --train {train_target}: unfroze {len(unfrozen_names)} block groups, embeddings frozen")
+        for name in unfrozen_names:
+            print(f"    ✓ {name}")
 
-    trainable_params = [p for p in keras_model.parameters() if p.requires_grad]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable_params)
-    n_total     = sum(p.numel() for p in keras_model.parameters())
+    n_total     = sum(p.numel() for p in model.parameters())
     print(f"  params: {n_trainable:,} trainable / {n_total:,} total")
     if n_trainable == 0:
-        raise RuntimeError("No trainable parameters! Keras weights may not have requires_grad=True.")
+        raise RuntimeError("No trainable parameters! Torch weights may not have requires_grad=True.")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.99))
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train, test = load_train_test(seed=args.seed)
+    if args.dataset == "local_math" and not args.local_file:
+        raise ValueError("--local_file requis pour --dataset local_math")
+    use_synth_template = (args.dataset == "local_math")
+    train, test = load_train_test(seed=args.seed, dataset=args.dataset, local_file=args.local_file)
+    for ex in train: ex.setdefault("dataset", args.dataset)
+    for ex in test:  ex.setdefault("dataset", args.dataset)
     if args.overfit_n is not None:
         train = train[:args.overfit_n]
         eval_examples = train
@@ -586,9 +827,10 @@ def main():
     n_eval_label = len(eval_examples)
     print(f"\n  Baseline eval pass@{args.eval_k} on {n_eval_label} examples …")
     score = eval_pass_at_k(
-        torch_gen, keras_model, eval_examples,
+        torch_gen, eval_examples,
         k=args.eval_k, max_tokens=args.max_tokens,
         temperature=eval_temp, gen_batch_size=args.eval_batch,
+        use_synth_template=use_synth_template,
     )
     separator("═")
     print(f"  BASELINE EVAL  pass@{args.eval_k}"
@@ -596,6 +838,10 @@ def main():
     separator("═")
     print()
     prev_eval_score = score
+    best_eval_score = score
+    best_model_state, best_optimizer_state = snapshot_training_state(model, optimizer)
+    if args.save_best:
+        save_checkpoint(torch_gen, config, best_save_path, 0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     steps_per_epoch = len(train) // args.n
@@ -623,6 +869,7 @@ def main():
         raw_groups = generate_groups(
             torch_gen, batch,
             G=args.g, max_tokens=args.max_tokens, temperature=args.temperature,
+            use_synth_template=use_synth_template,
         )
         scored_groups = []
         for g in raw_groups:
@@ -632,6 +879,7 @@ def main():
             scored_groups.append({
                 "example":       g["example"],
                 "prompt_tokens": g["prompt_tokens"],
+                "comp_ids":      g["comp_ids"],
                 "texts":         g["texts"],
                 "binary":        binary,
                 "rewards":       rewards,
@@ -639,6 +887,10 @@ def main():
                 "positives":     positives,
                 "negatives":     negatives,
             })
+        if args.on_policy and not args.softmax_weighted:
+            _cache_old_policy_lps(
+                model, scored_groups, use_mixed_bfloat16=use_mixed_bfloat16
+            )
 
         # ── Gradient step ─────────────────────────────────────────────────────
         has_signal = any(g["positives"] or g["negatives"] for g in scored_groups)
@@ -646,21 +898,27 @@ def main():
             has_signal = any(g["positives"] for g in scored_groups)
         loss = 0.0
         gnorm = 0.0
+        effective_neg_weight = args.neg_scale
         n_pos = sum(len(g["positives"]) for g in scored_groups)
         n_neg = sum(len(g["negatives"]) for g in scored_groups)
         if has_signal:
             for _ in range(args.sft_steps):
                 if args.softmax_weighted:
                     loss, gnorm = _apply_gradient_softmax(
-                        keras_model, optimizer, scored_groups,
+                        model, optimizer, scored_groups,
                         softmax_temp=args.softmax_temp,
+                        use_mixed_bfloat16=use_mixed_bfloat16,
                     )
                     continue
-                loss, gnorm = _apply_gradient(keras_model, optimizer, scored_groups,
-                                              neg_weight=args.neg_weight,
-                                              kl_beta=args.kl_beta,
-                                              ref_model=ref_model)
-            sync_keras_to_torch(keras_model, torch_gen.model, config)
+                loss, gnorm, effective_neg_weight = _apply_gradient(
+                    model, optimizer, scored_groups,
+                    micro_batch_size=args.micro_batch_size,
+                    neg_scale=args.neg_scale,
+                    kl_beta=args.kl_beta,
+                    ref_model=ref_model,
+                    use_mixed_bfloat16=use_mixed_bfloat16,
+                    on_policy=args.on_policy,
+                )
 
         # ── Per-step summary ──────────────────────────────────────────────────
         n_comp    = sum(len(g["binary"]) for g in scored_groups)
@@ -673,7 +931,7 @@ def main():
         print(f"[step {step:4d}/{total_steps}]  "
               f"solve={n_correct:{w}d}/{n_comp}({100*n_correct/n_comp:3.0f}%)  "
               f"r̄={mean_r:.4f}  n+/n-={n_pos}/{n_neg}  "
-              f"loss={loss:.5f}  gnorm={gnorm:.3f}{skip_tag}  {step_duration:.1f}s")
+              f"loss={loss:.5f}  gnorm={gnorm:.3f}  negw={effective_neg_weight:.4f}{skip_tag}  {step_duration:.1f}s")
 
         # accumulate for inter-eval summary
         _acc["n_correct"]  += n_correct
@@ -706,9 +964,10 @@ def main():
                         loss_sum=0.0, gnorm_sum=0.0, grad_steps=0, steps=0)
             print(f"\n  evaluating pass@{args.eval_k} on {n_eval_label} examples …")
             score = eval_pass_at_k(
-                torch_gen, keras_model, eval_examples,
+                torch_gen, eval_examples,
                 k=args.eval_k, max_tokens=args.max_tokens,
                 temperature=eval_temp, gen_batch_size=args.eval_batch,
+                use_synth_template=use_synth_template,
             )
             if prev_eval_score is not None:
                 d = score - prev_eval_score
@@ -719,6 +978,28 @@ def main():
             print(f"  EVAL  step={step}/{total_steps}  pass@{args.eval_k}"
                   f"  n={n_eval_label}  score={score:.4f}{tag}")
             separator("═")
+            if score > best_eval_score:
+                best_eval_score = score
+                best_model_state, best_optimizer_state = snapshot_training_state(model, optimizer)
+                if args.refresh_kl_ref_on_best_eval and ref_model is not None:
+                    refresh_reference_model(ref_model, model)
+                    print(f"  KL reference updated from best eval model  score={score:.4f}")
+                    print()
+                if args.save_best:
+                    save_checkpoint(torch_gen, config, best_save_path, step)
+            else:
+                if args.rollback_on_eval_drop:
+                    sigma = eval_score_sigma(best_eval_score, n_eval_label)
+                    rollback_threshold = best_eval_score - args.rollback_sigma * sigma
+                    if score < rollback_threshold:
+                        restore_training_state(model, optimizer, best_model_state, best_optimizer_state)
+                        if args.refresh_kl_ref_on_best_eval and ref_model is not None:
+                            refresh_reference_model(ref_model, model)
+                        print(
+                            f"  rollback triggered: score={score:.4f} < threshold={rollback_threshold:.4f} "
+                            f"(best={best_eval_score:.4f}, σ={sigma:.4f}, z={args.rollback_sigma:.2f})"
+                        )
+                        score = best_eval_score
             print()
             prev_eval_score = score
 

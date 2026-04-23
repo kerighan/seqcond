@@ -26,6 +26,7 @@ MODEL_REGISTRY = {
     "qwen3-0.6b": "Qwen/Qwen3-0.6B",
     "llama3.2-1b": "meta-llama/Llama-3.2-1B-Instruct",
     "lfm2-350m": "LiquidAI/LFM2-350M",
+    "lfm2.5-350m": "LiquidAI/LFM2.5-350M",
     "granite-350m": "ibm-granite/granite-4.0-h-350M",
     "baguettotron": "PleIAs/Baguettotron",
 }

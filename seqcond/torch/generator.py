@@ -458,6 +458,7 @@ class TorchGenerator:
         max_new_tokens: int = 100,
         temperature: float = 0.0,
         repetition_penalty: float = 1.0,
+        top_k: int = 0,
         use_synth_template: bool = True,
         max_thinking_tokens: Optional[int] = None,
         output_constraints: Optional[List[str]] = None,
@@ -607,6 +608,9 @@ class TorchGenerator:
                 next_tokens = torch.argmax(logits, dim=-1)  # (B_cur,)
             else:
                 logits_scaled = logits / temperature
+                if top_k > 0:
+                    topk_vals = torch.topk(logits_scaled, top_k, dim=-1).values[:, -1:]
+                    logits_scaled = logits_scaled.masked_fill(logits_scaled < topk_vals, float("-inf"))
                 probs = F.softmax(logits_scaled, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 

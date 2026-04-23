@@ -5,6 +5,7 @@ Unlike eval.py which uses log-probability scoring for base models,
 this script prompts the model to generate an answer (with optional
 <|think_start|>...<|think_end|> reasoning) and parses the response.
 """
+import os
 import re
 import time
 import torch
@@ -443,7 +444,7 @@ def evaluate_gpqa(
                 f"B. {choices[1]}\n"
                 f"C. {choices[2]}\n"
                 f"D. {choices[3]}\n"
-                "\nAnswer only with a letter, like 'A' or 'B'."
+                # "\nAnswer only with a letter, like 'A' or 'B'."
             )
             # Truncate prompt if too long (whole prompt, to handle long choices)
             model_maxlen = getattr(gen.model, "maxlen", 4096)
@@ -923,7 +924,7 @@ def evaluate_mmlu(
                 + "\n".join(
                     f"{chr(ord('A') + j)}. {c}" for j, c in enumerate(shuffled_choices)
                 )
-                + "\n\nAnswer with the letter only."
+                # + "\n\nAnswer with the letter only."
             )
             prompts.append(prompt)
             metadata.append((prompt, shuffled_choices, correct_letter))
@@ -1587,6 +1588,95 @@ def evaluate_arc(
     return accuracy
 
 
+_GSM8K_NUM_PATTERN = r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_GSM8K_NUM_RE = re.compile(_GSM8K_NUM_PATTERN)
+_GSM8K_ANSWER_PATTERNS = [
+    re.compile(rf"####\s*({_GSM8K_NUM_PATTERN})"),
+    re.compile(
+        rf"(?:final\s+answer|answer|solution|result|total)\s*(?:is|=|:)\s*\$?\s*({_GSM8K_NUM_PATTERN})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:therefore|thus|so)\s*(?:the\s+)?(?:answer|solution|result)?\s*(?:is|=|:)?\s*\$?\s*({_GSM8K_NUM_PATTERN})",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _normalize_numeric_string(raw):
+    value = raw.strip().replace(",", "")
+    return value.rstrip(".")
+
+
+def _numeric_search_zones(text):
+    stripped = text.strip()
+    zones = []
+    parts = stripped.split("<|think_end|>")
+    if len(parts) > 1:
+        answer_zone = parts[-1].strip()
+        if answer_zone:
+            zones.append(answer_zone)
+    if stripped and stripped not in zones:
+        zones.append(stripped)
+    return zones
+
+
+def _extract_numeric_candidates(text):
+    candidates = []
+    seen = set()
+    for zone in _numeric_search_zones(text):
+        if "\\boxed{" in zone:
+            boxed_zone = zone.split("\\boxed{")[-1].split("}", 1)[0]
+            boxed_match = _GSM8K_NUM_RE.search(boxed_zone)
+            if boxed_match is not None:
+                value = _normalize_numeric_string(boxed_match.group(0))
+                if value and value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        for pattern in _GSM8K_ANSWER_PATTERNS:
+            match = pattern.search(zone)
+            if match is not None:
+                value = _normalize_numeric_string(match.group(1))
+                if value and value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        for match in _GSM8K_NUM_RE.finditer(zone):
+            value = _normalize_numeric_string(match.group(0))
+            if value and value not in seen:
+                seen.add(value)
+                candidates.append(value)
+    return candidates
+
+
+def _extract_strict_gsm8k_answer(text, answer_last=None):
+    answer_text = _extract_answer_after_thinking(text)
+    if not answer_text:
+        return None
+    lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    final_zone = lines[-1]
+    if "\\boxed{" in final_zone:
+        boxed_zone = final_zone.split("\\boxed{")[-1].split("}", 1)[0]
+        boxed_match = _GSM8K_NUM_RE.search(boxed_zone)
+        if boxed_match is not None:
+            return _normalize_numeric_string(boxed_match.group(0))
+    for pattern in _GSM8K_ANSWER_PATTERNS:
+        matches = list(pattern.finditer(final_zone))
+        if matches:
+            idx = -1 if answer_last is not False else 0
+            return _normalize_numeric_string(matches[idx].group(1))
+    candidates = [_normalize_numeric_string(m.group(0)) for m in _GSM8K_NUM_RE.finditer(final_zone)]
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return None
+    if answer_last is None:
+        idx = -1
+    else:
+        idx = -1 if answer_last else 0
+    return candidates[idx]
+
+
 def _extract_number(text, answer_last=None):
     """Extract a number from text. Tries structured patterns first, then falls back.
 
@@ -1595,42 +1685,24 @@ def _extract_number(text, answer_last=None):
                      If True, fallback uses the last number in text.
                      If False, fallback uses the first number in text.
     """
-    import re
-
-    if "answer is " in text:
-        res = text.split("answer is ")[1].split(".")[0].strip()
-        # keep only digits
-        res = re.sub(r"[^0-9]", "", res)
-        return res
-    if "\\boxed{" in text:
-        res = text.split("\\boxed{")[1].split("}")[0].strip()
-        res = re.sub(r"[^0-9]", "", res)
-        return res
-
-    _NUM = r"-?\d+(?:,\d{3})*(?:\.\d+)?"
-
-    # Try #### pattern first (GSM8K format)
-    m = re.search(rf"####\s*({_NUM})", text)
-    if m:
-        return m.group(1).replace(",", "")
-    # Try "Answer: X" pattern (with optional markdown bold **)
-    m = re.search(rf"\*?\*?[Aa]nswer:?\*?\*?\s*\$?\s*({_NUM})", text)
-    if m:
-        return m.group(1).replace(",", "")
-    # Try "answer is X" / "equals X" / "= X" pattern
-    m = re.search(
-        rf"(?:answer is|equals?|=)\s*\$?\s*({_NUM})",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).replace(",", "")
-    # Fallback: pick first or last number depending on answer_last
-    numbers = re.findall(rf"{_NUM}", text)
-    if numbers:
+    for zone in _numeric_search_zones(text):
+        if "\\boxed{" in zone:
+            boxed_zone = zone.split("\\boxed{")[-1].split("}", 1)[0]
+            boxed_match = _GSM8K_NUM_RE.search(boxed_zone)
+            if boxed_match is not None:
+                return _normalize_numeric_string(boxed_match.group(0))
+        for pattern in _GSM8K_ANSWER_PATTERNS:
+            match = pattern.search(zone)
+            if match is not None:
+                return _normalize_numeric_string(match.group(1))
+    candidates = _extract_numeric_candidates(text)
+    if not candidates:
+        return None
+    if answer_last is None:
+        idx = -1 if "<|think_end|>" in text else 0
+    else:
         idx = -1 if answer_last else 0
-        return numbers[idx].replace(",", "")
-    return None
+    return candidates[idx]
 
 
 def _extract_boxed(text):
@@ -1780,7 +1852,8 @@ def evaluate_math500(
             answer = example["answer"]
             ref_answers.append(answer)
 
-            prompt = f"Solve the following math problem. Show your work and give your final answer in \\boxed{{}}.\n\n{problem}"
+            # prompt = f"Solve the following math problem. Show your work and give your final answer in \\boxed{{}}.\n\n{problem}"
+            prompt = problem
             # Truncate if too long
             model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = model_maxlen // 2
@@ -1865,6 +1938,7 @@ def evaluate_gsm8k(
     use_triton=False,
     use_cuda_graph=False,
     answer_last=None,
+    strict=False,
     temperature=0.0,
     repetition_penalty=1.0,
 ):
@@ -1899,10 +1973,11 @@ def evaluate_gsm8k(
             ref_val = ref_match.group(1).replace(",", "") if ref_match else None
             ref_answers.append(ref_val)
 
-            prompt = (
-                f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
-                # + "\n\nProvide only the answer."
-            )
+            # prompt = (
+            #     f"Solve the following math problem. Give your final numerical answer after your reasoning.\n\n{question}"
+            #     # + "\n\nProvide only the answer."
+            # )
+            prompt = question
             # Truncate if too long
             model_maxlen = getattr(gen.model, "maxlen", 4096)
             max_prompt_tokens = model_maxlen // 2
@@ -1948,10 +2023,11 @@ def evaluate_gsm8k(
         for i, (output, ref_val) in enumerate(zip(outputs, ref_answers)):
             idx = batch_start + i
             answer_text = _extract_answer_after_thinking(output)
-            predicted = _extract_number(answer_text, answer_last=answer_last)
-            # print(answer_text)
-            # print(predicted, ref_val)
-            # print("\n" + "-" * 80 + "\n")
+            predicted = (
+                _extract_strict_gsm8k_answer(output, answer_last=answer_last)
+                if strict
+                else _extract_number(answer_text, answer_last=answer_last)
+            )
 
             if idx < verbose_examples:
                 print(f"  [DEBUG] idx={idx} predicted={predicted} ref={ref_val}")
@@ -2204,7 +2280,7 @@ def main():
     )
     # parser.add_argument("--checkpoint", default="checkpoints/seqcond_torch_762k.pt")
     parser.add_argument(
-        "--checkpoint", default="checkpoints/graft/seqcond_lin5_rlai_step1216_graft_step0002.pt"
+        "--checkpoint", default="checkpoints/graft/BEST_OVERALL_graft_best.pt"
         # "--checkpoint", default="checkpoints/sft/seqcond_lin5_sft_step00050.pt"
     )
     parser.add_argument(
@@ -2283,6 +2359,11 @@ def main():
         action="store_true",
         default=None,
         help="GSM8K: extract the last number in the answer instead of the first (depends on model)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="GSM8K only: parse only the final answer line/segment, disabling permissive whole-response numeric fallback",
     )
     args = parser.parse_args()
 
@@ -2389,7 +2470,6 @@ def main():
         dataset = load_dataset(
             "ybisk/piqa",
             split=args.split,
-            revision="refs/convert/parquet",
         )
         dataset = _maybe_shuffle_dataset(
             dataset, seed=args.shuffle_seed, enabled=not args.no_shuffle
@@ -2493,6 +2573,7 @@ def main():
             use_triton=args.use_triton,
             use_cuda_graph=not args.no_cuda_graph,
             answer_last=args.answer_last,
+            strict=args.strict,
             temperature=args.temperature,
             repetition_penalty=args.rep_penalty,
         )

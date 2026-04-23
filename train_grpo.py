@@ -1,13 +1,8 @@
 """
-GRPO fine-tuning for SeqCond on GSM8K.
+GRPO fine-tuning for SeqCond — single PyTorch model (no Keras).
 
 Quick start:
-    KERAS_BACKEND=torch python train_grpo.py --checkpoint checkpoints/seqcond_lin5.pt
-
-Colab:
-    !pip install keras datasets openai  # once
-    %env KERAS_BACKEND=torch
-    !python train_grpo.py --checkpoint ... --openai_api_key sk-...
+    python train_grpo.py --checkpoint checkpoints/seqcond_lin5.pt
 
 Two functions to modify:
     score_output()  — what counts as a good response  (reward design)
@@ -15,278 +10,36 @@ Two functions to modify:
 """
 
 import argparse
+import copy
 import math
 import os
 import random
 import re
 import time
-from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
-os.environ.setdefault("KERAS_BACKEND", "torch")
-
-import keras
-from keras import ops
-
-from convert_torch_to_keras import (
-    build_keras_model,
-    convert_weights,
-    get_config_value,
-    keras_pkl_to_torch_pt,
-    load_torch_checkpoint,
-    save_keras_checkpoint,
-)
 from seqcond.dataset import Tokenizer
+from seqcond.torch.generator import TorchGenerator
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fast PyTorch generation model (Triton-accelerated)
-# ─────────────────────────────────────────────────────────────────────────────
+_CACHE_PREFIXES = (
+    '_conv_kernel_t', '_decay_slopes_cached', '_phase_scale_b',
+    '_score_bias_b', '_score_scale_b', '_theta_cached', '_w_int_cached',
+)
 
 
-def load_torch_gen_model(config, checkpoint_path):
-    """Load a pure PyTorch SeqCondModel for fast Triton-accelerated generation."""
-    import torch
-    from seqcond.torch.model import SeqCondModel
-
-    torch_model = SeqCondModel(**config).cpu().eval()
-    data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    torch_model.load_state_dict(data["state_dict"], strict=False)
-    n = sum(p.numel() for p in torch_model.parameters())
-    print(f"Loaded PyTorch gen model ({n:,} params, Triton-accelerated)")
-    return torch_model
+def save_ckpt(torch_gen, config, path, step):
+    sd = {k: v.cpu() for k, v in torch_gen.model.state_dict().items()
+          if not any(k.endswith(s) for s in _CACHE_PREFIXES)}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({"state_dict": sd, "config": config, "step": step}, path)
+    print(f"  checkpoint → {path}  ({len(sd)} tensors)")
 
 
-def sync_keras_to_torch(keras_model, torch_model, config):
-    """Copy weights from Keras model to PyTorch model (in-place).
-
-    Since KERAS_BACKEND=torch, Keras weights are torch tensors.
-    We reverse the mapping from convert_torch_to_keras.convert_weights.
-    """
-    import torch
-
-    # Build Keras weight lookup: short path -> tensor
-    keras_w = {}
-    for w in keras_model.weights:
-        parts = w.path.split("/")
-        short = "/".join(parts[1:]) if len(parts) > 1 else w.path
-        keras_w[short] = w
-
-    # Build block map
-    num_layers = get_config_value(config, "num_layers")
-    seqcond_ratio = get_config_value(config, "seqcond_ratio", 3)
-    transformer_idx = seqcond_idx = 0
-    block_map = []
-    for i in range(num_layers):
-        if (i + 1) % (seqcond_ratio + 1) == 0:
-            block_map.append((i, "transformer", f"transformer_block_{transformer_idx}"))
-            transformer_idx += 1
-        else:
-            block_map.append((i, "seqcond", f"seqcond_block_{seqcond_idx}"))
-            seqcond_idx += 1
-
-    state_dict = {}
-
-    def get(short):
-        if short not in keras_w:
-            return None
-        return keras_w[short].value  # returns underlying torch tensor
-
-    # Embedding
-    state_dict["embedding.weight"] = get("token_embedding/embeddings")
-
-    # Final norm
-    v = get("final_norm/scale")
-    if v is not None:
-        state_dict["final_norm.scale"] = v
-
-    # Blocks
-    for torch_i, btype, kname in block_map:
-        tp = f"blocks.{torch_i}."
-        if btype == "transformer":
-            state_dict[tp + "norm1.scale"] = get(f"{kname}/norm1/scale")
-            state_dict[tp + "norm2.scale"] = get(f"{kname}/norm2/scale")
-            state_dict[tp + "attn.q_proj.weight"] = get(f"{kname}/attn/q_proj/kernel").T
-            state_dict[tp + "attn.k_proj.weight"] = get(f"{kname}/attn/k_proj/kernel").T
-            state_dict[tp + "attn.v_proj.weight"] = get(f"{kname}/attn/v_proj/kernel").T
-            state_dict[tp + "attn.out_proj.weight"] = get(
-                f"{kname}/attn/out_proj/kernel"
-            ).T
-            state_dict[tp + "ff_in.weight"] = get(f"{kname}/ff_in/kernel").T
-            state_dict[tp + "ff_in.bias"] = get(f"{kname}/ff_in/bias")
-            state_dict[tp + "ff_out.weight"] = get(f"{kname}/ff_out/kernel").T
-            state_dict[tp + "ff_out.bias"] = get(f"{kname}/ff_out/bias")
-        else:  # seqcond
-            state_dict[tp + "norm.scale"] = get(f"{kname}/pre_norm/scale")
-            state_dict[tp + "attn.in_proj.weight"] = get(
-                f"{kname}/attn/in_proj/kernel"
-            ).T
-            conv = get(f"{kname}/attn/conv/kernel")
-            state_dict[tp + "attn.conv_weight"] = conv.permute(2, 1, 0).contiguous()
-            state_dict[tp + "attn.gate_proj.weight"] = get(
-                f"{kname}/attn/gate_proj/kernel"
-            ).T
-            state_dict[tp + "attn.out_proj.weight"] = get(
-                f"{kname}/attn/out_proj/kernel"
-            ).T
-            for raw_key in [
-                "theta_d_raw",
-                "theta_raw",
-                "w_int_raw",
-                "decay_slopes",
-                "anchor_slopes",
-                "score_scale",
-                "score_bias",
-                "phase_scale",
-            ]:
-                val = get(f"{kname}/attn/{raw_key}")
-                if val is not None:
-                    state_dict[tp + f"attn.{raw_key}"] = val
-            state_dict[tp + "attn.gated_norm.weight"] = get(
-                f"{kname}/attn/gated_norm_weight"
-            )
-            state_dict[tp + "attn.W_readout"] = get(f"{kname}/attn/W_readout")
-
-    # Filter None and load
-    state_dict = {k: v for k, v in state_dict.items() if v is not None}
-    torch_model.load_state_dict(state_dict, strict=False)
-
-
-def generate_completions_torch(
-    torch_model,
-    tokenizer,
-    prompt: str,
-    num_completions: int = 4,
-    max_new_tokens: int = 512,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    rep_penalty: float = 1.0,
-    gen_batch_size: int = 4,
-    return_tokens: bool = False,
-    keep_on_cuda: bool = False,
-):
-    """Fast generation using PyTorch model with Triton kernels.
-
-    Moves model to CUDA for generation, then back to CPU to free VRAM.
-    If keep_on_cuda=True, assumes model is already on CUDA and does not move it.
-    """
-    import torch
-
-    eos_id = tokenizer.encode("<|im_end|>")[0]
-    prompt_toks = tokenizer([prompt])[0]
-    all_texts, all_ids = [], []
-
-    if not keep_on_cuda:
-        torch_model.cuda()
-    input_ids = torch.tensor([prompt_toks], device="cuda")
-
-    with torch.no_grad():
-        for start in range(0, num_completions, gen_batch_size):
-            B = min(gen_batch_size, num_completions - start)
-
-            # Prefill once
-            logits, states = torch_model.prefill(input_ids)
-            logits = logits.squeeze(1)  # (1, vocab)
-
-            # Tile for batch
-            if B > 1:
-                logits = logits.repeat(B, 1)
-                states = [
-                    tuple(s.repeat(B, *([1] * (s.ndim - 1))) for s in state)
-                    for state in states
-                ]
-
-            generated = [[] for _ in range(B)]
-            finished = [False] * B
-            active_map = list(range(B))
-            token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
-            current_seq_len = len(prompt_toks)
-
-            for _ in range(max_new_tokens):
-                B_cur = len(active_map)
-                logits_np = logits.cpu().float().numpy()
-                if rep_penalty != 1.0:
-                    for ci in range(B_cur):
-                        oi = active_map[ci]
-                        for tid in set(generated[oi]):
-                            logits_np[ci, tid] = (
-                                logits_np[ci, tid] / rep_penalty
-                                if logits_np[ci, tid] > 0
-                                else logits_np[ci, tid] * rep_penalty
-                            )
-                toks = _sample_batch(logits_np, temperature, top_k, top_p)
-                newly_done = set()
-                for ci in range(B_cur):
-                    oi = active_map[ci]
-                    tok = int(toks[ci])
-                    generated[oi].append(tok)
-                    if tok == eos_id:
-                        finished[oi] = True
-                        newly_done.add(ci)
-                    else:
-                        token_buf[ci, 0] = tok
-                if all(finished):
-                    break
-                if newly_done:
-                    keep = [ci for ci in range(B_cur) if ci not in newly_done]
-                    if not keep:
-                        break
-                    keep_idx = torch.tensor(keep, device="cuda")
-                    token_buf = token_buf[keep_idx].contiguous()
-                    states = [
-                        tuple(s[keep_idx].contiguous() for s in state)
-                        for state in states
-                    ]
-                    active_map = [active_map[ci] for ci in keep]
-                current_seq_len += 1
-                logits, states = torch_model.step(
-                    token_buf, states, seq_len=current_seq_len, use_triton=True
-                )
-
-
-            for i in range(B):
-                ids = generated[i]
-                if ids and ids[-1] == eos_id:
-                    ids = ids[:-1]
-                all_ids.append(list(ids))
-                try:
-                    all_texts.append(tokenizer.decode(ids))
-                except Exception:
-                    all_texts.append("")
-
-    # Move gen model back to CPU and free VRAM for training
-    if not keep_on_cuda:
-        torch_model.cpu()
-        torch.cuda.empty_cache()
-
-    return (all_texts, all_ids) if return_tokens else all_texts
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Backend helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def to_numpy(x):
-    if hasattr(x, "detach"):
-        x = x.detach()
-    if hasattr(x, "cpu"):
-        x = x.cpu()
-    return np.array(x)
-
-
-@contextmanager
-def inference_mode():
-    if keras.backend.backend() == "torch":
-        import torch
-
-        with torch.no_grad():
-            yield
-    else:
-        yield
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,17 +73,145 @@ def load_gsm8k(split="train", seed=42, max_examples=None):
     return examples[:max_examples] if max_examples else examples
 
 
-def check_answer(text: str, ground_truth: str) -> bool:
-    """Return True if text contains the correct numerical answer."""
-    m = re.search(r"####\s*(.+)", text)
-    if m:
-        return m.group(1).strip().replace(",", "") == ground_truth
+def load_local_math(path, seed=42, max_examples=None):
+    """Load a local JSONL with {query, ground_truth|answer} fields."""
+    import json
+    with open(path) as f:
+        rows = [json.loads(l) for l in f if l.strip()]
+    random.Random(seed).shuffle(rows)
+    if max_examples:
+        rows = rows[:max_examples]
+    examples = []
+    for row in rows:
+        query = row["query"]
+        gt = str(row.get("ground_truth", row.get("answer", "")))
+        examples.append({
+            "question": query,
+            "ground_truth": gt,
+            "prompt": (
+                "<|im_start|>user\n"
+                + query
+                + "\n<|im_end|><|im_start|>assistant\n<|think_start|>"
+            ),
+        })
+    print(f"  local_math: {len(examples)} exemples chargés depuis {path}")
+    return examples
+
+
+_GSM8K_NUM_PATTERN = r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_GSM8K_NUM_RE = re.compile(_GSM8K_NUM_PATTERN)
+_GSM8K_ANSWER_PATTERNS = [
+    re.compile(rf"####\s*({_GSM8K_NUM_PATTERN})"),
+    re.compile(
+        rf"(?:final\s+answer|answer|solution|result|total)\s*(?:is|=|:)\s*\$?\s*({_GSM8K_NUM_PATTERN})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:therefore|thus|so)\s*(?:the\s+)?(?:answer|solution|result)?\s*(?:is|=|:)?\s*\$?\s*({_GSM8K_NUM_PATTERN})",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _normalize_numeric_string(raw: str):
+    value = raw.strip().replace(",", "")
+    return value.rstrip(".")
+
+
+def _numeric_search_zones(text: str):
+    stripped = text.strip()
+    zones = []
+    parts = stripped.split("<|think_end|>")
+    if len(parts) > 1:
+        answer_zone = parts[-1].strip()
+        if answer_zone:
+            zones.append(answer_zone)
+        return zones
+    if stripped:
+        zones.append(stripped)
+    return zones
+
+
+def _extract_answer_after_thinking(text: str) -> str:
+    if "<|think_end|>" in text:
+        text = text.split("<|think_end|>")[-1]
+    elif "</think>" in text:
+        text = text.split("</think>")[-1]
+    elif "<|think_start|>" in text:
+        before = text.split("<|think_start|>")[0].strip()
+        if before:
+            text = before
+    text = text.replace("<|im_end|>", "").replace("<|im_start|>", "")
+    return text.strip()
+
+
+def _extract_numeric_candidates(text: str):
+    candidates = []
+    seen = set()
+    for zone in _numeric_search_zones(text):
+        if "\\boxed{" in zone:
+            boxed_zone = zone.split("\\boxed{")[-1].split("}", 1)[0]
+            boxed_match = _GSM8K_NUM_RE.search(boxed_zone)
+            if boxed_match is not None:
+                value = _normalize_numeric_string(boxed_match.group(0))
+                if value and value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        for pattern in _GSM8K_ANSWER_PATTERNS:
+            match = pattern.search(zone)
+            if match is not None:
+                value = _normalize_numeric_string(match.group(1))
+                if value and value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        for match in _GSM8K_NUM_RE.finditer(zone):
+            value = _normalize_numeric_string(match.group(0))
+            if value and value not in seen:
+                seen.add(value)
+                candidates.append(value)
+    return candidates
+
+
+def _extract_numeric_answer(text: str, answer_last=None):
+    for zone in _numeric_search_zones(text):
+        if "\\boxed{" in zone:
+            boxed_zone = zone.split("\\boxed{")[-1].split("}", 1)[0]
+            boxed_match = _GSM8K_NUM_RE.search(boxed_zone)
+            if boxed_match is not None:
+                return _normalize_numeric_string(boxed_match.group(0))
+        for pattern in _GSM8K_ANSWER_PATTERNS:
+            match = pattern.search(zone)
+            if match is not None:
+                return _normalize_numeric_string(match.group(1))
+    candidates = _extract_numeric_candidates(text)
+    if not candidates:
+        return None
+    if answer_last is None:
+        idx = -1 if "<|think_end|>" in text else 0
+    else:
+        idx = -1 if answer_last else 0
+    return candidates[idx]
+
+
+def _answer_zone(text: str) -> str:
+    """Return the answer zone: text after the last <|think_end|>, or full text if absent."""
     parts = text.split("<|think_end|>")
-    after = parts[-1].strip() if len(parts) > 1 else text.strip()
-    for num in re.findall(r"-?[\d,]+\.?\d*", after):
-        if num.replace(",", "").rstrip(".") == ground_truth:
-            return True
-    return False
+    if len(parts) > 1:
+        zone = parts[-1].strip()
+        if zone:
+            return zone
+    return text
+
+
+def check_answer(text: str, ground_truth: str) -> bool:
+    answer_text = _extract_answer_after_thinking(text)
+    extracted = _extract_numeric_answer(answer_text)
+    if extracted is None:
+        return False
+    try:
+        return float(extracted) == float(ground_truth)
+    except ValueError:
+        return False
 
 
 def _partial_answer_score(text: str, ground_truth: str) -> float:
@@ -352,25 +233,20 @@ def _partial_answer_score(text: str, ground_truth: str) -> float:
     if gt == 0:
         return 0.0
 
-    # Prefer numbers appearing after <|think_end|>; fall back to full text
-    parts = text.split("<|think_end|>")
-    search_zone = parts[-1] if len(parts) > 1 else text
-    candidates = re.findall(r"-?[\d,]+\.?\d*", search_zone)
-    if not candidates:
-        candidates = re.findall(r"-?[\d,]+\.?\d*", text)
-
-    best = 0.0
-    for raw in candidates:
-        try:
-            val = float(raw.replace(",", "").rstrip("."))
-        except ValueError:
-            continue
-        ratio = val / gt
-        if 0.95 <= ratio <= 1.05:
-            best = max(best, 0.5)
-        elif 0.80 <= ratio <= 1.20:
-            best = max(best, 0.2)
-    return best
+    answer_text = _extract_answer_after_thinking(text)
+    raw = _extract_numeric_answer(answer_text)
+    if raw is None:
+        return 0.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return 0.0
+    ratio = val / gt
+    if 0.95 <= ratio <= 1.05:
+        return 0.5
+    if 0.80 <= ratio <= 1.20:
+        return 0.2
+    return 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -441,128 +317,23 @@ def score_output(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _tile_states(states, n):
-    return [
-        tuple(ops.tile(s, (n,) + (1,) * (s.ndim - 1)) for s in state)
-        for state in states
-    ]
-
-
-def _sample_batch(logits_np, temperature=0.7, top_k=50, top_p=0.95):
-    """Sample one token per row from (B, vocab) logits."""
-    B = logits_np.shape[0]
-    tokens = np.empty(B, dtype=np.int64)
-    for i in range(B):
-        row = logits_np[i].astype(np.float64)
-        if temperature <= 0.0:
-            tokens[i] = np.argmax(row)
-            continue
-        row = row / temperature
-        topk_idx = (
-            np.argpartition(row, -top_k)[-top_k:]
-            if 0 < top_k < len(row)
-            else np.arange(len(row))
-        )
-        vals = row[topk_idx]
-        vals -= np.max(vals)
-        probs = np.exp(vals)
-        probs /= probs.sum()
-        if top_p < 1.0:
-            order = np.argsort(probs)[::-1]
-            cut = np.searchsorted(np.cumsum(probs[order]), top_p) + 1
-            nucleus = order[:cut]
-            p = probs[nucleus]
-            p /= p.sum()
-            tokens[i] = topk_idx[np.random.choice(nucleus, p=p)]
-        else:
-            tokens[i] = topk_idx[np.random.choice(len(probs), p=probs)]
-    return tokens
-
-
-def generate_completions(
-    model,
-    tokenizer,
-    prompt: str,
-    num_completions: int = 4,
-    max_new_tokens: int = 512,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    rep_penalty: float = 1.0,
-    gen_batch_size: int = 4,
-    return_tokens: bool = False,
-):
-    """Generate num_completions responses for prompt. Prefills once, tiles states."""
-    eos_id = tokenizer.encode("<|im_end|>")[0]
-    prompt_toks = tokenizer([prompt])[0]
-    all_texts, all_ids = [], []
-
-    with inference_mode():
-        for start in range(0, num_completions, gen_batch_size):
-            B = min(gen_batch_size, num_completions - start)
-            states = model.init_state(batch_size=1)
-            for t in prompt_toks:
-                logits, states = model.step(np.array([[t]], dtype=np.int32), states)
-            if B > 1:
-                states = _tile_states(states, B)
-            logits_np = np.tile(to_numpy(logits), (B, 1))
-
-            generated = [[] for _ in range(B)]
-            finished = [False] * B
-            buf = np.zeros((B, 1), dtype=np.int32)
-
-            for _ in range(max_new_tokens):
-                if rep_penalty != 1.0:
-                    for i in range(B):
-                        for tid in set(generated[i]):
-                            logits_np[i, tid] = (
-                                logits_np[i, tid] / rep_penalty
-                                if logits_np[i, tid] > 0
-                                else logits_np[i, tid] * rep_penalty
-                            )
-                toks = _sample_batch(logits_np, temperature, top_k, top_p)
-                for i in range(B):
-                    if not finished[i]:
-                        generated[i].append(int(toks[i]))
-                        finished[i] = toks[i] == eos_id
-                        buf[i, 0] = toks[i]
-                    else:
-                        buf[i, 0] = eos_id
-                if all(finished):
-                    break
-                logits, states = model.step(buf, states)
-                logits_np = to_numpy(logits)
-
-            for i in range(B):
-                ids = generated[i]
-                if ids and ids[-1] == eos_id:
-                    ids = ids[:-1]
-                all_ids.append(list(ids))
-                try:
-                    all_texts.append(tokenizer.decode(ids))
-                except Exception:
-                    all_texts.append("")
-
-    return (all_texts, all_ids) if return_tokens else all_texts
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # GRPO internals
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _seq_log_prob(model, input_ids, prompt_len):
-    """Sum of per-token log probs for the completion portion of input_ids."""
-    return ops.sum(_seq_token_log_probs(model, input_ids, prompt_len))
+def _seq_token_log_probs(model, input_ids_t, prompt_len):
+    """Per-token log probs for the completion portion of input_ids (PyTorch tensor)."""
+    logits = model(input_ids_t)          # (1, T, vocab)
+    log_probs = F.log_softmax(logits, dim=-1)
+    shift = log_probs[0, prompt_len - 1:-1, :]          # (comp_len, vocab)
+    targets = input_ids_t[0, prompt_len:].long().unsqueeze(-1)  # (comp_len, 1)
+    return shift.gather(-1, targets).squeeze(-1)         # (comp_len,)
 
 
-def _seq_token_log_probs(model, input_ids, prompt_len):
-    """Per-token log probs for the completion portion of input_ids."""
-    logits = model(input_ids)
-    log_probs = ops.log_softmax(logits, axis=-1)
-    shift = log_probs[0, prompt_len - 1 : -1, :]
-    targets = ops.expand_dims(ops.cast(input_ids[0, prompt_len:], "int32"), -1)
-    return ops.squeeze(ops.take_along_axis(shift, targets, axis=-1), axis=-1)
+def _seq_log_prob(model, input_ids_t, prompt_len):
+    """Sum of per-token log probs for the completion portion."""
+    return _seq_token_log_probs(model, input_ids_t, prompt_len).sum()
 
 
 def _repetition_penalty(
@@ -617,19 +388,67 @@ def _filter_group_by_total_length(
     return kept_texts, kept_tokens, skipped
 
 
-def _compute_old_log_probs(model, prompt_tokens, completions_tokens):
+def _ids_tensor(prompt_tokens, comp, device):
+    """Build a (1, T) long tensor from prompt + completion token lists."""
+    return torch.tensor([prompt_tokens + comp], dtype=torch.long, device=device)
+
+
+def _compute_old_log_probs(model, prompt_tokens, completions_tokens, device):
     """Compute detached per-token log probs for all completions (π_old)."""
     prompt_len = len(prompt_tokens)
     old_lps = []
-    with inference_mode():
+    with torch.no_grad():
         for comp in completions_tokens:
             if len(comp) == 0:
                 old_lps.append(None)
                 continue
-            ids = np.array([prompt_tokens + comp], dtype=np.int32)
+            ids = _ids_tensor(prompt_tokens, comp, device)
             token_lps = _seq_token_log_probs(model, ids, prompt_len)
-            old_lps.append(to_numpy(token_lps).copy())
+            old_lps.append(token_lps.detach().cpu().numpy().copy())
     return old_lps
+
+
+def _accumulate_loss_term(acc, term):
+    if term is None:
+        return acc
+    return term if acc is None else acc + term
+
+
+def _grad_norm_sq(loss, params):
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    total = None
+    for grad in grads:
+        if grad is None:
+            continue
+        cur = grad.detach().pow(2).sum()
+        total = cur if total is None else total + cur
+    if total is None:
+        return 0.0
+    return float(total.item())
+
+
+def _apply_balanced_backward(pos_loss, neg_loss, params, grad_scale: float, neg_scale: float):
+    if pos_loss is None and neg_loss is None:
+        return 1.0, 0.0, 0.0
+    if neg_scale <= 0 or pos_loss is None or neg_loss is None:
+        total_loss = _accumulate_loss_term(pos_loss, neg_loss)
+        (total_loss * grad_scale).backward()
+        return 1.0, 0.0, 0.0
+
+    pos_norm_sq = _grad_norm_sq(pos_loss, params)
+    neg_norm_sq = _grad_norm_sq(neg_loss, params)
+    neg_mult = 1.0
+    if pos_norm_sq > 0.0 and neg_norm_sq > pos_norm_sq * (neg_scale ** 2):
+        neg_mult = (math.sqrt(pos_norm_sq) * neg_scale) / math.sqrt(neg_norm_sq)
+
+    total_loss = pos_loss + neg_loss * neg_mult
+    (total_loss * grad_scale).backward()
+    return neg_mult, math.sqrt(pos_norm_sq), math.sqrt(neg_norm_sq)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -650,90 +469,71 @@ def grpo_step_ppo(
     ref_model=None,
     grad_scale: float = 1.0,
     llds_lambda: float = 0.0,
+    neg_scale: float = 0.0,
+    device: str = "cuda",
 ) -> float:
-    """PPO-clip GRPO: clipped surrogate objective with importance sampling.
-
-    Uses stored π_old to compute the ratio π/π_old per token, with asymmetric
-    clipping [1-ε_low, 1+ε_high] (DAPO-style).  Supports multiple epochs
-    over the same batch of completions.
-
-    LLDS: For completions with advantage >= 0, if total log-likelihood decreased
-    vs π_old, penalize tokens whose individual log-prob dropped.
-    """
+    """PPO-clip GRPO (DAPO asymmetric clipping). Pure PyTorch."""
     prompt_len = len(prompt_tokens)
     total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
     if total_tokens == 0:
         return 0.0
 
-    # Reference log probs for KL (optional, frozen model)
     ref_avg_lps = []
     if beta > 0:
         ref = ref_model if ref_model is not None else model
-        with inference_mode():
+        with torch.no_grad():
             for comp in completions_tokens:
                 if len(comp) == 0:
                     ref_avg_lps.append(0.0)
                     continue
-                ids = np.array([prompt_tokens + comp], dtype=np.int32)
-                ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
+                ids = _ids_tensor(prompt_tokens, comp, device)
+                ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len).item()) / len(comp))
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    pos_loss = None
+    neg_loss = None
     total_loss = 0.0
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0 or old_token_log_probs[i] is None:
             continue
-        ids = np.array([prompt_tokens + comp], dtype=np.int32)
-        # Current per-token log probs (with gradient)
+        ids = _ids_tensor(prompt_tokens, comp, device)
         cur_token_lps = _seq_token_log_probs(model, ids, prompt_len)
-        # Old per-token log probs (detached numpy)
-        old_lps_t = ops.convert_to_tensor(old_token_log_probs[i])
+        old_lps_t = torch.tensor(old_token_log_probs[i], device=device)
 
-        # Importance sampling ratio per token
         log_ratio = cur_token_lps - old_lps_t
-        ratio = ops.exp(log_ratio)
-
-        # Clipped ratio (asymmetric: DAPO)
-        clipped_ratio = ops.clip(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high)
-
-        # PPO surrogate: min(ratio*A, clip(ratio)*A)
+        ratio = torch.exp(log_ratio)
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high)
         adv_i = float(advantages[i])
-        surr1 = ratio * adv_i
-        surr2 = clipped_ratio * adv_i
-        # min handles both signs of advantage correctly
-        ppo_obj = ops.minimum(surr1, surr2)
-
-        # Token-level mean, then weight by completion length
+        ppo_obj = torch.minimum(ratio * adv_i, clipped_ratio * adv_i)
         token_weight = len(comp) / total_tokens
-        loss_i = -ops.mean(ppo_obj) * token_weight
+        loss_i = -ppo_obj.mean() * token_weight
 
-        # KL penalty (optional)
         if beta > 0:
-            avg_lp = ops.sum(cur_token_lps) / len(comp)
-            kl = avg_lp - ref_avg_lps[i]
+            kl = cur_token_lps.sum() / len(comp) - ref_avg_lps[i]
             loss_i = loss_i + beta * kl * token_weight
 
-        (loss_i * grad_scale).backward()
-        total_loss += float(to_numpy(loss_i))
+        if adv_i >= 0:
+            pos_loss = _accumulate_loss_term(pos_loss, loss_i)
+        else:
+            neg_loss = _accumulate_loss_term(neg_loss, loss_i)
+        total_loss += loss_i.item()
 
-    # LLDS regularization for PPO path
+    _apply_balanced_backward(pos_loss, neg_loss, trainable_params, grad_scale, neg_scale)
+
     if llds_lambda > 0:
         for i, comp in enumerate(completions_tokens):
             if len(comp) == 0 or advantages[i] < 0 or old_token_log_probs[i] is None:
                 continue
-            ids = np.array([prompt_tokens + comp], dtype=np.int32)
+            ids = _ids_tensor(prompt_tokens, comp, device)
             cur_token_lps = _seq_token_log_probs(model, ids, prompt_len)
-            old_lps_t = ops.convert_to_tensor(old_token_log_probs[i])
-            # Response-level gate: only activate if total likelihood decreased
-            cur_total = ops.sum(cur_token_lps)
-            old_total = float(np.sum(old_token_log_probs[i]))
-            if float(to_numpy(cur_total)) >= old_total:
+            old_lps_t = torch.tensor(old_token_log_probs[i], device=device)
+            if cur_token_lps.sum().item() >= old_lps_t.sum().item():
                 continue
-            # Token-level: penalize only tokens whose log-prob dropped
-            drop = old_lps_t - cur_token_lps
-            drop_masked = ops.maximum(drop, 0.0)
+            drop_masked = torch.clamp(old_lps_t - cur_token_lps, min=0.0)
             token_weight = len(comp) / total_tokens
-            llds_loss = llds_lambda * ops.mean(drop_masked) * token_weight
+            llds_loss = llds_lambda * drop_masked.mean() * token_weight
             (llds_loss * grad_scale).backward()
-            total_loss += float(to_numpy(llds_loss))
+            total_loss += llds_loss.item()
 
     return total_loss
 
@@ -748,82 +548,70 @@ def grpo_step(
     ref_model=None,
     grad_scale: float = 1.0,
     llds_lambda: float = 0.0,
+    neg_scale: float = 0.0,
+    device: str = "cuda",
 ) -> float:
-    """Compute GRPO loss and accumulate gradients for one group of completions.
-
-    Token-level normalization: each completion is weighted by its token count so
-    each token equal weight regardless of sequence length.
-
-    For each completion i with non-zero advantage:
-        loss_i = -advantage_i * sum_log_prob_i  +  β * KL(π || π_ref) * len(comp_i)
-    Total loss is divided by total_tokens (sum of all completion lengths).
-
-    LLDS (Lazy Likelihood-Displacement Stabilization):
-        For completions with advantage >= 0 whose total log-likelihood decreased
-        vs the old policy, penalize individual tokens whose log-prob dropped.
-    """
+    """REINFORCE GRPO with KL penalty. Pure PyTorch."""
     prompt_len = len(prompt_tokens)
     total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
     if total_tokens == 0:
         return 0.0
 
-    # Reference log probs (frozen initial model, or current snapshot if no ref)
     ref = ref_model if ref_model is not None else model
     ref_avg_lps = []
-    with inference_mode():
+    with torch.no_grad():
         for comp in completions_tokens:
             if len(comp) == 0:
                 ref_avg_lps.append(0.0)
                 continue
-            ids = np.array([prompt_tokens + comp], dtype=np.int32)
-            ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
+            ids = _ids_tensor(prompt_tokens, comp, device)
+            ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len).item()) / len(comp))
 
-    # Old token-level log probs for LLDS (detached snapshot of current policy)
     old_token_lps_list = []
     if llds_lambda > 0:
-        with inference_mode():
+        with torch.no_grad():
             for comp in completions_tokens:
                 if len(comp) == 0:
                     old_token_lps_list.append(None)
                     continue
-                ids = np.array([prompt_tokens + comp], dtype=np.int32)
-                old_token_lps_list.append(to_numpy(_seq_token_log_probs(model, ids, prompt_len)).copy())
+                ids = _ids_tensor(prompt_tokens, comp, device)
+                old_token_lps_list.append(_seq_token_log_probs(model, ids, prompt_len).detach().cpu().numpy().copy())
 
-    # Policy gradient with token-level normalization
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    pos_loss = None
+    neg_loss = None
     total_loss = 0.0
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0:
             continue
-        ids = np.array([prompt_tokens + comp], dtype=np.int32)
-        policy_lp = _seq_log_prob(model, ids, prompt_len)  # sum over tokens
+        ids = _ids_tensor(prompt_tokens, comp, device)
+        policy_lp = _seq_log_prob(model, ids, prompt_len)
         avg_lp = policy_lp / len(comp)
         kl = avg_lp - ref_avg_lps[i]
-        # Token-level normalization: weight each completion by its token count
         token_weight = len(comp) / total_tokens
         loss_i = (-advantages[i] * avg_lp + beta * kl) * token_weight
-        (loss_i * grad_scale).backward()
-        total_loss += float(to_numpy(loss_i))
+        if advantages[i] >= 0:
+            pos_loss = _accumulate_loss_term(pos_loss, loss_i)
+        else:
+            neg_loss = _accumulate_loss_term(neg_loss, loss_i)
+        total_loss += loss_i.item()
 
-    # LLDS regularization: prevent likelihood collapse for non-negative advantage completions
+    _apply_balanced_backward(pos_loss, neg_loss, trainable_params, grad_scale, neg_scale)
+
     if llds_lambda > 0:
         for i, comp in enumerate(completions_tokens):
             if len(comp) == 0 or advantages[i] < 0 or old_token_lps_list[i] is None:
                 continue
-            ids = np.array([prompt_tokens + comp], dtype=np.int32)
+            ids = _ids_tensor(prompt_tokens, comp, device)
             cur_token_lps = _seq_token_log_probs(model, ids, prompt_len)
-            old_lps_t = ops.convert_to_tensor(old_token_lps_list[i])
-            # Response-level gate: only activate if total likelihood decreased
-            cur_total = ops.sum(cur_token_lps)
-            old_total = float(np.sum(old_token_lps_list[i]))
-            if float(to_numpy(cur_total)) >= old_total:
+            old_lps_t = torch.tensor(old_token_lps_list[i], device=device)
+            if cur_token_lps.sum().item() >= old_lps_t.sum().item():
                 continue
-            # Token-level: penalize only tokens whose log-prob dropped
-            drop = old_lps_t - cur_token_lps  # positive where likelihood decreased
-            drop_masked = ops.maximum(drop, 0.0)  # only penalize decreases
+            drop_masked = torch.clamp(old_lps_t - cur_token_lps, min=0.0)
             token_weight = len(comp) / total_tokens
-            llds_loss = llds_lambda * ops.mean(drop_masked) * token_weight
+            llds_loss = llds_lambda * drop_masked.mean() * token_weight
             (llds_loss * grad_scale).backward()
-            total_loss += float(to_numpy(llds_loss))
+            total_loss += llds_loss.item()
 
     return total_loss
 
@@ -838,15 +626,10 @@ def gmpo_step(
     beta: float = 0.05,
     ref_model=None,
     grad_scale: float = 1.0,
+    neg_scale: float = 0.0,
+    device: str = "cuda",
 ) -> float:
-    """Compute GMPO loss (true geometric-mean policy optimization).
-
-    Each token's log importance-ratio is clipped independently to [-clip_eps, +clip_eps]
-    BEFORE taking the mean (= geometric mean in linear space). This prevents outlier
-    tokens from dominating the sequence ratio, which was the bug in the previous
-    sequence-level clipping approach. Token-level normalization is used (same as
-    grpo_step) so every token contributes equally regardless of sequence length.
-    """
+    """GMPO: geometric-mean policy optimization. Pure PyTorch."""
     prompt_len = len(prompt_tokens)
     total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
     if total_tokens == 0:
@@ -855,44 +638,44 @@ def gmpo_step(
     ref = ref_model if ref_model is not None else model
     old_token_lps = []
     ref_avg_lps = []
-    with inference_mode():
+    with torch.no_grad():
         for comp in completions_tokens:
             if len(comp) == 0:
                 old_token_lps.append(None)
                 ref_avg_lps.append(0.0)
                 continue
-            ids = np.array([prompt_tokens + comp], dtype=np.int32)
-            old_token_lps.append(_seq_token_log_probs(model, ids, prompt_len))
-            ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
+            ids = _ids_tensor(prompt_tokens, comp, device)
+            old_token_lps.append(_seq_token_log_probs(model, ids, prompt_len).detach())
+            ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len).item()) / len(comp))
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    pos_loss = None
+    neg_loss = None
     total_loss = 0.0
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0:
             continue
-
-        ids = np.array([prompt_tokens + comp], dtype=np.int32)
+        ids = _ids_tensor(prompt_tokens, comp, device)
         new_token_lps = _seq_token_log_probs(model, ids, prompt_len)
         old_lps = old_token_lps[i]
 
         adv = float(advantages[i])
         sign_a = 1.0 if adv > 0 else -1.0
-        # GMPO (paper): per-token r_t^sgn(A), pessimistic clip (cap above only)
-        # In log-space: s·ℓ_t where s=sgn(A), ℓ_t = log(π_new/π_old)
-        # min(r^s, clip(r^s, e^-ε, e^+ε)) in log = min(s·ℓ_t, +ε)  (no floor)
-        token_log_ratios = new_token_lps - old_lps          # ℓ_t
-        signed_log_ratios = sign_a * token_log_ratios        # s·ℓ_t
-        pessimistic = ops.minimum(signed_log_ratios, clip_eps)  # min(s·ℓ_t, ε)
-        mean_pessimistic = ops.mean(pessimistic)
-        seq_ratio = ops.exp(mean_pessimistic)                # geometric mean
-        avg_policy_lp = ops.mean(new_token_lps)
-        kl = avg_policy_lp - ref_avg_lps[i]
+        token_log_ratios = new_token_lps - old_lps
+        signed_log_ratios = sign_a * token_log_ratios
+        pessimistic = torch.minimum(signed_log_ratios, torch.tensor(clip_eps, device=device))
+        seq_ratio = torch.exp(pessimistic.mean())
+        kl = new_token_lps.mean() - ref_avg_lps[i]
 
-        # Token-level normalization: weight by this completion's share of total tokens
         token_weight = len(comp) / total_tokens
         loss_i = (-adv * seq_ratio + beta * kl) * token_weight
-        (loss_i * grad_scale).backward()
-        total_loss += float(to_numpy(loss_i))
+        if adv >= 0:
+            pos_loss = _accumulate_loss_term(pos_loss, loss_i)
+        else:
+            neg_loss = _accumulate_loss_term(neg_loss, loss_i)
+        total_loss += loss_i.item()
 
+    _apply_balanced_backward(pos_loss, neg_loss, trainable_params, grad_scale, neg_scale)
     return total_loss
 
 
@@ -907,14 +690,10 @@ def gmpo_step_ppo(
     beta: float = 0.0,
     ref_model=None,
     grad_scale: float = 1.0,
+    neg_scale: float = 0.0,
+    device: str = "cuda",
 ) -> float:
-    """Multi-epoch GMPO: geometric-mean policy optimization with stored π_old.
-
-    Like gmpo_step but uses pre-computed old_token_log_probs instead of
-    computing π_old inline.  Each token's log importance-ratio is clipped
-    symmetrically to [-clip_eps, +clip_eps] BEFORE taking the mean
-    (= geometric mean in linear space).
-    """
+    """Multi-epoch GMPO with stored π_old. Pure PyTorch."""
     prompt_len = len(prompt_tokens)
     total_tokens = sum(len(c) for c in completions_tokens if len(c) > 0)
     if total_tokens == 0:
@@ -923,42 +702,45 @@ def gmpo_step_ppo(
     ref_avg_lps = []
     if beta > 0:
         ref = ref_model if ref_model is not None else model
-        with inference_mode():
+        with torch.no_grad():
             for comp in completions_tokens:
                 if len(comp) == 0:
                     ref_avg_lps.append(0.0)
                     continue
-                ids = np.array([prompt_tokens + comp], dtype=np.int32)
-                ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len)) / len(comp))
+                ids = _ids_tensor(prompt_tokens, comp, device)
+                ref_avg_lps.append(float(_seq_log_prob(ref, ids, prompt_len).item()) / len(comp))
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    pos_loss = None
+    neg_loss = None
     total_loss = 0.0
     for i, comp in enumerate(completions_tokens):
         if len(comp) == 0 or advantages[i] == 0 or old_token_log_probs[i] is None:
             continue
-        ids = np.array([prompt_tokens + comp], dtype=np.int32)
+        ids = _ids_tensor(prompt_tokens, comp, device)
         new_token_lps = _seq_token_log_probs(model, ids, prompt_len)
-        old_lps_t = ops.convert_to_tensor(old_token_log_probs[i])
+        old_lps_t = torch.tensor(old_token_log_probs[i], device=device)
 
         adv = float(advantages[i])
         sign_a = 1.0 if adv > 0 else -1.0
-        # GMPO (paper): s·ℓ_t, pessimistic clip = min(s·ℓ_t, +ε)
         token_log_ratios = new_token_lps - old_lps_t
         signed_log_ratios = sign_a * token_log_ratios
-        pessimistic = ops.minimum(signed_log_ratios, clip_eps)
-        mean_pessimistic = ops.mean(pessimistic)
-        seq_ratio = ops.exp(mean_pessimistic)
-
+        pessimistic = torch.minimum(signed_log_ratios, torch.tensor(clip_eps, device=device))
+        seq_ratio = torch.exp(pessimistic.mean())
         token_weight = len(comp) / total_tokens
         loss_i = -adv * seq_ratio * token_weight
 
         if beta > 0:
-            avg_policy_lp = ops.mean(new_token_lps)
-            kl = avg_policy_lp - ref_avg_lps[i]
+            kl = new_token_lps.mean() - ref_avg_lps[i]
             loss_i = loss_i + beta * kl * token_weight
 
-        (loss_i * grad_scale).backward()
-        total_loss += float(to_numpy(loss_i))
+        if adv >= 0:
+            pos_loss = _accumulate_loss_term(pos_loss, loss_i)
+        else:
+            neg_loss = _accumulate_loss_term(neg_loss, loss_i)
+        total_loss += loss_i.item()
 
+    _apply_balanced_backward(pos_loss, neg_loss, trainable_params, grad_scale, neg_scale)
     return total_loss
 
 
@@ -968,126 +750,18 @@ def gmpo_step_ppo(
 
 
 def load_model(checkpoint_path: str):
-    """Load Keras SeqCond model + PyTorch gen model from a .pt checkpoint."""
-    config, state_dict = load_torch_checkpoint(checkpoint_path)
-    model = build_keras_model(config)
-    convert_weights(config, state_dict, model)
-    n_params = model.count_params()
-    print(
-        f"Loaded {checkpoint_path}  ({n_params:,} params, backend={keras.backend.backend()})"
-    )
-    torch_gen = load_torch_gen_model(config, checkpoint_path)
-    return model, config, torch_gen
+    """Load a single TorchGenerator (model + config). Returns (model, config, torch_gen)
+    where model IS torch_gen.model — no Keras, no sync needed."""
+    torch_gen = TorchGenerator(checkpoint_path, device="cuda")
+    config = torch_gen.config
+    n = sum(p.numel() for p in torch_gen.model.parameters())
+    print(f"Loaded {checkpoint_path}  ({n:,} params, PyTorch)")
+    return torch_gen.model, config, torch_gen
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _generate_eval_batch(
-    torch_model,
-    tokenizer,
-    prompts,
-    max_new_tokens=512,
-    temperature=0.0,
-    rep_penalty: float = 1.0,
-):
-    """Generate one completion per prompt, batched across different prompts.
-
-    Assumes model is already on CUDA. Returns list of completion strings.
-    """
-    import torch
-
-    B = len(prompts)
-    if B == 0:
-        return []
-    eos_id = tokenizer.encode("<|im_end|>")[0]
-
-    # Tokenize all prompts
-    all_toks = [tokenizer([p])[0] for p in prompts]
-    prompt_lens = [len(t) for t in all_toks]
-
-    # Prefill each prompt individually (different lengths, no padding noise)
-    all_logits, all_states = [], []
-    with torch.no_grad():
-        for toks in all_toks:
-            input_ids = torch.tensor([toks], device="cuda")
-            logits_i, states_i = torch_model.prefill(input_ids)
-            all_logits.append(logits_i.squeeze(1))
-            all_states.append(states_i)
-
-    # Stack into batched tensors
-    logits = torch.cat(all_logits, dim=0)
-    num_blocks = len(all_states[0])
-    states = []
-    for block_idx in range(num_blocks):
-        block_state = tuple(
-            torch.cat([s[block_idx][t] for s in all_states], dim=0)
-            for t in range(len(all_states[0][block_idx]))
-        )
-        states.append(block_state)
-
-    # Decode with batch compaction
-    generated = [[] for _ in range(B)]
-    finished = [False] * B
-    active_map = list(range(B))
-    token_buf = torch.zeros((B, 1), dtype=torch.long, device="cuda")
-    current_seq_len = max(prompt_lens)
-
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            B_cur = len(active_map)
-            logits_np = logits.cpu().float().numpy()
-
-            if rep_penalty != 1.0:
-                for ci in range(B_cur):
-                    oi = active_map[ci]
-                    for tid in set(generated[oi]):
-                        logits_np[ci, tid] = (
-                            logits_np[ci, tid] / rep_penalty
-                            if logits_np[ci, tid] > 0
-                            else logits_np[ci, tid] * rep_penalty
-                        )
-
-            toks = _sample_batch(logits_np, temperature, 50, 0.95)
-            newly_done = set()
-            for ci in range(B_cur):
-                oi = active_map[ci]
-                tok = int(toks[ci])
-                generated[oi].append(tok)
-                if tok == eos_id:
-                    finished[oi] = True
-                    newly_done.add(ci)
-                else:
-                    token_buf[ci, 0] = tok
-            if all(finished):
-                break
-            if newly_done:
-                keep = [ci for ci in range(B_cur) if ci not in newly_done]
-                if not keep:
-                    break
-                keep_idx = torch.tensor(keep, device="cuda")
-                token_buf = token_buf[keep_idx].contiguous()
-                states = [
-                    tuple(s[keep_idx].contiguous() for s in state)
-                    for state in states
-                ]
-                active_map = [active_map[ci] for ci in keep]
-            current_seq_len += 1
-            logits, states = torch_model.step(
-                token_buf, states, seq_len=current_seq_len, use_triton=True
-            )
-
-    results = []
-    for i in range(B):
-        ids = generated[i]
-        if ids and ids[-1] == eos_id:
-            ids = ids[:-1]
-        try:
-            results.append(tokenizer.decode(ids))
-        except Exception:
-            results.append("")
-    return results
 
 
 def evaluate(
@@ -1099,48 +773,49 @@ def evaluate(
     temperature=0.0,
     rep_penalty: float = 1.0,
     gen_batch_size=4,
+    eval_batch_size=None,
     step=None,
     log_path=None,
 ):
-    """Evaluate pass@k accuracy on the first max_examples problems."""
-    import torch
+    """Evaluate pass@k accuracy on the first max_examples problems.
 
-    tokenizer = Tokenizer()
+    All k*N prompts are flattened into a single queue and dispatched in batches
+    of `eval_batch_size` (falls back to `gen_batch_size`). This is much faster
+    than looping pass-by-pass because every generate_batch call uses the full
+    GPU capacity regardless of how many examples remain in the current pass.
+    """
     examples = examples[:max_examples]
     t0 = time.time()
+    was_training = torch_gen.model.training
+    torch_gen.model.eval()
 
-    # ── Phase 1: Generate all completions (fast, batched, GPU) ──
-    torch_gen.cuda()
-    # Fast batched path: run num_completions passes over all problems
-    all_comps = [[] for _ in range(len(examples))]
-    for _pass in range(num_completions):
-        for batch_start in range(0, len(examples), gen_batch_size):
-            prompts = [
-                ex["prompt"]
-                for ex in examples[batch_start : batch_start + gen_batch_size]
-            ]
-            batch_comps = _generate_eval_batch(
-                torch_gen,
-                tokenizer,
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                rep_penalty=rep_penalty,
-            )
-            for j, c in enumerate(batch_comps):
-                all_comps[batch_start + j].append(c)
+    eval_bs = eval_batch_size or gen_batch_size
+    N = len(examples)
+    flat_prompts = [ex["prompt"] for ex in examples for _ in range(num_completions)]
+    flat_idx = [(i, k) for i in range(N) for k in range(num_completions)]
+
+    all_comps = [[None] * num_completions for _ in range(N)]
+    for start in range(0, len(flat_prompts), eval_bs):
+        chunk_prompts = flat_prompts[start:start + eval_bs]
+        chunk_idx = flat_idx[start:start + eval_bs]
+        texts = torch_gen.generate_batch(
+            chunk_prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=10,
+            use_synth_template=False,
+        )
+        for (i, k), c in zip(chunk_idx, texts):
+            all_comps[i][k] = c
+
+    if was_training:
+        torch_gen.model.train()
 
     torch.cuda.empty_cache()
-    gen_time = time.time() - t0
-    total_gens = len(examples) * num_completions
-    print(f"  Generated {total_gens} eval completions ({len(examples)} problems × {num_completions}) in {gen_time:.1f}s")
-
-    # ── Phase 2: Check answers ──
-    correct = 0
-    for i, (ex, comps) in enumerate(zip(examples, all_comps)):
-        ok = any(check_answer(c, ex["ground_truth"]) for c in comps)
-        correct += int(ok)
-
+    correct = sum(
+        int(any(check_answer(c, ex["ground_truth"]) for c in comps))
+        for ex, comps in zip(examples, all_comps)
+    )
     acc = correct / len(examples)
     elapsed = time.time() - t0
     step_str = f"step={step}  " if step is not None else ""
@@ -1160,55 +835,14 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _save_and_upload_gcp(model, config, save_path, step, torch_gen=None):
-    import subprocess, torch as _torch
-
-    gcs_bucket = "gs://telekinesis-43/checkpoints"
-
-    # Save directly from torch_gen state_dict to avoid lossy Keras→pkl→pt round-trip
-    # (SeqCond recurrence is chaotic: even 1e-4 weight diffs change generation)
-    # IMPORTANT: filter out internal cached buffers (_conv_kernel_t, _theta_cached, etc.)
-    # These depend on seq_len of last forward call and corrupt generation if reloaded.
-    if torch_gen is not None and save_path.endswith(".pt"):
-        _CACHE_PREFIXES = ('_conv_kernel_t', '_decay_slopes_cached', '_phase_scale_b',
-                           '_score_bias_b', '_score_scale_b', '_theta_cached', '_w_int_cached')
-        sd = {k: v.cpu() for k, v in torch_gen.state_dict().items()
-              if not any(k.endswith(sfx) for sfx in _CACHE_PREFIXES)}
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        _torch.save({"state_dict": sd, "config": config}, save_path)
-        print(f"PyTorch checkpoint saved (direct): {save_path} ({len(sd)} tensors)")
-    else:
-        pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
-        save_keras_checkpoint(model, config, pkl_path)
-        if save_path.endswith(".pt"):
-            keras_pkl_to_torch_pt(pkl_path, save_path)
-
+def _save_stepped(torch_gen, config, save_path, step):
+    """Save a stepped checkpoint next to save_path (e.g. foo_step00064.pt)."""
+    base, ext = os.path.splitext(save_path)
+    stepped = f"{base}_step{step:05d}{ext}"
     try:
-        filename = os.path.basename(save_path)
-        base, ext = os.path.splitext(filename)
-        gcs_filename = f"{base}_step{step}{ext}"
-        gcs_path = f"{gcs_bucket}/{gcs_filename}"
-
-        print(f"  Uploading to {gcs_path}...", end=" ", flush=True)
-        for cmd in [
-            ["gcloud", "storage", "cp", save_path, gcs_path],
-            ["gsutil", "cp", save_path, gcs_path],
-        ]:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if result.returncode == 0:
-                print(f"✓ ({cmd[0]})")
-                break
-            err = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            print(f"\n    {cmd[0]} failed: {err[:500]}")
-        else:
-            print(f"  ✗ upload failed for {gcs_path}")
-    except Exception as e:
-        print(f"✗ ({str(e)[:500]})")
+        save_ckpt(torch_gen, config, stepped, step)
+    except OSError as e:
+        print(f"WARNING: could not save stepped checkpoint ({e})")
 
 
 def train_grpo(
@@ -1224,6 +858,7 @@ def train_grpo(
     temperature: float = 0.5,
     rep_penalty: float = 1.0,
     gen_batch_size: int = 4,
+    eval_batch_size: int = 0,
     beta: float = 0.05,
     lr: float = 5e-5,
     optimizer_name: str = "adamw",
@@ -1238,7 +873,7 @@ def train_grpo(
     max_eval: int = 100,
     eval_num_completions: int = 1,
     eval_temperature: float = 0.0,
-    save_gcp_every: int = 0,
+    save_every: int = 0,
     save_path: str = None,
     grad_accum_steps: int = 4,
     seed: int = 42,
@@ -1253,18 +888,15 @@ def train_grpo(
     gmpo_clip_eps: float = 0.4,
     llds_lambda: float = 0.0,
     min_active_steps: int = 1,
+    neg_scale: float = 0.0,
 ):
-    import torch
-
-    # Match pre-training dtype: bf16 compute, fp32 weights (same as train_jax.py)
-    keras.mixed_precision.set_global_policy("mixed_float16")
-    print(f"Mixed precision: {keras.mixed_precision.global_policy().name}")
+    device = next(model.parameters()).device
 
     tokenizer = Tokenizer()
     np.random.seed(seed)
     random.seed(seed)
 
-    n_blocks = len(model.blocks_list)
+    n_blocks = len(model.blocks)
     train_layers = min(train_layers, n_blocks)
 
     all_params = list(model.parameters())
@@ -1274,16 +906,34 @@ def train_grpo(
         else torch.optim.SGD(all_params, lr=lr, momentum=0.0, weight_decay=weight_decay)
     )
 
-    use_fast_gen = torch_gen is not None
     max_total_tokens = int(config.get("maxlen") or 0)
 
-    # Frozen reference model for KL penalty (anchors to initial policy)
-    ref_model = build_keras_model(config)
-    ref_model(np.zeros((1, 1), dtype=np.int32))  # ensure built
-    for ref_w, src_w in zip(ref_model.weights, model.weights):
-        ref_w.assign(src_w)
+    # Frozen reference model for KL penalty (deepcopy of initial PyTorch model)
+    ref_model = copy.deepcopy(model)
     for p in ref_model.parameters():
         p.requires_grad = False
+    ref_model.eval()
+
+    # SeqCondAttention lazily caches tensors derived from trainable params
+    # (_theta_cached, _w_int_cached, _decay_slopes_cached, _anchor_slopes_cached,
+    #  _score_scale_b, _score_bias_b, _phase_scale_b, _conv_kernel_t). These are
+    # NEVER recomputed once set, so after an optimizer.step() they become stale
+    # while step() (used by torch_gen.generate_batch) keeps using them. Must
+    # invalidate after every param update to keep generation consistent with
+    # training forward path — otherwise the checkpoint saved to disk (which
+    # omits these buffers) will be decoded with freshly recomputed caches and
+    # diverge from the live training-eval behavior.
+    _CACHE_ATTRS = (
+        "_theta_cached", "_w_int_cached", "_decay_slopes_cached",
+        "_anchor_slopes_cached", "_score_scale_b", "_score_bias_b",
+        "_phase_scale_b", "_conv_kernel_t",
+    )
+
+    def _invalidate_seqcond_caches(m):
+        for sub in m.modules():
+            for a in _CACHE_ATTRS:
+                if hasattr(sub, a) and getattr(sub, a) is not None:
+                    setattr(sub, a, None)
 
     if grad_accum_steps < 1:
         raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
@@ -1325,6 +975,8 @@ def train_grpo(
                 clip_eps=gmpo_clip_eps,
                 beta=beta, ref_model=ref_model,
                 grad_scale=_grad_scale,
+                neg_scale=neg_scale,
+                device=str(device),
             )
         else:
             return grpo_step_ppo(
@@ -1334,13 +986,15 @@ def train_grpo(
                 beta=beta, ref_model=ref_model,
                 grad_scale=_grad_scale,
                 llds_lambda=llds_lambda,
+                neg_scale=neg_scale,
+                device=str(device),
             )
 
     def _set_active_trainable_blocks(block_indices):
         for p in model.parameters():
             p.requires_grad = False
         for idx in block_indices:
-            for p in model.blocks_list[idx].parameters():
+            for p in model.blocks[idx].parameters():
                 p.requires_grad = True
         # Embeddings FROZEN — tied to lm_head (weight tying), training them
         # causes progressive regression (confirmed: grad_norm escalation + eval drop).
@@ -1362,40 +1016,29 @@ def train_grpo(
     active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
     _set_active_trainable_blocks(active_block_indices)
 
-    if use_fast_gen:
-        sync_keras_to_torch(model, torch_gen, config)
-        torch_gen.cuda()
-
     for step in range(1, num_steps + 1):
         ex = random.choice(examples)
         prompt_tokens = tokenizer([ex["prompt"]])[0]
 
-        # Generate (fast path with Triton, or fallback to Keras)
-        if use_fast_gen:
-            texts, ids = generate_completions_torch(
-                torch_gen,
-                tokenizer,
-                ex["prompt"],
-                num_completions=num_completions,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                rep_penalty=rep_penalty,
-                gen_batch_size=gen_batch_size,
-                return_tokens=True,
-                keep_on_cuda=True,
-            )
-        else:
-            texts, ids = generate_completions(
-                model,
-                tokenizer,
-                ex["prompt"],
-                num_completions=num_completions,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                rep_penalty=rep_penalty,
-                gen_batch_size=gen_batch_size,
-                return_tokens=True,
-            )
+        # Generate using the single PyTorch model (via TorchGenerator).
+        # IMPORTANT: request return_token_ids=True to get the *actual* tokens
+        # the model produced. Decoding to text and re-encoding is NOT identity
+        # with tiktoken (special tokens, whitespace, multi-byte boundaries), so
+        # using re-encoded ids would feed GRPO gradient on sequences that
+        # differ from what the model actually sampled — producing an incorrect
+        # log-prob / ratio / advantage mapping and silently corrupting the
+        # policy update.
+        was_training = model.training
+        model.eval()
+        texts, ids = torch_gen.generate_batch(
+            [ex["prompt"]] * num_completions,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            use_synth_template=False,
+            return_token_ids=True,
+        )
+        if was_training:
+            model.train()
 
         # Filter out degenerate completions (too short to be meaningful)
         valid = [len(c) >= min_completion_tokens for c in ids]
@@ -1474,7 +1117,7 @@ def train_grpo(
                 _actual_grad_scale = 1.0 / grad_accum_steps
                 if ppo_epochs > 1:
                     # Multi-epoch PPO: store group + π_old for later
-                    old_lps = _compute_old_log_probs(model, prompt_tokens, ids_f)
+                    old_lps = _compute_old_log_probs(model, prompt_tokens, ids_f, device)
                     ppo_batch.append((prompt_tokens, ids_f, advantages, old_lps))
                     active_grad_steps += 1
                     # Approximate loss for logging using π_old
@@ -1493,6 +1136,8 @@ def train_grpo(
                         beta=beta,
                         ref_model=ref_model,
                         grad_scale=_actual_grad_scale,
+                        neg_scale=neg_scale,
+                        device=str(device),
                     )
                     run_loss += loss
                     active_grad_steps += 1
@@ -1506,6 +1151,8 @@ def train_grpo(
                         ref_model=ref_model,
                         grad_scale=_actual_grad_scale,
                         llds_lambda=llds_lambda,
+                        neg_scale=neg_scale,
+                        device=str(device),
                     )
                     run_loss += loss
                     active_grad_steps += 1
@@ -1534,6 +1181,7 @@ def train_grpo(
                         n_grads = sum(1 for p in model.parameters() if p.grad is not None)
                         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
                         optimizer.step()
+                        _invalidate_seqcond_caches(model)
                         print(
                             f"  [optimizer.step | train_step={step} | "
                             f"ppo_epoch={_epoch+1}/{ppo_epochs} | "
@@ -1542,9 +1190,6 @@ def train_grpo(
                             f"active={active_grad_steps}/{grad_accum_steps}]"
                         )
                     ppo_batch = []
-                    if use_fast_gen:
-                        sync_keras_to_torch(model, torch_gen, config)
-                        print(f"  [sync weights → torch gen model at step {step}]")
                     optimizer.zero_grad()
                     pending_grad_steps = 0
                     active_grad_steps = 0
@@ -1564,15 +1209,13 @@ def train_grpo(
                     n_grads = sum(1 for p in model.parameters() if p.grad is not None)
                     n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
                     optimizer.step()
+                    _invalidate_seqcond_caches(model)
                     print(
                         f"  [optimizer.step | train_step={step} | "
                         f"grad_norm={pre_clip_norm:.4f} | "
                         f"n_grads={n_grads}/{n_trainable} | "
                         f"active={active_grad_steps}/{grad_accum_steps}]"
                     )
-                    if use_fast_gen:
-                        sync_keras_to_torch(model, torch_gen, config)
-                        print(f"  [sync weights → torch gen model at step {step}]")
                     optimizer.zero_grad()
                     pending_grad_steps = 0
                     active_grad_steps = 0
@@ -1615,19 +1258,15 @@ def train_grpo(
                     _set_optimizer_lr(step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                     optimizer.step()
+                    _invalidate_seqcond_caches(model)
                     print(f"  [optimizer.step | train_step={step} | ppo_epoch={_epoch+1}/{ppo_epochs} | flush=eval]")
                 ppo_batch = []
-                if use_fast_gen:
-                    sync_keras_to_torch(model, torch_gen, config)
-                    print(f"  [sync weights → torch gen model at step {step} | flush=eval]")
             else:
                 _set_optimizer_lr(step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
+                _invalidate_seqcond_caches(model)
                 print(f"  [optimizer.step | train_step={step} | flush=eval]")
-                if use_fast_gen:
-                    sync_keras_to_torch(model, torch_gen, config)
-                    print(f"  [sync weights → torch gen model at step {step} | flush=eval]")
             optimizer.zero_grad()
             pending_grad_steps = 0
             active_grad_steps = 0
@@ -1637,25 +1276,45 @@ def train_grpo(
         # Periodic eval
         if eval_every > 0 and step % eval_every == 0:
             log_path = save_path.replace(".pt", "_eval.log") if save_path else None
+            ds = eval_examples if eval_examples is not None else examples
+            # Configured eval (typically pass@K sampled at eval_temperature)
             evaluate(
-                torch_gen if use_fast_gen else model,
-                eval_examples if eval_examples is not None else examples,
+                torch_gen,
+                ds,
                 max_examples=max_eval,
                 num_completions=eval_num_completions,
                 max_new_tokens=max_new_tokens,
                 temperature=eval_temperature,
                 rep_penalty=rep_penalty,
                 gen_batch_size=gen_batch_size,
+                eval_batch_size=eval_batch_size or None,
                 step=step,
                 log_path=log_path,
             )
+            # Secondary greedy eval: pass@1 at T=0 (mode of the policy).
+            # Useful to detect cases where sampled pass@K improves while the
+            # greedy mode collapses (policy narrowing / deteriorating).
+            if eval_num_completions != 1 or eval_temperature != 0.0:
+                evaluate(
+                    torch_gen,
+                    ds,
+                    max_examples=max_eval,
+                    num_completions=1,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    rep_penalty=rep_penalty,
+                    gen_batch_size=gen_batch_size,
+                    eval_batch_size=eval_batch_size or None,
+                    step=step,
+                    log_path=log_path,
+                )
 
             # Round-trip debug moved to sanity_check_reload.py
 
         # Flush pending gradients before backup
         if (
-            save_gcp_every > 0
-            and step % save_gcp_every == 0
+            save_every > 0
+            and step % save_every == 0
             and save_path
             and pending_grad_steps > 0
         ):
@@ -1671,28 +1330,24 @@ def train_grpo(
                     _set_optimizer_lr(step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                     optimizer.step()
+                    _invalidate_seqcond_caches(model)
                     print(f"  [optimizer.step | train_step={step} | ppo_epoch={_epoch+1}/{ppo_epochs} | flush=save]")
                 ppo_batch = []
-                if use_fast_gen:
-                    sync_keras_to_torch(model, torch_gen, config)
-                    print(f"  [sync weights → torch gen model at step {step} | flush=save]")
             else:
                 _set_optimizer_lr(step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
+                _invalidate_seqcond_caches(model)
                 print(f"  [optimizer.step | train_step={step} | flush=save]")
-                if use_fast_gen:
-                    sync_keras_to_torch(model, torch_gen, config)
-                    print(f"  [sync weights → torch gen model at step {step} | flush=save]")
             optimizer.zero_grad()
             pending_grad_steps = 0
             active_grad_steps = 0
             active_block_indices = sorted(random.sample(range(n_blocks), train_layers))
             _set_active_trainable_blocks(active_block_indices)
 
-        # Periodic GCP backup
-        if save_gcp_every > 0 and step % save_gcp_every == 0 and save_path:
-            _save_and_upload_gcp(model, config, save_path, step, torch_gen=torch_gen if use_fast_gen else None)
+        # Periodic local checkpoint save
+        if save_every > 0 and step % save_every == 0 and save_path:
+            _save_stepped(torch_gen, config, save_path, step)
 
     # Flush any remaining accumulated gradients
     if pending_grad_steps > 0 and active_grad_steps >= min_active_steps:
@@ -1704,11 +1359,13 @@ def train_grpo(
                 _set_optimizer_lr(num_steps)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
+                _invalidate_seqcond_caches(model)
             ppo_batch = []
         else:
             _set_optimizer_lr(num_steps)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            _invalidate_seqcond_caches(model)
         optimizer.zero_grad()
 
     print(f"\n── {objective_name} complete ({time.time()-t0:.0f}s) ──\n")
@@ -1726,6 +1383,8 @@ def main():
         "--save", default=None, help="Output .pt path (default: <base>_grpo.pt)"
     )
     p.add_argument("--max_examples", type=int, default=None)
+    p.add_argument("--local_file", default=None,
+                   help="Chemin vers un JSONL local {query, ground_truth} (remplace GSM8K)")
     p.add_argument("--skip_baseline", action="store_true")
 
     # Generation
@@ -1734,6 +1393,14 @@ def main():
     p.add_argument("--temperature", type=float, default=0.5)
     p.add_argument("--rep_penalty", type=float, default=1.0)
     p.add_argument("--gen_batch_size", type=int, default=4)
+    p.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=64,
+        help="Batch size for eval generation. All k*N pass@k prompts are "
+        "flattened into one queue and dispatched in chunks of this size. "
+        "0 = fall back to --gen_batch_size.",
+    )
 
     # Training
     p.add_argument("--num_steps", type=int, default=250)
@@ -1759,12 +1426,13 @@ def main():
         help="Accumulate gradients over N steps before optimizer update",
     )
     p.add_argument(
-        "--save-gcp",
+        "--save_every",
+        "--save-gcp",  # legacy alias
         type=int,
         default=0,
-        dest="save_gcp_every",
-        help="Save checkpoint to GCS every N steps (0=disabled). "
-        "Uploads to gs://telekinesis-43/checkpoints/",
+        dest="save_every",
+        help="Save a stepped checkpoint every N steps to disk (0=disabled). "
+        "Writes <save_path>_step<NNNNN>.pt next to the final save path.",
     )
 
     # GMPO
@@ -1846,6 +1514,14 @@ def main():
         help="Minimum number of steps with real gradient signal in an accumulation window. "
              "If fewer, the window is discarded without applying the optimizer update.",
     )
+    p.add_argument(
+        "--neg_scale",
+        type=float,
+        default=0.0,
+        help="If >0, downscale negative-advantage gradients so their norm is at most "
+             "neg_scale times the positive-gradient norm within each GRPO/PPO group. "
+             "No effect when negative gradients are already weaker.",
+    )
 
     # Layer rotation
     p.add_argument(
@@ -1858,9 +1534,12 @@ def main():
     args = p.parse_args()
 
     model, config, torch_gen = load_model(args.checkpoint)
-    train_examples = load_gsm8k(split="train", seed=42, max_examples=args.max_examples)
-    # Eval on test split (sample up to max_eval)
-    eval_examples = load_gsm8k(split="test", seed=42, max_examples=args.max_eval)
+    if args.local_file:
+        train_examples = load_local_math(args.local_file, seed=42, max_examples=args.max_examples)
+        eval_examples  = load_gsm8k(split="test", seed=42, max_examples=args.max_eval)
+    else:
+        train_examples = load_gsm8k(split="train", seed=42, max_examples=args.max_examples)
+        eval_examples  = load_gsm8k(split="test", seed=42, max_examples=args.max_eval)
     print(f"Dataset: {len(train_examples)} train / {len(eval_examples)} eval (test split)")
 
     if not args.skip_baseline:
@@ -1874,7 +1553,20 @@ def main():
             temperature=args.eval_temperature,
             rep_penalty=args.rep_penalty,
             gen_batch_size=args.gen_batch_size,
+            eval_batch_size=args.eval_batch_size or None,
         )
+        if args.eval_num_completions != 1 or args.eval_temperature != 0.0:
+            evaluate(
+                torch_gen,
+                eval_examples,
+                max_examples=args.max_eval,
+                num_completions=1,
+                max_new_tokens=args.max_new_tokens,
+                temperature=0.0,
+                rep_penalty=args.rep_penalty,
+                gen_batch_size=args.gen_batch_size,
+                eval_batch_size=args.eval_batch_size or None,
+            )
         # Round-trip debug moved to sanity_check_reload.py
 
     save_path = args.save or os.path.join(
@@ -1894,6 +1586,7 @@ def main():
         temperature=args.temperature,
         rep_penalty=args.rep_penalty,
         gen_batch_size=args.gen_batch_size,
+        eval_batch_size=args.eval_batch_size,
         beta=args.beta,
         lr=args.lr,
         optimizer_name=args.optimizer,
@@ -1903,7 +1596,7 @@ def main():
         max_eval=args.max_eval,
         eval_num_completions=args.eval_num_completions,
         eval_temperature=args.eval_temperature,
-        save_gcp_every=args.save_gcp_every,
+        save_every=args.save_every,
         save_path=save_path,
         grad_accum_steps=args.grad_accum_steps,
         use_dr_grpo=args.use_dr_grpo,
@@ -1918,23 +1611,11 @@ def main():
         gmpo_clip_eps=args.gmpo_clip_eps,
         llds_lambda=args.llds_lambda,
         min_active_steps=args.min_active_steps,
+        neg_scale=args.neg_scale,
     )
 
-    # Save final checkpoint (direct from torch_gen to avoid lossy round-trip)
     try:
-        import torch as _torch
-        if torch_gen is not None and save_path.endswith(".pt"):
-            _CACHE_PREFIXES = ('_conv_kernel_t', '_decay_slopes_cached', '_phase_scale_b',
-                               '_score_bias_b', '_score_scale_b', '_theta_cached', '_w_int_cached')
-            sd = {k: v.cpu() for k, v in torch_gen.state_dict().items()
-                  if not any(k.endswith(sfx) for sfx in _CACHE_PREFIXES)}
-            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-            _torch.save({"state_dict": sd, "config": config}, save_path)
-        else:
-            pkl_path = save_path[:-3] + ".pkl" if save_path.endswith(".pt") else save_path
-            save_keras_checkpoint(model, config, pkl_path)
-            if save_path.endswith(".pt"):
-                keras_pkl_to_torch_pt(pkl_path, save_path)
+        save_ckpt(torch_gen, config, save_path, 0)
         print(f"Saved: {save_path}")
     except OSError as e:
         print(f"WARNING: could not save ({e})")

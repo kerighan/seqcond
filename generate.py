@@ -25,7 +25,8 @@ def main():
         type=str,
         # default="checkpoints/seqcond_lin5_rlai_step800.pt",
         # default="checkpoints/seqcond_lin5.pt",
-        default="checkpoints/seqcond_xlarge_init.pt",
+        # default="checkpoints/sft/CURRENT_BEST_sft_step00180.pt",
+        default="checkpoints/BEST/BEST_OVERALL.pt",
         # default="checkpoints/thin_torch.pt",
         # default="checkpoints/transformer_torch.pt",
         help="Path to PyTorch checkpoint",
@@ -57,7 +58,7 @@ def main():
     parser.add_argument(
         "--rep_penalty",
         type=float,
-        default=1.0,
+        default=1.1,
         help="Repetition penalty (1.0 = no penalty, >1.0 penalizes repetition)",
     )
     parser.add_argument(
